@@ -12,7 +12,7 @@ describe("deployment config", () => {
     delete process.env.DEPLOYMENT_OWNER;
     delete process.env.AISUITE_NONPROD_ACCOUNT_ID;
     delete process.env.AISUITE_PROD_ACCOUNT_ID;
-    delete process.env.CDK_DEFAULT_REGION;
+    delete process.env.DEFAULT_REGION;
   });
 
   it("builds a namespaced stack config for a known environment", () => {

@@ -107,7 +107,7 @@ export function getDeploymentConfig(
     accountTier,
     awsEnvironment: {
       account: resolveAccountId(accountTier),
-      region: process.env.CDK_DEFAULT_REGION ?? DEFAULT_REGION,
+      region: DEFAULT_REGION,
     },
     name: environmentName,
     protectedEnvironment,
