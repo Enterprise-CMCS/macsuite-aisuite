@@ -1,0 +1,115 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Creates (or reuses) the GitHub Actions OIDC provider and a deploy role for
+  macsuite-aisuite. Attach AdministratorAccess plus the CMS-required managed
+  policies and permissions boundary so CDK can deploy without inventing a
+  narrower custom policy. Trust is limited by repository and GitHub Environment
+  subject claims.
+
+Parameters:
+  GithubActionsThumbprint:
+    Type: CommaDelimitedList
+    Default: 6938fd4d98bab03faadb97b34396831e3780aea1
+    Description: >
+      Comma-separated thumbprints for GitHub Actions OIDC tokens. Default from
+      https://github.blog/changelog/2022-01-13-github-actions-update-on-oidc-based-deployments-to-aws/
+
+  AudienceList:
+    Type: CommaDelimitedList
+    Default: sts.amazonaws.com
+    Description: >
+      Allowed token audiences. Default matches aws-actions/configure-aws-credentials.
+
+  SubjectClaimFilters:
+    Type: CommaDelimitedList
+    Description: >
+      Allowed token.actions.githubusercontent.com:sub values. Use one filter per
+      GitHub Environment that may assume this role in this AWS account.
+      Example non-prod:
+      repo:Enterprise-CMCS/macsuite-aisuite:environment:dev,
+      repo:Enterprise-CMCS/macsuite-aisuite:environment:qa,
+      repo:Enterprise-CMCS/macsuite-aisuite:environment:uat
+      Example prod:
+      repo:Enterprise-CMCS/macsuite-aisuite:environment:prod
+
+  RoleName:
+    Type: String
+    Default: aisuite-github-oidc-deploy
+    Description: IAM role name GitHub Actions will assume.
+
+  Path:
+    Type: String
+    Default: /delegatedadmin/developer/
+    Description: IAM path required by CMS CloudTamer / delegated admin.
+
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >
+      Set to false when token.actions.githubusercontent.com already exists in
+      this account (common in reused/shared accounts). Then set ExistingOidcProviderArn.
+
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >
+      Required when CreateOidcProvider=false. Example:
+      arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubIdentityProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ThumbprintList: !Ref GithubActionsThumbprint
+      ClientIdList: !Ref AudienceList
+
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Path: !Ref Path
+      MaxSessionDuration: 10800
+      Description: GitHub Actions OIDC deploy role for macsuite-aisuite (CDK).
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/cms-cloud-admin/ct-ado-poweruser-permissions-boundary-policy
+      ManagedPolicyArns:
+        - !Sub arn:aws:iam::${AWS::AccountId}:policy/ADO-Restriction-Policy
+        - !Sub arn:aws:iam::${AWS::AccountId}:policy/CMSApprovedAWSServices
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RoleForGitHubActions
+            Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !GetAtt GitHubIdentityProvider.Arn
+                - !Ref ExistingOidcProviderArn
+            Action:
+              - sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: !Ref AudienceList
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Ref SubjectClaimFilters
+
+Outputs:
+  DeployRoleArn:
+    Description: Role ARN for GitHub Actions vars.AISUITE_DEPLOY_ROLE_ARN
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+  OidcProviderArn:
+    Description: GitHub OIDC provider ARN used by the deploy role trust policy
+    Value: !If
+      - ShouldCreateOidcProvider
+      - !GetAtt GitHubIdentityProvider.Arn
+      - !Ref ExistingOidcProviderArn
+  AwsAccountId:
+    Description: Account where this role was created
+    Value: !Ref AWS::AccountId

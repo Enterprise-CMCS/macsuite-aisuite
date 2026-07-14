@@ -1,0 +1,85 @@
+name: AISuite Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - qa
+          - uat
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aisuite-deploy-${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+    env:
+      DEPLOYMENT_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+      AISUITE_DEPLOY_REGION: ${{ vars.AISUITE_DEPLOY_REGION || 'us-east-1' }}
+      # Stable within a release so DeployedAt tags do not churn every deploy.
+      DEPLOYMENT_TIMESTAMP: ${{ github.event.head_commit.timestamp || github.run_started_at }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+          run_install: false
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm run type-check
+
+      - name: Test
+        run: pnpm test
+
+      - name: Require deploy role configuration
+        run: |
+          test -n "${{ vars.AISUITE_DEPLOY_ROLE_ARN }}" || {
+            echo "Set environment variable AISUITE_DEPLOY_ROLE_ARN on GitHub Environment '${DEPLOYMENT_ENV}'" >&2
+            exit 1
+          }
+
+      - name: Synthesize CDK template
+        run: pnpm run cdk:synth --context environment=${DEPLOYMENT_ENV}
+
+      - name: Configure cloud access
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AISUITE_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AISUITE_DEPLOY_REGION }}
+          role-session-name: aisuite-${{ env.DEPLOYMENT_ENV }}-${{ github.run_id }}
+
+      - name: Review CDK diff
+        run: pnpm run cdk:diff --context environment=${DEPLOYMENT_ENV}
+
+      - name: Deploy CDK stack
+        run: pnpm run cdk:deploy --context environment=${DEPLOYMENT_ENV}

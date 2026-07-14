@@ -1,0 +1,35 @@
+{
+  "name": "macsuite-aisuite",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Macsuite AISuite",
+  "type": "module",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "cdk": "cdk",
+    "cdk:deploy": "cdk deploy --require-approval never",
+    "cdk:diff": "cdk diff",
+    "cdk:synth": "cdk synth --quiet",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "type-check": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=11 <12"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.261.0",
+    "constructs": "^10.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "@vitest/coverage-v8": "^4.0.0",
+    "aws-cdk": "^2.1130.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}
