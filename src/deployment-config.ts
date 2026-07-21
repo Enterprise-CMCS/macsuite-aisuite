@@ -25,13 +25,24 @@ export const DEPLOYMENT_ENVIRONMENT_ACCOUNT_TIER = {
 } as const satisfies Record<DeploymentEnvironmentName, AwsAccountTier>;
 
 /**
- * Explicit AISuite AWS account IDs (OY2-39614).
+ * CloudTamer-provisioned VPC Name tags (aisuite-east-*). App stages map 1:1
+ * except `uat` → `aisuite-east-test` (CloudTamer has no uat VPC name).
+ */
+export const DEPLOYMENT_ENVIRONMENT_VPC_NAME = {
+  dev: "aisuite-east-dev",
+  qa: "aisuite-east-qa",
+  uat: "aisuite-east-test",
+  prod: "aisuite-east-prod",
+} as const satisfies Record<DeploymentEnvironmentName, string>;
+
+/**
+ * Explicit AISuite AWS account IDs (CloudTamer aisuite-non-prod / aisuite-prod).
  * Runtime env overrides (`AISUITE_NONPROD_ACCOUNT_ID` /
  * `AISUITE_PROD_ACCOUNT_ID`) win when set (CI / local override).
  */
 export const AWS_ACCOUNT_IDS: Record<AwsAccountTier, string> = {
-  nonprod: "604764467489",
-  prod: "980819806828",
+  nonprod: "205501819586",
+  prod: "609425363642",
 };
 
 const ACCOUNT_ID_ENV_KEYS = {
@@ -64,7 +75,6 @@ export interface StandardTags {
   ManagedBy: string;
   Owner: string;
   Protected: string;
-  WorkItem: string;
 }
 
 export interface DeploymentConfig {
@@ -74,6 +84,8 @@ export interface DeploymentConfig {
   protectedEnvironment: boolean;
   stackName: string;
   tags: StandardTags;
+  /** CloudTamer VPC Name tag for this stage (use with `ec2.Vpc.fromLookup`). */
+  vpcName: (typeof DEPLOYMENT_ENVIRONMENT_VPC_NAME)[DeploymentEnvironmentName];
 }
 
 const ACCOUNT_ID_PATTERN = /^\d{12}$/;
@@ -119,8 +131,8 @@ export function getDeploymentConfig(
       ManagedBy: MANAGED_BY,
       Owner: process.env.DEPLOYMENT_OWNER ?? DEFAULT_OWNER,
       Protected: String(protectedEnvironment),
-      WorkItem: WORK_ITEM,
     },
+    vpcName: DEPLOYMENT_ENVIRONMENT_VPC_NAME[environmentName],
   };
 }
 

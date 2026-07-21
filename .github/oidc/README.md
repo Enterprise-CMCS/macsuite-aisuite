@@ -79,8 +79,8 @@ Set these so CDK synth pins the correct account before assume-role:
 
 | Name | Scope | Value |
 | --- | --- | --- |
-| `AISUITE_NONPROD_ACCOUNT_ID` | repository (optional) | `604764467489` — already pinned in `src/deployment-config.ts` |
-| `AISUITE_PROD_ACCOUNT_ID` | repository (optional) | `980819806828` — already pinned in `src/deployment-config.ts` |
+| `AISUITE_NONPROD_ACCOUNT_ID` | repository (optional) | `205501819586` — already pinned in `src/deployment-config.ts` |
+| `AISUITE_PROD_ACCOUNT_ID` | repository (optional) | `609425363642` — already pinned in `src/deployment-config.ts` |
 | `AISUITE_DEPLOY_REGION` | repository (optional) | `us-east-1` (default) |
 
 Set the assume-role ARN **per GitHub Environment** (same ARN for all non-prod

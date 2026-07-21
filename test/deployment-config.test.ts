@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   AWS_ACCOUNT_IDS,
   DEPLOYMENT_ENVIRONMENT_NAMES,
+  DEPLOYMENT_ENVIRONMENT_VPC_NAME,
   getDeploymentConfig,
   resolveAccountId,
 } from "../src/deployment-config";
@@ -22,6 +23,7 @@ describe("deployment config", () => {
     expect(config.accountTier).toBe("nonprod");
     expect(config.protectedEnvironment).toBe(false);
     expect(config.stackName).toBe("aisuite-dev-infrastructure");
+    expect(config.vpcName).toBe("aisuite-east-dev");
     expect(config.awsEnvironment.account).toMatch(/^\d{12}$/);
     expect(config.awsEnvironment.region).toBeTruthy();
     expect(config.tags.Application).toBe("aisuite");
@@ -34,6 +36,23 @@ describe("deployment config", () => {
     expect(config.accountTier).toBe("prod");
     expect(config.protectedEnvironment).toBe(true);
     expect(config.stackName).toBe("aisuite-prod-infrastructure");
+    expect(config.vpcName).toBe("aisuite-east-prod");
+  });
+
+  it("maps each app stage to the CloudTamer VPC Name tag", () => {
+    expect(DEPLOYMENT_ENVIRONMENT_VPC_NAME).toEqual({
+      dev: "aisuite-east-dev",
+      qa: "aisuite-east-qa",
+      uat: "aisuite-east-test",
+      prod: "aisuite-east-prod",
+    });
+
+    for (const environmentName of DEPLOYMENT_ENVIRONMENT_NAMES) {
+      const config = getDeploymentConfig(environmentName);
+      expect(config.vpcName).toBe(
+        DEPLOYMENT_ENVIRONMENT_VPC_NAME[environmentName],
+      );
+    }
   });
 
   it("covers every declared deployment environment name", () => {
@@ -63,8 +82,8 @@ describe("deployment config", () => {
     expect(() => resolveAccountId("prod")).toThrow();
   });
 
-  it("exposes configured account ids as 12-digit strings", () => {
-    expect(AWS_ACCOUNT_IDS.nonprod).toMatch(/^\d{12}$/);
-    expect(AWS_ACCOUNT_IDS.prod).toMatch(/^\d{12}$/);
+  it("exposes configured CloudTamer account ids as 12-digit strings", () => {
+    expect(AWS_ACCOUNT_IDS.nonprod).toBe("205501819586");
+    expect(AWS_ACCOUNT_IDS.prod).toBe("609425363642");
   });
 });
