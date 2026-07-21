@@ -54,7 +54,6 @@ export const DEFAULT_REGION = "us-east-1";
 
 export const APPLICATION_NAME = "aisuite";
 export const MANAGED_BY = "AWS CDK";
-export const WORK_ITEM = "OY2-40308";
 
 /**
  * Fallback owner when `DEPLOYMENT_OWNER` is not exported. Override per repo/team
@@ -75,6 +74,7 @@ export interface StandardTags {
   ManagedBy: string;
   Owner: string;
   Protected: string;
+  DeployedAt: string
 }
 
 export interface DeploymentConfig {
@@ -115,6 +115,7 @@ export function getDeploymentConfig(
   const accountTier = DEPLOYMENT_ENVIRONMENT_ACCOUNT_TIER[environmentName];
   const protectedEnvironment = environmentName !== "dev";
 
+  const deployedAt = process.env.DEPLOYMENT_TIMESTAMP ?? new Date().toISOString();
   return {
     accountTier,
     awsEnvironment: {
@@ -123,7 +124,7 @@ export function getDeploymentConfig(
     },
     name: environmentName,
     protectedEnvironment,
-    stackName: `aisuite-${environmentName}-infrastructure`,
+    stackName: `${APPLICATION_NAME}-${environmentName}-infrastructure`,
     tags: {
       Application: APPLICATION_NAME,
       AwsAccountTier: accountTier,
@@ -131,6 +132,7 @@ export function getDeploymentConfig(
       ManagedBy: MANAGED_BY,
       Owner: process.env.DEPLOYMENT_OWNER ?? DEFAULT_OWNER,
       Protected: String(protectedEnvironment),
+      DeployedAt: deployedAt
     },
     vpcName: DEPLOYMENT_ENVIRONMENT_VPC_NAME[environmentName],
   };
