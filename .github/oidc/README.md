@@ -104,6 +104,17 @@ so local synth matches CI without relying on env exports alone.
 Subject claims require the workflow `environment:` key to match; that is already
 set in `.github/workflows/deploy.yml`.
 
+## CDK bootstrap
+
+Modern stack synthesis (`newStyleStackSynthesis`) needs a one-time
+`CDKToolkit` bootstrap in each AWS account/region before `cdk deploy`.
+CI synth does not require it; deploy does.
+
+Non-prod is bootstrapped. Prod still needs bootstrap before the first prod
+deploy. Use the CMS path-qualified permissions boundary and
+`AdministratorAccess` as the CloudFormation execution policy. Same-account
+GitHub OIDC deploy does not need `--trust`.
+
 ## Validate
 
 1. Manually dispatch **AISuite Deploy** for `dev`.
