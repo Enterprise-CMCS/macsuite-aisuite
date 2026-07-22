@@ -1,4 +1,4 @@
-name: AISuite CI
+name: AISuite Unit Tests
 
 on:
   pull_request:
@@ -12,12 +12,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: aisuite-ci-${{ github.ref }}
+  group: aisuite-unit-tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  validate:
-    name: Validate
+  unit-tests:
+    name: Unit tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -38,12 +38,5 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Type check
-        run: pnpm run type-check
-
-      - name: Synthesize CDK templates
-        run: |
-          pnpm run cdk:synth --context environment=dev
-          pnpm run cdk:synth --context environment=qa
-          pnpm run cdk:synth --context environment=uat
-          pnpm run cdk:synth --context environment=prod
+      - name: Run unit tests
+        run: pnpm test
