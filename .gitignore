@@ -1,0 +1,13 @@
+node_modules/
+cdk.out/
+coverage/
+dist/
+*.tsbuildinfo
+
+.env
+.env.*
+!.env.example
+
+pnpm-debug.log*
+.vscode/
+.DS_Store

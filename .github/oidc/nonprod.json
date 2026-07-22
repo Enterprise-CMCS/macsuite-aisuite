@@ -1,0 +1,18 @@
+[
+  {
+    "ParameterKey": "SubjectClaimFilters",
+    "ParameterValue": "repo:Enterprise-CMCS/macsuite-aisuite:environment:dev,repo:Enterprise-CMCS/macsuite-aisuite:environment:qa,repo:Enterprise-CMCS/macsuite-aisuite:environment:uat"
+  },
+  {
+    "ParameterKey": "RoleName",
+    "ParameterValue": "aisuite-github-oidc-deploy"
+  },
+  {
+    "ParameterKey": "Path",
+    "ParameterValue": "/delegatedadmin/developer/"
+  },
+  {
+    "ParameterKey": "CreateOidcProvider",
+    "ParameterValue": "true"
+  }
+]
