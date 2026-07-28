@@ -19,6 +19,9 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
+    env:
+      AISUITE_DEPLOY_REGION: ${{ vars.AISUITE_DEPLOY_REGION || 'us-east-1' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,9 +44,14 @@ jobs:
       - name: Type check
         run: pnpm run type-check
 
+      - name: Unit tests
+        run: pnpm test
+
+      # Stub VPC avoids assuming the deploy role on PRs (AdministratorAccess).
+      # Deploy workflow performs live Vpc.fromLookup after OIDC.
       - name: Synthesize CDK templates
         run: |
-          pnpm run cdk:synth --context environment=dev
-          pnpm run cdk:synth --context environment=qa
-          pnpm run cdk:synth --context environment=uat
-          pnpm run cdk:synth --context environment=prod
+          pnpm run cdk:synth --context environment=dev --context aisuite:stubVpc=true
+          pnpm run cdk:synth --context environment=qa --context aisuite:stubVpc=true
+          pnpm run cdk:synth --context environment=uat --context aisuite:stubVpc=true
+          pnpm run cdk:synth --context environment=prod --context aisuite:stubVpc=true

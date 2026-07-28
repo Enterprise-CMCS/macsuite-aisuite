@@ -68,15 +68,15 @@ jobs:
             exit 1
           }
 
-      - name: Synthesize CDK template
-        run: pnpm run cdk:synth --context environment=${DEPLOYMENT_ENV}
-
       - name: Configure cloud access
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AISUITE_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AISUITE_DEPLOY_REGION }}
           role-session-name: aisuite-${{ env.DEPLOYMENT_ENV }}-${{ github.run_id }}
+
+      - name: Synthesize CDK template
+        run: pnpm run cdk:synth --context environment=${DEPLOYMENT_ENV}
 
       - name: Review CDK diff
         run: pnpm run cdk:diff --context environment=${DEPLOYMENT_ENV}
