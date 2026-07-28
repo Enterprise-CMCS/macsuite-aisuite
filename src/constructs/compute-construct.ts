@@ -133,11 +133,14 @@ export class ComputeConstruct extends Construct {
     });
 
     this.service = new ecs.FargateService(this, "Service", {
-      circuitBreaker: { rollback: true },
+      // Keep the stack when the first deploy races ahead of the ECR image push
+      // or DB bootstrap; operators can force a new deployment after both exist.
+      circuitBreaker: { enable: true, rollback: false },
       cluster: this.cluster,
       desiredCount: protectedEnvironment ? 2 : 1,
+      healthCheckGracePeriod: cdk.Duration.minutes(5),
       maxHealthyPercent: 200,
-      minHealthyPercent: 50,
+      minHealthyPercent: 0,
       securityGroups: [props.appSecurityGroup],
       serviceName,
       taskDefinition,
