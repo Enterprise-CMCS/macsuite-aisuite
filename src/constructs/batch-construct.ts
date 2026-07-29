@@ -10,6 +10,10 @@ import { Construct } from "constructs";
 
 import { APPLICATION_NAME, type DeploymentConfig } from "../deployment-config";
 
+export const BATCH_IMAGE_TAG_CONTEXT_KEY = "aisuite:batchImageTag";
+
+const DEFAULT_BATCH_IMAGE_TAG = "latest";
+
 const BEDROCK_MODEL_ID = "us.amazon.nova-pro-v1:0";
 const BEDROCK_EMBED_MODEL_ID = "us.cohere.embed-v4:0";
 
@@ -99,7 +103,14 @@ export class BatchConstruct extends Construct {
       PIPELINE_TEMP_BUCKET: props.pipelineTempBucket.bucketName,
       POST_PROCESSING_BUCKET: props.postProcessingBucket.bucketName,
     };
-    const image = ecs.ContainerImage.fromEcrRepository(this.repository);
+    const imageTag =
+      (this.node.tryGetContext(BATCH_IMAGE_TAG_CONTEXT_KEY) as
+        | string
+        | undefined) ?? DEFAULT_BATCH_IMAGE_TAG;
+    const image = ecs.ContainerImage.fromEcrRepository(
+      this.repository,
+      imageTag,
+    );
 
     this.preProcessingTaskDefinition = this.createTaskDefinition({
       command: ["python", "-m", "data_preprocessing.pre_processing"],
@@ -138,6 +149,10 @@ export class BatchConstruct extends Construct {
         executionRole: this.executionRole,
         family: props.family,
         memoryLimitMiB: 2048,
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.X86_64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
         taskRole: props.taskRole,
       },
     );

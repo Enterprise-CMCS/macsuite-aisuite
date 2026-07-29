@@ -19,6 +19,8 @@ export const API_CONTAINER_PORT = 8001;
 
 export const API_HEALTH_CHECK_PATH = "/health";
 
+export const API_ACTIVATION_CONTEXT_KEY = "aisuite:activateApi";
+
 export const API_IMAGE_TAG_CONTEXT_KEY = "aisuite:apiImageTag";
 
 const DEFAULT_API_IMAGE_TAG = "latest";
@@ -102,6 +104,10 @@ export class ComputeConstruct extends Construct {
         ...TASK_SIZE_BY_ENVIRONMENT[name],
         executionRole,
         family: serviceName,
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.X86_64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
         taskRole: props.taskRole,
       },
     );
@@ -110,6 +116,11 @@ export class ComputeConstruct extends Construct {
       (this.node.tryGetContext(API_IMAGE_TAG_CONTEXT_KEY) as
         | string
         | undefined) ?? DEFAULT_API_IMAGE_TAG;
+    const activationContext = this.node.tryGetContext(
+      API_ACTIVATION_CONTEXT_KEY,
+    ) as unknown;
+    const apiActivated =
+      activationContext === true || activationContext === "true";
 
     const container = taskDefinition.addContainer("Container", {
       containerName: "rag-api",
@@ -133,11 +144,9 @@ export class ComputeConstruct extends Construct {
     });
 
     this.service = new ecs.FargateService(this, "Service", {
-      // Keep the stack when the first deploy races ahead of the ECR image push
-      // or DB bootstrap; operators can force a new deployment after both exist.
       circuitBreaker: { enable: true, rollback: false },
       cluster: this.cluster,
-      desiredCount: protectedEnvironment ? 2 : 1,
+      desiredCount: apiActivated ? (protectedEnvironment ? 2 : 1) : 0,
       healthCheckGracePeriod: cdk.Duration.minutes(5),
       maxHealthyPercent: 200,
       minHealthyPercent: 0,

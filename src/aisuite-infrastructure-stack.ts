@@ -4,6 +4,7 @@ import { Construct } from "constructs";
 
 import { AppIamConstruct } from "./constructs/app-iam-construct";
 import { BatchConstruct } from "./constructs/batch-construct";
+import { BootstrapConstruct } from "./constructs/bootstrap-construct";
 import { ComputeConstruct } from "./constructs/compute-construct";
 import { DatabaseConstruct } from "./constructs/database-construct";
 import { NetworkingConstruct } from "./constructs/networking-construct";
@@ -76,6 +77,16 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
       pipelineTempBucket: storage.pipelineTempBucket,
       postProcessingBucket: storage.postProcessingBucket,
       taskRole: appIam.taskRole,
+      vpc: networking.vpc,
+    });
+
+    const bootstrap = new BootstrapConstruct(this, "Bootstrap", {
+      appDbSecret: secrets.appDbSecret,
+      appSecurityGroup: networking.appSecurityGroup,
+      cluster: batch.cluster,
+      deploymentConfig,
+      masterDbSecret: secrets.dbSecret,
+      repository: batch.repository,
       vpc: networking.vpc,
     });
 
@@ -180,6 +191,27 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
     new cdk.CfnOutput(this, "BatchEcrRepositoryUri", {
       description: "ECR repository holding the RAG batch container image.",
       value: batch.repository.repositoryUri,
+    });
+
+    new cdk.CfnOutput(this, "BootstrapClusterName", {
+      description: "ECS cluster for the one-shot database bootstrap task.",
+      value: bootstrap.cluster.clusterName,
+    });
+
+    new cdk.CfnOutput(this, "BootstrapTaskDefinitionArn", {
+      description: "Task definition ARN for the database bootstrap task.",
+      value: bootstrap.taskDefinition.taskDefinitionArn,
+    });
+
+    new cdk.CfnOutput(this, "BootstrapSecurityGroupId", {
+      description: "Security group for the database bootstrap task.",
+      value: bootstrap.securityGroup.securityGroupId,
+    });
+
+    new cdk.CfnOutput(this, "BootstrapSubnetIds", {
+      description:
+        "Comma-separated private subnet IDs for the database bootstrap task.",
+      value: cdk.Fn.join(",", bootstrap.subnetIds),
     });
   }
 }

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { AisuiteInfrastructureStack } from "../src/aisuite-infrastructure-stack";
 import { STUB_VPC_CONTEXT_KEY } from "../src/constructs/networking-construct";
 import {
+  DEPLOYMENT_ENVIRONMENT_NAMES,
   type DeploymentEnvironmentName,
   getDeploymentConfig,
 } from "../src/deployment-config";
@@ -38,6 +39,9 @@ const DATA_RESOURCES = new Set([
   "AWS::SecretsManager::Secret",
 ]);
 
+const PROTECTED_ENVIRONMENT_NAMES = ["qa", "uat", "prod"] as const satisfies
+  readonly DeploymentEnvironmentName[];
+
 function synthesize(environmentName: DeploymentEnvironmentName): Template {
   const app = new cdk.App({ context: { [STUB_VPC_CONTEXT_KEY]: true } });
   const config = getDeploymentConfig(environmentName);
@@ -50,7 +54,7 @@ function synthesize(environmentName: DeploymentEnvironmentName): Template {
   return Template.fromStack(stack);
 }
 
-describe.each(["dev", "prod"] as const)(
+describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
   "AISuite %s data plane",
   (environmentName) => {
     it("creates exactly four private S3 buckets", () => {
@@ -217,29 +221,32 @@ describe("environment-specific data protection", () => {
     expect(resources).toHaveLength(0);
   });
 
-  it("protects prod resources from deletion", () => {
-    const template = synthesize("prod");
+  it.each(PROTECTED_ENVIRONMENT_NAMES)(
+    "protects %s resources from deletion",
+    (environmentName) => {
+      const template = synthesize(environmentName);
 
-    template.hasResourceProperties("AWS::RDS::DBInstance", {
-      DeletionProtection: true,
-    });
+      template.hasResourceProperties("AWS::RDS::DBInstance", {
+        DeletionProtection: true,
+      });
 
-    const resources = Object.values(
-      template.toJSON().Resources as Record<
-        string,
-        {
-          DeletionPolicy?: string;
-          Type?: string;
-          UpdateReplacePolicy?: string;
-        }
-      >,
-    ).filter(
-      (resource) =>
-        DATA_RESOURCES.has(resource.Type ?? "") &&
-        resource.DeletionPolicy === "Retain" &&
-        resource.UpdateReplacePolicy === "Retain",
-    );
+      const resources = Object.values(
+        template.toJSON().Resources as Record<
+          string,
+          {
+            DeletionPolicy?: string;
+            Type?: string;
+            UpdateReplacePolicy?: string;
+          }
+        >,
+      ).filter(
+        (resource) =>
+          DATA_RESOURCES.has(resource.Type ?? "") &&
+          resource.DeletionPolicy === "Retain" &&
+          resource.UpdateReplacePolicy === "Retain",
+      );
 
-    expect(resources).toHaveLength(7);
-  });
+      expect(resources).toHaveLength(7);
+    },
+  );
 });
