@@ -10,4 +10,7 @@ dist/
 
 pnpm-debug.log*
 .vscode/
+.cursor/
 .DS_Store
+cdk.context.json
+__pycache__/

@@ -68,9 +68,6 @@ jobs:
             exit 1
           }
 
-      - name: Synthesize CDK template
-        run: pnpm run cdk:synth --context environment=${DEPLOYMENT_ENV}
-
       - name: Configure cloud access
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -78,8 +75,192 @@ jobs:
           aws-region: ${{ env.AISUITE_DEPLOY_REGION }}
           role-session-name: aisuite-${{ env.DEPLOYMENT_ENV }}-${{ github.run_id }}
 
+      - name: Synthesize CDK template
+        run: pnpm run cdk:synth --context environment=${DEPLOYMENT_ENV}
+
       - name: Review CDK diff
         run: pnpm run cdk:diff --context environment=${DEPLOYMENT_ENV}
 
-      - name: Deploy CDK stack
-        run: pnpm run cdk:deploy --context environment=${DEPLOYMENT_ENV}
+      - name: Deploy infrastructure phase (desired count 0)
+        if: env.DEPLOYMENT_ENV == 'dev'
+        run: |
+          set -euo pipefail
+
+          pnpm run cdk:deploy \
+            --context environment=${DEPLOYMENT_ENV} \
+            --context aisuite:activateApi=false \
+            --context aisuite:apiImageTag=${{ github.sha }} \
+            --context aisuite:batchImageTag=${{ github.sha }}
+
+          STACK_NAME="aisuite-${DEPLOYMENT_ENV}-infrastructure"
+          STACK_OUTPUTS="$(aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query 'Stacks[0].Outputs' \
+            --output json)"
+
+          output_value() {
+            local output_key="$1"
+            local output_value
+            output_value="$(jq -er --arg key "${output_key}" \
+              '.[] | select(.OutputKey == $key) | .OutputValue' \
+              <<<"${STACK_OUTPUTS}")"
+            test -n "${output_value}"
+            printf '%s' "${output_value}"
+          }
+
+          {
+            echo "API_REPOSITORY_URI=$(output_value ApiEcrRepositoryUri)"
+            echo "BATCH_REPOSITORY_URI=$(output_value BatchEcrRepositoryUri)"
+            echo "BOOTSTRAP_CLUSTER_NAME=$(output_value BootstrapClusterName)"
+            echo "BOOTSTRAP_TASK_DEFINITION_ARN=$(output_value BootstrapTaskDefinitionArn)"
+            echo "BOOTSTRAP_SECURITY_GROUP_ID=$(output_value BootstrapSecurityGroupId)"
+            echo "BOOTSTRAP_SUBNET_IDS=$(output_value BootstrapSubnetIds)"
+            echo "API_CLUSTER_NAME=$(output_value ApiClusterName)"
+            echo "API_SERVICE_NAME=$(output_value ApiServiceName)"
+          } >>"${GITHUB_ENV}"
+
+      - name: Authenticate to Amazon ECR
+        if: env.DEPLOYMENT_ENV == 'dev'
+        run: |
+          set -euo pipefail
+
+          ECR_REGISTRY="${API_REPOSITORY_URI%%/*}"
+          test "${BATCH_REPOSITORY_URI%%/*}" = "${ECR_REGISTRY}"
+          aws ecr get-login-password \
+            | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Build and push API image (linux/amd64)
+        if: env.DEPLOYMENT_ENV == 'dev'
+        run: |
+          set -euo pipefail
+
+          IMAGE="${API_REPOSITORY_URI}:${{ github.sha }}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --tag "${IMAGE}" \
+            --push \
+            services/rag
+          docker buildx imagetools inspect "${IMAGE}" \
+            --format '{{json .Image}}' \
+            | jq -e '.os == "linux" and .architecture == "amd64"'
+
+      - name: Build and push batch image (linux/amd64)
+        if: env.DEPLOYMENT_ENV == 'dev'
+        run: |
+          set -euo pipefail
+
+          IMAGE="${BATCH_REPOSITORY_URI}:${{ github.sha }}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --tag "${IMAGE}" \
+            --push \
+            services/rag
+          docker buildx imagetools inspect "${IMAGE}" \
+            --format '{{json .Image}}' \
+            | jq -e '.os == "linux" and .architecture == "amd64"'
+
+      - name: Run database bootstrap task
+        if: env.DEPLOYMENT_ENV == 'dev'
+        run: |
+          set -euo pipefail
+
+          RUN_TASK_RESPONSE="$(aws ecs run-task \
+            --cluster "${BOOTSTRAP_CLUSTER_NAME}" \
+            --task-definition "${BOOTSTRAP_TASK_DEFINITION_ARN}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${BOOTSTRAP_SUBNET_IDS}],securityGroups=[${BOOTSTRAP_SECURITY_GROUP_ID}],assignPublicIp=DISABLED}" \
+            --output json)"
+
+          if ! jq -e \
+            '(.failures | length) == 0 and (.tasks | length) == 1' \
+            <<<"${RUN_TASK_RESPONSE}" >/dev/null; then
+            jq -r \
+              '.failures[]? | "bootstrap launch failure arn=\(.arn // "unknown") reason=\(.reason // "unknown") detail=\(.detail // "none")"' \
+              <<<"${RUN_TASK_RESPONSE}" >&2
+            exit 1
+          fi
+
+          TASK_ARN="$(jq -er '.tasks[0].taskArn' <<<"${RUN_TASK_RESPONSE}")"
+          echo "bootstrap task=${TASK_ARN}"
+          aws ecs wait tasks-stopped \
+            --cluster "${BOOTSTRAP_CLUSTER_NAME}" \
+            --tasks "${TASK_ARN}"
+
+          TASK_DESCRIPTION="$(aws ecs describe-tasks \
+            --cluster "${BOOTSTRAP_CLUSTER_NAME}" \
+            --tasks "${TASK_ARN}" \
+            --output json)"
+          TASK_STATUS="$(jq -er '.tasks[0].lastStatus' <<<"${TASK_DESCRIPTION}")"
+          STOP_CODE="$(jq -r '.tasks[0].stopCode // "none"' <<<"${TASK_DESCRIPTION}")"
+          STOPPED_REASON="$(jq -r '.tasks[0].stoppedReason // "none"' <<<"${TASK_DESCRIPTION}")"
+          CONTAINER_REASON="$(jq -r '.tasks[0].containers[0].reason // "none"' <<<"${TASK_DESCRIPTION}")"
+          EXIT_CODE="$(jq -r '.tasks[0].containers[0].exitCode // empty' <<<"${TASK_DESCRIPTION}")"
+
+          echo "bootstrap status=${TASK_STATUS} stopCode=${STOP_CODE}"
+          echo "bootstrap stoppedReason=${STOPPED_REASON}"
+          echo "bootstrap containerReason=${CONTAINER_REASON}"
+          echo "bootstrap logs=/ecs/aisuite-${DEPLOYMENT_ENV}-rag-db-bootstrap"
+          if test "${EXIT_CODE}" != "0"; then
+            echo "bootstrap exitCode=${EXIT_CODE:-missing}" >&2
+            exit 1
+          fi
+          echo "bootstrap exitCode=${EXIT_CODE}"
+
+      - name: Deploy activation phase (desired count 1)
+        if: env.DEPLOYMENT_ENV == 'dev'
+        run: |
+          set -euo pipefail
+
+          pnpm run cdk:deploy \
+            --context environment=${DEPLOYMENT_ENV} \
+            --context aisuite:activateApi=true \
+            --context aisuite:apiImageTag=${{ github.sha }} \
+            --context aisuite:batchImageTag=${{ github.sha }}
+
+      - name: Wait for ECS service stability
+        if: env.DEPLOYMENT_ENV == 'dev'
+        run: |
+          set -euo pipefail
+
+          echo "cluster=${API_CLUSTER_NAME} service=${API_SERVICE_NAME}"
+          aws ecs wait services-stable \
+            --cluster "${API_CLUSTER_NAME}" \
+            --services "${API_SERVICE_NAME}"
+
+      - name: Verify ALB target health
+        if: env.DEPLOYMENT_ENV == 'dev'
+        run: |
+          set -euo pipefail
+
+          TARGET_GROUP_ARN="$(aws ecs describe-services \
+            --cluster "${API_CLUSTER_NAME}" \
+            --services "${API_SERVICE_NAME}" \
+            --query 'services[0].loadBalancers[0].targetGroupArn' \
+            --output text)"
+          test -n "${TARGET_GROUP_ARN}"
+          test "${TARGET_GROUP_ARN}" != "None"
+          echo "targetGroup=${TARGET_GROUP_ARN}"
+
+          TARGET_HEALTH="$(aws elbv2 describe-target-health \
+            --target-group-arn "${TARGET_GROUP_ARN}" \
+            --output json)"
+          jq -r \
+            '.TargetHealthDescriptions[]? | "target=\(.Target.Id):\(.Target.Port) state=\(.TargetHealth.State) reason=\(.TargetHealth.Reason // "none")"' \
+            <<<"${TARGET_HEALTH}"
+          jq -e \
+            '[.TargetHealthDescriptions[]? | select(.TargetHealth.State == "healthy")] | length > 0' \
+            <<<"${TARGET_HEALTH}" >/dev/null
+
+      - name: Deploy infrastructure only (API inactive)
+        if: env.DEPLOYMENT_ENV != 'dev'
+        run: |
+          set -euo pipefail
+
+          echo "Runtime activation is supported only for dev; deploying ${DEPLOYMENT_ENV} with the API inactive."
+          pnpm run cdk:deploy \
+            --context environment=${DEPLOYMENT_ENV} \
+            --context aisuite:activateApi=false \
+            --context aisuite:apiImageTag=${{ github.sha }} \
+            --context aisuite:batchImageTag=${{ github.sha }}
