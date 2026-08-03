@@ -1,10 +1,11 @@
 import json
 import os
-import configparser
 
 from common.utils.logger import log
+from common.utils import contract_config as contract_cfg
 
 _RAISE_IF_MISSING = object()
+
 
 class Helper:
 
@@ -19,6 +20,7 @@ class Helper:
         "foundation_llm_model_id": ("BEDROCK_MODEL_ID",),
         "model_id_bedrock_profile_embed": ("BEDROCK_EMBED_MODEL_ID",),
         "model_id_bedrock_embeddings": ("BEDROCK_EMBED_MODEL_ID",),
+        "embeddings_table_name": ("EMBEDDINGS_TABLE_NAME",),
     }
 
     @staticmethod
@@ -30,32 +32,62 @@ class Helper:
         return None
 
     @staticmethod
+    def resolve_config_path(config_file='aws.properties.ini'):
+        return contract_cfg.resolve_config_path(
+            config_file,
+            utils_dir=os.path.dirname(os.path.abspath(__file__)),
+        )
+
+    @staticmethod
+    def load_config(config_file='aws.properties.ini'):
+        config_path = Helper.resolve_config_path(config_file)
+        try:
+            return contract_cfg.load_config(config_path)
+        except FileNotFoundError:
+            log.error(f"load_config() Configuration file '{config_path}' not found.")
+            raise
+
+    @staticmethod
+    def contract_sections(config):
+        return contract_cfg.contract_sections(config)
+
+    @staticmethod
+    def resolve_active_contract_section(config):
+        return contract_cfg.resolve_active_contract_section(config)
+
+    @staticmethod
+    def list_embeddings_table_names(config_file='aws.properties.ini'):
+        config = Helper.load_config(config_file)
+        return contract_cfg.list_embeddings_table_names_from_config(config)
+
+    @staticmethod
+    def validate_embeddings_table_name(table_name):
+        return contract_cfg.validate_embeddings_table_name(table_name)
+
+    @staticmethod
+    def get_embeddings_table_name(config_file='aws.properties.ini', default="embeddings"):
+        name = Helper.get_property(
+            "embeddings_table_name",
+            config_file=config_file,
+            default=default,
+        )
+        return Helper.validate_embeddings_table_name(name.strip())
+
+    @staticmethod
     def get_property(str_property_name, config_file='aws.properties.ini', default=_RAISE_IF_MISSING):
         env_value = Helper.get_env_property(str_property_name)
         if env_value:
             log.debug(f"get_property() Property name = {str_property_name} resolved from environment.")
             return env_value
 
-        ai_prop_file = os.getenv("AIPropFile")
         try:
-            if ai_prop_file is not None and ai_prop_file != "":
-                config_file = ai_prop_file.strip()
-                log.debug(f"{config_file}get_property() Property file variable AIPropFile from environment is either None or an empty string.")
-            else:
-                log.debug(f"get_property() Property file variable AIPropFile from environment is either None or an empty string.")
-            config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), config_file)
-            log.debug(f"Path from where INI file will be loaded config_path= {config_path}" )
-
-            if not os.path.exists(config_path):
-                log.error(f"get_property() Error: Configuration file '{config_path}' not found.")
-
-            config = configparser.ConfigParser()
-            config.read(config_path)
-            str_property_val = config["default"][str_property_name]
-            log.debug(f"Property name = {str_property_name}, Value = {str_property_val}")
-
-            #1/0
-            return str_property_val
+            config = Helper.load_config(config_file)
+            return contract_cfg.get_config_property(
+                config,
+                str_property_name,
+                default=default if default is not _RAISE_IF_MISSING else None,
+                raise_if_missing=default is _RAISE_IF_MISSING,
+            )
         except KeyError as lclEx:
             if default is not _RAISE_IF_MISSING:
                 log.debug(f"get_property() Property '{str_property_name}' is absent from the property file, using the supplied default.")
@@ -76,18 +108,11 @@ class Helper:
             log.debug(
                 f"getConfigAWSProperties() Property file variable AIPropFile from environment is either None or an empty string.")
 
-        if not os.path.exists(config_file):
-            log.error(f"getConfigAWSProperties() Error: Configuration file '{config_file}' not found.")
-        config = configparser.ConfigParser()
-
-        # Check if the file exists
-        if not os.path.exists(config_file):
+        try:
+            return Helper.load_config(config_file)
+        except FileNotFoundError:
             print(f"getConfigAWSProperties() Error: Configuration file '{config_file}' not found.")
             return None
-
-        # Read the file
-        config.read(config_file)
-        return config
 
     @staticmethod
     def create_file(bucket_name, str_file_name, file_data, str_folder=None):
