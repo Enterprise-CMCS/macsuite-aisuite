@@ -4,13 +4,15 @@ import numpy as np
 from data_embeddings_storage.database import connection
 from data_embeddings_storage.database.embeddings_client import BedrockEmbeddingClient
 from data_embeddings_storage.database.connection import initialization_db, close_db, get_connection, release_connection
+from common.utils.helper import Helper
 
 
 class EmbeddingProcessor:
 
-    def __init__(self, max_concurrent_requests=1):
+    def __init__(self, max_concurrent_requests=1, table_name=None):
         self.embedding_client = BedrockEmbeddingClient()
         self.max_concurrent_requests = max_concurrent_requests
+        self.table_name = table_name or Helper.get_embeddings_table_name()
     
     async def process_data(self, data, batch_size=1):
 
@@ -101,8 +103,8 @@ class EmbeddingProcessor:
                         batch_status["errors"].append("Empty embedding received")
                         continue
 
-                    doc_id = await pool.fetchval("""
-                        INSERT INTO embeddings (text, metadata, embedding)
+                    doc_id = await pool.fetchval(f"""
+                        INSERT INTO {self.table_name} (text, metadata, embedding)
                         VALUES ($1, $2, $3)
                         RETURNING id
                     """, text, metadata_json, embedding_flat)

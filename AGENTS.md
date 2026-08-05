@@ -66,5 +66,6 @@ Use `pnpm run test:coverage` when coverage is relevant. CI runs the same gates.
 - Agent harness overlay (specs/tasks) lives under `.cursor/harness`.
 - CloudTamer VPC Name tags map in config: `dev`→`aisuite-east-dev`, `qa`→`aisuite-east-qa`, `uat`→`aisuite-east-test`, `prod`→`aisuite-east-prod` (keep names; do not rename VPCs).
 - Database target is internal-only RDS Postgres 16.
-- Near-term delivery focus is `dev`; training PDFs/docs may be missing until uploaded to buckets.
+- Near-term delivery focus is `dev`. Contract docs are under `aisuite-dev-contract-rag` at: `state_of_ME/MCR-ME-0002-NEMT/`, `state_of_TN/MCCRS-TN-6756-TennCare/`, `state_of_WA/MCCRS-WA-6369-IFC/`, `state_of_WA/MCCRS-WA-6472-AHIMC/`, `state_of_WA/MCCRS-WA-6473-IFC/`.
+- Per-contract RAG config (`services/rag/common/utils/aws.properties.ini`): exactly one `[contract:*]` with `active = true` (default `tn_6756`). Shared buckets `aisuite-dev-contract-rag`, `…-post-processing`, `…-llm-pipeline-code`, `…-llm-pipeline-temp`; per contract: prefixes + `embeddings_table_name`. See `services/rag/README.md`.
 - Jira project CLDSPT exists, but there is no single board or sprint cadence yet.

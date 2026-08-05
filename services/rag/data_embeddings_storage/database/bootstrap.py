@@ -4,9 +4,15 @@ import sys
 
 import asyncpg
 
+from common.utils.helper import Helper
+from data_embeddings_storage.database.embeddings_schema import (
+    EMBEDDING_DIMENSION,
+    create_embeddings_table_sql,
+    embeddings_index_statements,
+)
+
 
 APP_ROLE = "aisuite_app"
-EMBEDDING_DIMENSION = 1536
 
 
 def required_environment(name: str) -> str:
@@ -14,6 +20,18 @@ def required_environment(name: str) -> str:
     if not value:
         raise RuntimeError(f"Required environment variable {name} is not set")
     return value
+
+
+def embeddings_tables_to_bootstrap() -> list[str]:
+    return Helper.list_embeddings_table_names()
+
+
+async def ensure_embeddings_table(connection, table_name: str) -> None:
+    await connection.execute(
+        create_embeddings_table_sql(table_name, EMBEDDING_DIMENSION),
+    )
+    for statement in embeddings_index_statements(table_name):
+        await connection.execute(statement)
 
 
 async def bootstrap_database() -> None:
@@ -36,57 +54,9 @@ async def bootstrap_database() -> None:
             )
             await connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
             await connection.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-            await connection.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS embeddings (
-                    id SERIAL PRIMARY KEY,
-                    text TEXT NOT NULL,
-                    metadata JSONB DEFAULT NULL,
-                    embedding VECTOR({EMBEDDING_DIMENSION}) NOT NULL,
-                    search_tsv tsvector GENERATED ALWAYS AS (
-                        setweight(
-                            to_tsvector('english', coalesce(text, '')),
-                            'A'
-                        ) ||
-                        setweight(
-                            to_tsvector(
-                                'english',
-                                coalesce(metadata::text, '')
-                            ),
-                            'B'
-                        )
-                    ) STORED,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """,
-            )
-            await connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_embeddings_hnsw
-                ON embeddings
-                USING hnsw (embedding vector_cosine_ops)
-                WITH (m=16, ef_construction=128)
-                """,
-            )
-            await connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_embeddings_metadata
-                ON embeddings USING GIN (metadata)
-                """,
-            )
-            await connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_search_text_trgm
-                ON embeddings USING GIN (text gin_trgm_ops)
-                """,
-            )
-            await connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_search_tsv
-                ON embeddings USING GIN (search_tsv)
-                """,
-            )
+
+            for table_name in embeddings_tables_to_bootstrap():
+                await ensure_embeddings_table(connection, table_name)
 
             role_exists = await connection.fetchval(
                 "SELECT EXISTS("
