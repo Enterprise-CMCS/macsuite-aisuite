@@ -36,6 +36,15 @@ export const DEPLOYMENT_ENVIRONMENT_VPC_NAME = {
 } as const satisfies Record<DeploymentEnvironmentName, string>;
 
 /**
+ * Optional CloudTamer cmscloud-vpn SG; attached to RDS so VPN/Zscaler can reach it.
+ */
+export const DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID: Partial<
+  Record<DeploymentEnvironmentName, string>
+> = {
+  dev: "sg-0964f9710d200b1ac",
+};
+
+/**
  * Explicit AISuite AWS account IDs (CloudTamer aisuite-non-prod / aisuite-prod).
  * Runtime env overrides (`AISUITE_NONPROD_ACCOUNT_ID` /
  * `AISUITE_PROD_ACCOUNT_ID`) win when set (CI / local override).
@@ -86,6 +95,8 @@ export interface DeploymentConfig {
   tags: StandardTags;
   /** CloudTamer VPC Name tag for this stage (use with `ec2.Vpc.fromLookup`). */
   vpcName: (typeof DEPLOYMENT_ENVIRONMENT_VPC_NAME)[DeploymentEnvironmentName];
+  /** CloudTamer cmscloud-vpn SG id when this stage allows VPN access to RDS. */
+  vpnSecurityGroupId?: string;
 }
 
 const ACCOUNT_ID_PATTERN = /^\d{12}$/;
@@ -135,6 +146,8 @@ export function getDeploymentConfig(
       DeployedAt: deployedAt
     },
     vpcName: DEPLOYMENT_ENVIRONMENT_VPC_NAME[environmentName],
+    vpnSecurityGroupId:
+      DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
   };
 }
 

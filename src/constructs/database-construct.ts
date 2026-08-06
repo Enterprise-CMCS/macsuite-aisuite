@@ -42,7 +42,20 @@ export class DatabaseConstruct extends Construct {
   ) {
     super(scope, id);
 
-    const { name, protectedEnvironment } = props.deploymentConfig;
+    const { name, protectedEnvironment, vpnSecurityGroupId } =
+      props.deploymentConfig;
+
+    const securityGroups: ec2.ISecurityGroup[] = [props.dbSecurityGroup];
+    if (vpnSecurityGroupId) {
+      securityGroups.push(
+        ec2.SecurityGroup.fromSecurityGroupId(
+          this,
+          "VpnAccessSecurityGroup",
+          vpnSecurityGroupId,
+          { mutable: false },
+        ),
+      );
+    }
 
     this.instance = new rds.DatabaseInstance(this, "RagDatabase", {
       allocatedStorage: 100,
@@ -66,7 +79,7 @@ export class DatabaseConstruct extends Construct {
       removalPolicy: protectedEnvironment
         ? cdk.RemovalPolicy.RETAIN
         : cdk.RemovalPolicy.DESTROY,
-      securityGroups: [props.dbSecurityGroup],
+      securityGroups,
       storageEncrypted: true,
       storageType: rds.StorageType.GP3,
       vpc: props.vpc,
