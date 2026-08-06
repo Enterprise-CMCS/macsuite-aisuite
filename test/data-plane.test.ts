@@ -93,6 +93,26 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       }
     });
 
+    it("attaches CloudTamer VPN SG to RDS only in configured environments", () => {
+      const template = synthesize(environmentName);
+      const config = getDeploymentConfig(environmentName);
+      const dbInstances = Object.values(
+        template.findResources("AWS::RDS::DBInstance"),
+      );
+      expect(dbInstances).toHaveLength(1);
+
+      const vpcSecurityGroups = dbInstances[0]?.Properties
+        ?.VPCSecurityGroups as unknown[];
+      expect(Array.isArray(vpcSecurityGroups)).toBe(true);
+
+      if (config.vpnSecurityGroupId) {
+        expect(vpcSecurityGroups).toHaveLength(2);
+        expect(vpcSecurityGroups).toContain(config.vpnSecurityGroupId);
+      } else {
+        expect(vpcSecurityGroups).toHaveLength(1);
+      }
+    });
+
     it("encrypts RDS storage and provisions master + app database secrets", () => {
       const template = synthesize(environmentName);
 

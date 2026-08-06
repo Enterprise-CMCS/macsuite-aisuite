@@ -239,13 +239,32 @@ The bootstrap entrypoint is
 `data_embeddings_storage.database.bootstrap`. It runs idempotently and:
 
 - creates the `vector` and `pg_trgm` extensions;
+- creates the dedicated `aisuite_schema` (not `public`) for application objects;
+- migrates any legacy `public.embeddings*` tables into `aisuite_schema`;
 - creates each contract’s embeddings table (from `aws.properties.ini`) and HNSW,
   metadata GIN, trigram GIN, and full-text GIN indexes matching `table_setup.py`;
 - creates `aisuite_app` or safely updates its password from the app secret;
-- grants `CONNECT` on the database, `USAGE` on the `public` schema, table
-  `SELECT`/`INSERT`/`UPDATE`/`DELETE`, sequence `USAGE`/`SELECT`, and function
-  `EXECUTE`; and
-- grants default table DML and sequence usage/select privileges in `public`.
+- grants `CONNECT` on the database and schema/table privileges on
+  `aisuite_schema` to `aisuite_app` and `aisuite_app_clone` (Secrets Manager
+  multi-user rotation), including `CREATE` on the app schema for idempotent
+  table setup;
+- sets each app role’s `search_path` to `aisuite_schema, public`; and
+- grants default table DML and sequence usage/select privileges in
+  `aisuite_schema` for objects created by the bootstrap master role.
+
+Runtime connections set `search_path` on pool init so unqualified table names
+resolve to `aisuite_schema` regardless of which rotation login is active.
+
+### Operator remediation (VPN + CLI)
+
+```sh
+export AWS_PROFILE=aisuite-dev
+./scripts/psql-rag.sh --master -v ON_ERROR_STOP=1 -f scripts/sql/init-aisuite-schema.sql
+./scripts/psql-rag.sh --probe
+```
+
+`init-aisuite-schema.sql` creates the schema, migrates leftover
+`public.embeddings*`, and grants both app roles (not full table DDL).
 
 After bootstrap, applications use
 `aisuite/{env}/rag-app-db-credentials`, not the master

@@ -1,6 +1,8 @@
 import asyncpg
 from common.utils.helper import Helper
 from common.utils.settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+from data_embeddings_storage.database.embeddings_schema import SEARCH_PATH_SQL
+
 
 async def check_embeddings_table(table_name=None):
     resolved_table = table_name or Helper.get_embeddings_table_name()
@@ -9,10 +11,12 @@ async def check_embeddings_table(table_name=None):
         password=DB_PASSWORD,
         database=DB_NAME,
         host=DB_HOST,
-        port=DB_PORT
+        port=DB_PORT,
+        ssl="require",
     )
 
     try:
+        await conn.execute(SEARCH_PATH_SQL)
         table_exists = await conn.fetchval(f"""
             SELECT COUNT(*) FROM {resolved_table};
         """)

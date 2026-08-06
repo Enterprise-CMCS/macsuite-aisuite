@@ -19,6 +19,7 @@ from common.utils.contract_config import (  # noqa: E402
 )
 from data_embeddings_storage.database.embeddings_schema import (  # noqa: E402
     create_embeddings_table_sql,
+    embeddings_index_statements,
 )
 
 
@@ -154,8 +155,17 @@ class ActiveContractResolutionTests(unittest.TestCase):
 
     def test_create_sql_uses_validated_table_name(self):
         sql = create_embeddings_table_sql("embeddings_tn_6756_tenncare")
-        self.assertIn("CREATE TABLE IF NOT EXISTS embeddings_tn_6756_tenncare", sql)
+        self.assertIn(
+            "CREATE TABLE IF NOT EXISTS aisuite_schema.embeddings_tn_6756_tenncare",
+            sql,
+        )
         self.assertIn("VECTOR(1536)", sql)
+
+    def test_index_sql_is_schema_qualified(self):
+        statements = embeddings_index_statements("embeddings_tn_6756_tenncare")
+        self.assertTrue(statements)
+        for statement in statements:
+            self.assertIn("ON aisuite_schema.embeddings_tn_6756_tenncare", statement)
 
 
 if __name__ == "__main__":

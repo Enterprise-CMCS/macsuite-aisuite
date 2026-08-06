@@ -4,6 +4,7 @@ import {
   AWS_ACCOUNT_IDS,
   DEPLOYMENT_ENVIRONMENT_NAMES,
   DEPLOYMENT_ENVIRONMENT_VPC_NAME,
+  DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID,
   getDeploymentConfig,
   resolveAccountId,
 } from "../src/deployment-config";
@@ -24,6 +25,7 @@ describe("deployment config", () => {
     expect(config.protectedEnvironment).toBe(false);
     expect(config.stackName).toBe("aisuite-dev-infrastructure");
     expect(config.vpcName).toBe("aisuite-east-dev");
+    expect(config.vpnSecurityGroupId).toBe("sg-0964f9710d200b1ac");
     expect(config.awsEnvironment.account).toMatch(/^\d{12}$/);
     expect(config.awsEnvironment.region).toBeTruthy();
     expect(config.tags.Application).toBe("aisuite");
@@ -53,6 +55,18 @@ describe("deployment config", () => {
         DEPLOYMENT_ENVIRONMENT_VPC_NAME[environmentName],
       );
     }
+  });
+
+  it("attaches CloudTamer VPN access SG only where configured", () => {
+    expect(DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID).toEqual({
+      dev: "sg-0964f9710d200b1ac",
+    });
+    expect(getDeploymentConfig("dev").vpnSecurityGroupId).toBe(
+      "sg-0964f9710d200b1ac",
+    );
+    expect(getDeploymentConfig("qa").vpnSecurityGroupId).toBeUndefined();
+    expect(getDeploymentConfig("uat").vpnSecurityGroupId).toBeUndefined();
+    expect(getDeploymentConfig("prod").vpnSecurityGroupId).toBeUndefined();
   });
 
   it("covers every declared deployment environment name", () => {
