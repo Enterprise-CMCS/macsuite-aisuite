@@ -15,10 +15,13 @@ if RAG_ROOT not in sys.path:
 from data_embeddings_storage.database.bootstrap import (  # noqa: E402
     APP_ROLE,
     APP_ROTATION_ROLES,
+    ensure_app_owner_role,
     grant_app_role_privileges,
     migrate_public_embeddings_tables,
+    reassign_schema_objects,
 )
 from data_embeddings_storage.database.embeddings_schema import (  # noqa: E402
+    APP_OWNER_ROLE,
     APP_SCHEMA,
     SEARCH_PATH_SQL,
     qualified_embeddings_table,
@@ -64,6 +67,71 @@ class BootstrapHelpersTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(connection.execute.await_count, 9)
+
+    async def test_ensure_app_owner_role_grants_current_user_and_existing_roles(self):
+        connection = AsyncMock()
+        connection.fetchval = AsyncMock(
+            side_effect=[
+                False,  # owner does not exist -> CREATE
+                "CREATE ROLE aisuite_app_owner NOLOGIN",
+                "GRANT aisuite_app_owner TO aisuite_admin",
+                True,  # aisuite_app exists
+                "GRANT aisuite_app_owner TO aisuite_app",
+                "ALTER ROLE aisuite_app INHERIT",
+                False,  # aisuite_app_clone missing
+            ]
+        )
+        connection.execute = AsyncMock()
+
+        await ensure_app_owner_role(connection)
+
+        executed = [c.args[0] for c in connection.execute.await_args_list]
+        self.assertIn("CREATE ROLE aisuite_app_owner NOLOGIN", executed)
+        self.assertIn("GRANT aisuite_app_owner TO aisuite_admin", executed)
+        self.assertIn("GRANT aisuite_app_owner TO aisuite_app", executed)
+        self.assertIn("ALTER ROLE aisuite_app INHERIT", executed)
+        self.assertFalse(
+            any("aisuite_app_clone" in str(stmt) for stmt in executed),
+        )
+
+    async def test_reassign_schema_objects_alters_tables_and_sequences(self):
+        connection = AsyncMock()
+        connection.fetch = AsyncMock(
+            side_effect=[
+                [
+                    {"tablename": "embeddings"},
+                    {"tablename": "embeddings_tn_6756_tenncare"},
+                ],
+                [
+                    {"seqname": "embeddings_id_seq"},
+                    {"seqname": "embeddings_tn_6756_tenncare_id_seq"},
+                ],
+            ]
+        )
+        connection.fetchval = AsyncMock(
+            side_effect=[
+                "ALTER SCHEMA aisuite_schema OWNER TO aisuite_app_owner",
+                "ALTER TABLE aisuite_schema.embeddings OWNER TO aisuite_app_owner",
+                (
+                    "ALTER TABLE aisuite_schema.embeddings_tn_6756_tenncare "
+                    "OWNER TO aisuite_app_owner"
+                ),
+                (
+                    "ALTER SEQUENCE aisuite_schema.embeddings_id_seq "
+                    "OWNER TO aisuite_app_owner"
+                ),
+                (
+                    "ALTER SEQUENCE aisuite_schema.embeddings_tn_6756_tenncare_id_seq "
+                    "OWNER TO aisuite_app_owner"
+                ),
+            ]
+        )
+        connection.execute = AsyncMock()
+
+        await reassign_schema_objects(connection, APP_SCHEMA)
+
+        self.assertEqual(connection.execute.await_count, 5)
+        self.assertEqual(APP_OWNER_ROLE, "aisuite_app_owner")
 
 
 if __name__ == "__main__":
