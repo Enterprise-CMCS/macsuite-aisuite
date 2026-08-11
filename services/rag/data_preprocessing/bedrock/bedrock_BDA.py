@@ -123,58 +123,38 @@ def create_bda_project(projectname, project_description, project_stage):
     return new_project_arn
 
 
-def get_nested_value(data, path):
-    log.debug("***************** bedrock_BDA.get_nested_value start *****************************")
-    keys = path.split('.')
-    for key in keys:
-        if isinstance(data, dict) and key in data:
-            data = data[key]
-        else:
-            return None
-    return data
+def wait_for_all_jobs(jobs, max_iterations=15, delay=30):
+    log.info(f"***************** bedrock_BDA.wait_for_all_jobs start ***** Number of jobs={len(jobs)} *****")
+    pending = list(jobs)
 
-
-def wait_for_completion(client,get_status_function,status_kwargs,status_path_in_response,completion_states,error_states,max_iterations=60,delay=10):
-    log.info("***************** bedrock_BDA.wait_for_completion start *****************************")
     for currentIterations in range(max_iterations):
         log.debug(f" Current Iteration={currentIterations}")
-        try:
-            response = get_status_function(**status_kwargs)
-            status = get_nested_value(response, status_path_in_response)
+        still_pending = []
+        for job in pending:
+            try:
+                response = bda_runtime_client.get_data_automation_status(invocationArn=job["arn"])
+                status = response.get("status")
+            except ClientError as lclException:
+                print("Error Occurred")
+                Helper.print_exception("wait_for_all_jobs", lclException, extra_msg="Exception occurred")
+                raise Exception(f"Exception Occurred Error checking status: {str(lclException)}")
 
-            if status in completion_states:
-                log.debug(f"Operation completed successfully with status: {status}")
-                return response
+            if status == "Success":
+                log.info(f"Job completed for {job['name']}: final status={status}")
+            elif status in ['ClientError', 'ServiceError']:
+                log.error("Error", error=f"wait_for_all_jobs() Job failed for {job['name']} with status: {status}")
+                raise Exception(f"wait_for_all_jobs() Job failed for {job['name']} with status: {status}")
+            else:
+                log.debug(f"Current status for {job['name']}: {status}. Waiting...")
+                still_pending.append(job)
 
-            if status in error_states:
-                log.error("Error", error=f"wait_for_completion() Operation failed with status: {status}")
-                raise Exception(f"wait_for_completion() Operation failed with status: {status}")
+        pending = still_pending
+        if not pending:
+            log.info("***************** bedrock_BDA.wait_for_all_jobs End ***** All jobs completed *****")
+            return
+        time.sleep(delay)
 
-            log.debug(f"Current status: {status}. Waiting...")
-            time.sleep(delay) 
-
-        except ClientError as lclException:
-            print("Error Occurred")
-            Helper.print_exception("wait_for_completion", lclException, extra_msg="Exception occurred")
-            raise Exception(f"Exception Occurred Error checking status: {str(lclException)}")
-
-    raise Exception(f"wait_for_completion() Operation timed out after {max_iterations} iterations")
-
-
-def wait_for_job_to_complete(invocation_arn):
-    log.debug("***************** bedrock_BDA.wait_for_job_to_complete start *****************************")
-    get_status_response = wait_for_completion(
-        client=bda_runtime_client,
-        get_status_function=bda_runtime_client.get_data_automation_status,
-        status_kwargs={'invocationArn': invocation_arn},
-        completion_states=['Success'],
-        error_states=['ClientError', 'ServiceError'],
-        status_path_in_response='status',
-        max_iterations=15,
-        delay=30
-    )
-    log.info(f"***************** bedrock_BDA.wait_for_job_to_complete End ******** Returning get_status_response= {get_status_response}***************")
-    return get_status_response
+    raise Exception(f"wait_for_all_jobs() Operation timed out after {max_iterations} iterations. Jobs still running={[job['name'] for job in pending]}")
 
 
 def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da_profile_arn, project_stage):
@@ -238,11 +218,13 @@ def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da
         
         invocation_arn = response.get("invocationArn")
         if invocation_arn:
-            log.debug(f"Waiting for job to complete for:{rename_file_info}")
-            job_status = wait_for_job_to_complete(invocation_arn)
-            log.info(f"Job completed for {rename_file_info}: final status={job_status.get('status')}")
+            log.info(f"Started BDA job for {rename_file_info}. invocation_arn={invocation_arn}")
+            invoked.append({"name": rename_file_info, "key": key, "arn": invocation_arn})
 
         log.debug(f"********************************** Key ={key} *********************** End  ")
+
+    log.info(f"All BDA jobs started. Number of jobs={len(invoked)}. Now waiting for them to finish.")
+    wait_for_all_jobs(invoked)
     log.debug(f"****************** bda_invoke() ******************************* End ****************************")
     return invoked
 

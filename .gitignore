@@ -5,8 +5,11 @@ dist/
 *.tsbuildinfo
 
 .env
+.venv
 .env.*
 !.env.example
+
+data/*
 
 pnpm-debug.log*
 .vscode/
