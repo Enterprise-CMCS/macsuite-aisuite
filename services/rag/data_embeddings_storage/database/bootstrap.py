@@ -6,11 +6,13 @@ import asyncpg
 
 from common.utils.helper import Helper
 from data_embeddings_storage.database.embeddings_schema import (
+    APP_OWNER_ROLE,
     APP_SCHEMA,
-    EMBEDDING_DIMENSION,
-    create_embeddings_table_sql,
-    embeddings_index_statements,
     validate_app_schema,
+)
+from data_embeddings_storage.database.table_objects import (
+    ensure_indexes,
+    ensure_table,
 )
 
 
@@ -30,11 +32,8 @@ def embeddings_tables_to_bootstrap() -> list[str]:
 
 
 async def ensure_embeddings_table(connection, table_name: str) -> None:
-    await connection.execute(
-        create_embeddings_table_sql(table_name, EMBEDDING_DIMENSION),
-    )
-    for statement in embeddings_index_statements(table_name):
-        await connection.execute(statement)
+    await ensure_table(connection, table_name)
+    await ensure_indexes(connection, table_name)
 
 
 async def role_exists(connection, role_name: str) -> bool:
@@ -58,6 +57,85 @@ async def ensure_app_role(connection, app_password: str) -> None:
         app_password,
     )
     await connection.execute(role_statement)
+
+
+async def ensure_app_owner_role(connection) -> None:
+    if not await role_exists(connection, APP_OWNER_ROLE):
+        await _execute_format(
+            connection,
+            "SELECT format('CREATE ROLE %I NOLOGIN', $1::text)",
+            APP_OWNER_ROLE,
+        )
+
+    # RDS master is not superuser; membership is required to reassign ownership.
+    await _execute_format(
+        connection,
+        "SELECT format('GRANT %I TO %I', $1::text, current_user::text)",
+        APP_OWNER_ROLE,
+    )
+
+    for role_name in APP_ROTATION_ROLES:
+        if not await role_exists(connection, role_name):
+            continue
+        await _execute_format(
+            connection,
+            "SELECT format('GRANT %I TO %I', $1::text, $2::text)",
+            APP_OWNER_ROLE,
+            role_name,
+        )
+        await _execute_format(
+            connection,
+            "SELECT format('ALTER ROLE %I INHERIT', $1::text)",
+            role_name,
+        )
+
+
+async def reassign_schema_objects(connection, schema: str) -> None:
+    await _execute_format(
+        connection,
+        "SELECT format('ALTER SCHEMA %I OWNER TO %I', $1::text, $2::text)",
+        schema,
+        APP_OWNER_ROLE,
+    )
+
+    tables = await connection.fetch(
+        """
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = $1
+        ORDER BY tablename
+        """,
+        schema,
+    )
+    for row in tables:
+        await _execute_format(
+            connection,
+            "SELECT format("
+            "'ALTER TABLE %I.%I OWNER TO %I', $1::text, $2::text, $3::text)",
+            schema,
+            row["tablename"],
+            APP_OWNER_ROLE,
+        )
+
+    sequences = await connection.fetch(
+        """
+        SELECT c.relname AS seqname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relkind = 'S'
+        ORDER BY c.relname
+        """,
+        schema,
+    )
+    for row in sequences:
+        await _execute_format(
+            connection,
+            "SELECT format("
+            "'ALTER SEQUENCE %I.%I OWNER TO %I', $1::text, $2::text, $3::text)",
+            schema,
+            row["seqname"],
+            APP_OWNER_ROLE,
+        )
 
 
 async def _execute_format(connection, format_expr: str, *args) -> None:
@@ -184,6 +262,7 @@ async def bootstrap_database() -> None:
             await connection.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
 
             await ensure_app_role(connection, app_password)
+            await ensure_app_owner_role(connection)
             await _execute_format(
                 connection,
                 "SELECT format('CREATE SCHEMA IF NOT EXISTS %I', $1::text)",
@@ -193,6 +272,8 @@ async def bootstrap_database() -> None:
 
             for table_name in embeddings_tables_to_bootstrap():
                 await ensure_embeddings_table(connection, table_name)
+
+            await reassign_schema_objects(connection, schema)
 
             for role_name in APP_ROTATION_ROLES:
                 if role_name != APP_ROLE and not await role_exists(
