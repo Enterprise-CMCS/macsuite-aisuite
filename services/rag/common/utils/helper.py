@@ -60,6 +60,20 @@ class Helper:
         return contract_cfg.list_embeddings_table_names_from_config(config)
 
     @staticmethod
+    def list_contracts(config_file='aws.properties.ini'):
+        from common.utils import contract_registry as contract_reg
+
+        config = Helper.load_config(config_file)
+        return contract_reg.list_contracts(config)
+
+    @staticmethod
+    def resolve_contract(contract_id, config_file='aws.properties.ini'):
+        from common.utils import contract_registry as contract_reg
+
+        config = Helper.load_config(config_file)
+        return contract_reg.resolve_contract(config, contract_id)
+
+    @staticmethod
     def validate_embeddings_table_name(table_name):
         return contract_cfg.validate_embeddings_table_name(table_name)
 

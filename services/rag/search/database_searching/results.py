@@ -1,9 +1,9 @@
-from search.database_searching.search import SearchEngine
+from search.database_searching.deps import get_search_engine
 
 
-async def get_search_results(query: str):
+async def get_search_results(query: str, contract_id: str | None = None):
 
-    search = SearchEngine()
+    search = get_search_engine(contract_id)
 
     semantic_results = await search.semantic_search(query)
 

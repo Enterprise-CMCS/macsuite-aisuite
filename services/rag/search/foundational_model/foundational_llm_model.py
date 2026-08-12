@@ -89,13 +89,16 @@ async def extract_text_with_foundational_model_async(text_content: str, search_t
 
 
 
-async def process_query_with_foundational_model(query: str) -> dict:
+async def process_query_with_foundational_model(
+    query: str,
+    contract_id: str | None = None,
+) -> dict:
 
     print(f"Processing query: {query}")
     
 
 
-    search_results = await get_search_results(query)
+    search_results = await get_search_results(query, contract_id)
 
     print("Search results obtained. Extracting answers with AWS Nova Pro...")
     

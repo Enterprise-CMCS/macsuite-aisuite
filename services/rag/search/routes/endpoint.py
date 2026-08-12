@@ -15,7 +15,19 @@ from strawberry.fastapi import GraphQLRouter
 src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
+from common.utils import contract_config  # noqa: E402
+from common.utils.contract_registry import (  # noqa: E402
+    UnknownContractError,
+    list_contracts,
+    resolve_contract,
+)
+
 logger = structlog.get_logger(__name__)
+
+
+def _load_contract_config():
+    """Load the active aws.properties.ini contract definitions."""
+    return contract_config.load_config(contract_config.resolve_config_path())
 
 
 # GraphQL schema types
@@ -31,6 +43,7 @@ class SearchResponse:
 class QueryResponse:
     """Query response containing all search strategies."""
     query: str
+    contract_id: str
     semantic: SearchResponse
     hybrid: Optional[SearchResponse] = None
     reranked: Optional[SearchResponse] = None
@@ -48,13 +61,28 @@ class Query:
 class Mutation:
     """GraphQL mutation root."""
     @strawberry.mutation
-    async def process_query(self, query: str) -> QueryResponse:
+    async def process_query(self, query: str, contract_id: Optional[str] = None) -> QueryResponse:
         from search.foundational_model.foundational_llm_model import process_query_with_foundational_model
 
-        results = await process_query_with_foundational_model(query)
+        if contract_id:
+            try:
+                resolved_contract_id = resolve_contract(
+                    _load_contract_config(), contract_id
+                ).contract_id
+            except UnknownContractError as exc:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+        else:
+            resolved_contract_id = resolve_contract(
+                _load_contract_config(), None
+            ).contract_id
+
+        results = await process_query_with_foundational_model(
+            query, contract_id=contract_id or None
+        )
 
         return QueryResponse(
             query=results["query"],
+            contract_id=resolved_contract_id,
             semantic=SearchResponse(
                 search_type=results["semantic"]["search_type"],
                 response=results["semantic"]["response"],
@@ -70,6 +98,10 @@ schema = strawberry.Schema(query=Query, mutation=Mutation)
 class AgentRequest(BaseModel):
     """Request model for agent endpoint."""
     query: str = Field(..., min_length=1, max_length=2000, description="User query to process")
+    contract_id: Optional[str] = Field(
+        default=None,
+        description="Contract to scope the search to (defaults to the active contract)"
+    )
 
 
 class AgentResponse(BaseModel):
@@ -77,6 +109,7 @@ class AgentResponse(BaseModel):
     query: str = Field(..., description="Original query")
     response: str = Field(..., description="Agent-generated response")
     success: bool = Field(default=True, description="Whether request was successful")
+    contract_id: str = Field(..., description="Contract the query was scoped to")
 
 
 # FastAPI application
@@ -110,14 +143,27 @@ async def root():
         "model": os.environ.get('BEDROCK_MODEL_ID', 'us.amazon.nova-pro-v1:0'),
         "endpoints": [
             {"path": "/agent", "methods": ["GET", "POST"], "description": "AI agent endpoint"},
+            {"path": "/contracts", "methods": ["GET"], "description": "Available contract ids"},
             {"path": "/health", "methods": ["GET"], "description": "Health check"},
             {"path": "/query", "methods": ["GET", "POST"], "description": "GraphQL API"},
             {"path": "/docs", "methods": ["GET"], "description": "Interactive API docs"}
         ],
         "usage": {
-            "agent_get": "GET /agent?query=your+question", #answer from question
-            "agent_post": "POST /agent with body {\"query\": \"your question\"}" #input question from user
+            "agent_get": "GET /agent?query=your+question&contract_id=tn_6756", #answer from question
+            "agent_post": "POST /agent with body {\"query\": \"your question\", \"contract_id\": \"tn_6756\"}" #input question from user
         }
+    }
+
+
+@app.get("/contracts", tags=["Contracts"])
+async def list_available_contracts():
+    """Contract ids clients may scope a query to."""
+    contracts = list_contracts(_load_contract_config())
+    return {
+        "contracts": [
+            {"contract_id": contract.contract_id, "is_default": contract.is_default}
+            for contract in contracts
+        ]
     }
 
 
@@ -127,19 +173,45 @@ async def health_check():
     return {"status": "healthy", "service": "agentic-rag-api", "version": "2.0.0"}
 
 
-async def process_agent_query(query: str) -> AgentResponse:
+async def process_agent_query(query: str, contract_id: Optional[str] = None) -> AgentResponse:
     """Process agent query (shared by GET and POST endpoints)."""
-    logger.info("agent_request", query=query[:100])
+    resolved_contract_id = None
+
+    # Resolve a client-supplied contract before the try block so an unknown id
+    # answers 400 instead of the 200 error envelope returned below.
+    if contract_id:
+        try:
+            resolved_contract_id = resolve_contract(
+                _load_contract_config(), contract_id
+            ).contract_id
+        except UnknownContractError as exc:
+            logger.warning("unknown_contract", contract_id=contract_id[:100])
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+        logger.info("agent_request", query=query[:100], contract_id=resolved_contract_id)
 
     try:
-        from search.database_searching.agents import search_agent, ChatDeps
-        from search.database_searching.search import SearchEngine
+        from search.database_searching.agents import search_agent
+        from search.database_searching.deps import build_chat_deps
 
-        deps = ChatDeps(acronyms={}, timing={}, search_engine=SearchEngine())
+        deps = build_chat_deps(resolved_contract_id)
+        if resolved_contract_id is None:
+            resolved_contract_id = resolve_contract(_load_contract_config(), None).contract_id
+            logger.info("agent_request", query=query[:100], contract_id=resolved_contract_id)
+
         result = await search_agent.run(query, deps=deps)
 
-        logger.info("agent_success", query=query[:100], length=len(result.output))
-        return AgentResponse(query=query, response=result.output, success=True)
+        logger.info(
+            "agent_success",
+            query=query[:100],
+            contract_id=resolved_contract_id,
+            length=len(result.output),
+        )
+        return AgentResponse(
+            query=query,
+            response=result.output,
+            success=True,
+            contract_id=resolved_contract_id,
+        )
 
     except ImportError as e:
         error_msg = f"Module import failed: {str(e)}"
@@ -150,27 +222,34 @@ async def process_agent_query(query: str) -> AgentResponse:
         )
 
     except Exception as e:
-        logger.error("agent_error", error=str(e), query=query[:100], exc_info=True)
+        logger.error(
+            "agent_error",
+            error=str(e),
+            query=query[:100],
+            contract_id=resolved_contract_id,
+            exc_info=True,
+        )
         return AgentResponse(
             query=query,
             response=f"Error: {str(e)}. Please try rephrasing or contact support.",
-            success=False
+            success=False,
+            contract_id=resolved_contract_id or ""
         )
 
 
 @app.post("/agent", response_model=AgentResponse, tags=["Agent"]) #where user asks Q, endpoints to hit
 async def agent_post(request: AgentRequest):
     """AI agent endpoint (POST with JSON body)."""
-    return await process_agent_query(request.query)
+    return await process_agent_query(request.query, request.contract_id)
 
 
 @app.get("/agent", response_model=AgentResponse, tags=["Agent"]) #where response lands, endpoints to hit
-async def agent_get(query: str = ""):
+async def agent_get(query: str = "", contract_id: Optional[str] = None):
     if not query.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Query required. Example: /agent?query=What is RAG?")
     if len(query) > 2000:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Query too long (max 2000 characters)")
-    return await process_agent_query(query)
+    return await process_agent_query(query, contract_id)
 
 
 if __name__ == "__main__":

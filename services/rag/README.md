@@ -79,6 +79,7 @@ python -m search.routes.endpoint
 | `GET /health` | Health check |
 | `GET /agent?query=…` | Agent answer (query string) |
 | `POST /agent` | Agent answer; body `{"query": "…"}` |
+| `GET /contracts` | Available contract IDs and the default |
 | `GET/POST /query` | GraphQL |
 | `GET /docs` | OpenAPI UI |
 
@@ -168,8 +169,11 @@ contract’s `embeddings_table_name`.
 
 ### Search (API)
 
-The agent accepts only a natural-language `query`. Results come from the active
-contract embeddings table configured in the INI / `EMBEDDINGS_TABLE_NAME`.
+The agent accepts a natural-language `query` and an optional `contract_id` on
+both `GET /agent` and `POST /agent`. Contract selection follows this precedence:
+request `contract_id` → `EMBEDDINGS_TABLE_NAME` env → active INI section. The
+environment and INI defaults apply only when `contract_id` is omitted. Use
+`GET /contracts` to list valid contract IDs and identify the default.
 
 The default agent tool is `hybrid_search`; `semantic_search` remains available as
 a cheaper fallback. Hybrid search runs Postgres full-text search with
@@ -212,13 +216,18 @@ Contract-specific paths and `embeddings_table_name` live in `[contract:…]` sec
 
 ### Active contract
 
-Exactly one section may have `active = true`. Default for dev is `tn_6756` (TennCare).
-To switch:
+Exactly one section may have `active = true`. This flag sets only the default
+for requests that omit `contract_id`; the dev default is `tn_6756` (TennCare).
+Another contract can be selected per request without switching the flag or
+redeploying. To change the default:
 
 1. Set `active = true` on the target `[contract:…]` section.
 2. Set `active = false` on the previously active section.
 3. Leave prefixes and `embeddings_table_name` alone unless rewiring storage.
 4. Restart / redeploy tasks so they reload the INI.
+
+A valid contract can still have an empty embeddings table if it was never
+ingested; queries against it can therefore return `UNCLEAR`.
 
 ### Contract matrix (dev)
 
@@ -235,7 +244,8 @@ Full `output_prefix` / BDA / RAG folder paths are in the INI under each contract
 ### Bootstrap note
 
 Bootstrap creates each contract’s embeddings table (and indexes) so switching `active`
-does not require a re-run for DDL. Search/store use only the active contract table.
+does not require a re-run for DDL. Ingestion uses the active contract table;
+search can select a configured contract per request.
 
 ## One-time DB bootstrap (app user)
 

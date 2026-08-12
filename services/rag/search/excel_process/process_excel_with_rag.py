@@ -12,7 +12,8 @@ import pandas as pd
 src_path = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_path))
 
-from search.database_searching.agents import search_agent, ChatDeps
+from search.database_searching.agents import search_agent
+from search.database_searching.deps import build_chat_deps
 from common.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -56,7 +57,7 @@ class ExcelRAGProcessor:
         try:
             logger.info(f"Processing: {requirement[:80]}...")
 
-            deps = ChatDeps(acronyms={})
+            deps = build_chat_deps()
             agent_response = await search_agent.run(user_prompt=requirement, deps=deps)
 
             if hasattr(agent_response, 'output'):
