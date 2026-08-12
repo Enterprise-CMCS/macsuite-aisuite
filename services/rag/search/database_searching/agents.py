@@ -2,7 +2,7 @@ import json
 from dataclasses import dataclass, field
 import os
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import hashlib
 
 from pydantic_ai import Agent, RunContext
@@ -145,6 +145,9 @@ CITATION FORMAT:
 
 
 """
+
+PROMPT_VERSION = "hybrid-search-v1"
+PROMPT_SHA256 = hashlib.sha256(BASE_SYSTEM_PROMPT.encode()).hexdigest()
 
 
 model_id = os.environ.get("BEDROCK_MODEL_ID", "us.amazon.nova-pro-v1:0")
@@ -348,59 +351,66 @@ async def semantic_search(context: RunContext[ChatDeps], query: str) -> List[Dic
         return []
 
 
-async def analyze_requirement_with_rag(
-    requirement: str,
-    deps: Optional[ChatDeps] = None,
-) -> Dict[str, Any]:
-
-    deps = deps or ChatDeps(acronyms={})
-
-    # 1. Retrieve context
-    context_results = await semantic_search(
-        RunContext(deps=deps, state={}, tools=search_agent.tools),
-        query=requirement,
-    )
-
-    formatted_results = []
-    for i, r in enumerate(context_results, 1):
-        md = r.get("metadata", {})
-        doc_name = md.get("doc_name") or md.get("doc_id") or "Unknown document"
-        page = md.get("page", "unknown")
-        clause_label = md.get("clause_label") or md.get("section_title") or ""
-        header = f"[result {i}] Document: {doc_name} | Page: {page}"
-        if clause_label:
-            header += f" | Clause: {clause_label}"
-        chunk_text = r.get("text", "")
-        formatted_results.append(f"{header}\n{chunk_text}")
-
-    retrieval_block = (
-        "\n\n".join(formatted_results) if formatted_results else "No relevant text found."
-    )
-
-    user_message = (
-        "Requirement to verify:\n"
-        f"{requirement}\n\n"
-        "Retrieved contract context (each [result i] includes text and metadata):\n"
-        f"{retrieval_block}\n\n"
-        "Now perform the analysis as specified in the system prompt and return a single JSON object."
-    )
-
-    result = await search_agent.run(user_message, deps=deps)
+@search_agent.tool
+async def hybrid_search(context: RunContext[ChatDeps], query: str) -> List[Dict[str, Any]]:
 
     try:
-        parsed = json.loads(result.output_text)
-        return parsed
-    except Exception:
-    
-        return {
-            "Requirement": requirement,
-            "Recommendation": "UNCLEAR",
-            "Response": (
-                "The model output could not be parsed as JSON. "
-                "Raw output was:\n" + result.output_text
-            ),
-            "Source": "",
-            "Page": "",
-        }
+        normalized_query = _normalize_query(query)
+        expanded_query = _expand_query(normalized_query)
+        cache_key = generate_cache_key(expanded_query, "hybrid_raw")
 
+        if cache_key in context.deps._result_cache:
+            context.deps._cache_hits += 1
+            hits = context.deps._cache_hits
+            misses = context.deps._cache_misses
+            cache_ratio = hits / (hits + misses)
+            logger.info(f"[HYBRID] Cache hit (ratio: {cache_ratio:.2%})")
+            return context.deps._result_cache[cache_key]
+
+        context.deps._cache_misses += 1
+        logger.info(f"[HYBRID] Query: {query}")
+        logger.debug(f"[HYBRID] Expanded query: {expanded_query}")
+
+        results = await context.deps.search_engine.hybrid_search(
+            normalized_query,
+            expanded_query,
+            top_k=FINAL_RESULTS,
+        )
+
+        if not results:
+            logger.warning("[HYBRID] No results found")
+            response: List[Dict[str, Any]] = []
+            context.deps._result_cache[cache_key] = response
+            return response
+
+        # Fusion and reranking already ordered these results; passing a query here
+        # would re-sort them by lexical relevance and discard that ordering.
+        results = deduplicate_results(results, query="")
+        results = results[:FINAL_RESULTS]
+
+        cleaned: List[Dict[str, Any]] = []
+        for r in results:
+            item = {
+                "text": _truncate_text((r.get("text") or "").strip()),
+                "metadata": _parse_metadata(r.get("metadata", {})),
+                "id": r.get("id"),
+                "distance": r.get("distance"),
+                "retrieval_leg": r.get("retrieval_leg"),
+                "fusion_rank": r.get("fusion_rank"),
+            }
+            if "rerank_score" in r:
+                item["rerank_score"] = r.get("rerank_score")
+            cleaned.append(item)
+
+        context.deps._result_cache[cache_key] = cleaned
+        _manage_cache_size(context.deps._result_cache)
+
+        logger.info(f"[HYBRID] Retrieved {len(cleaned)} fused results")
+        return cleaned
+
+    except Exception as e:
+        error_msg = f"Hybrid search failed: {str(e)}"
+        logger.error(f"[HYBRID] {error_msg}", exc_info=True)
+
+        return []
 

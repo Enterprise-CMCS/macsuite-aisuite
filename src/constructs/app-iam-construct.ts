@@ -17,6 +17,7 @@ const BEDROCK_INFERENCE_PROFILES = [
 ] as const;
 
 const BEDROCK_RERANK_MODEL = "cohere.rerank-v3-5:0";
+const BEDROCK_RERANK_REGIONS = ["us-east-1", "us-west-2"] as const;
 
 export interface AppIamConstructProps {
   dbSecret: secretsmanager.ISecret;
@@ -117,11 +118,19 @@ export class AppIamConstruct extends Construct {
     this.taskRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ["bedrock:Rerank"],
-        resources: CROSS_REGION_INFERENCE_REGIONS.map(
+        resources: ["*"],
+        sid: "BedrockRerank",
+      }),
+    );
+
+    this.taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["bedrock:InvokeModel"],
+        resources: BEDROCK_RERANK_REGIONS.map(
           (inferenceRegion) =>
             `arn:aws:bedrock:${inferenceRegion}::foundation-model/${BEDROCK_RERANK_MODEL}`,
         ),
-        sid: "BedrockRerank",
+        sid: "BedrockRerankInvokeModel",
       }),
     );
 

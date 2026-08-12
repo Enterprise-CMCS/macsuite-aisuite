@@ -4,6 +4,10 @@ import boto3
 import os
 import numpy as np
 
+from common.utils.embedding_input_types import (
+    INPUT_TYPE_DOCUMENT,
+    build_embedding_request,
+)
 from common.utils.settings import aws_client
 from common.utils.settings import MODEL_ID, EMBEDDING_DIMENSION
 
@@ -30,10 +34,7 @@ class BedrockEmbeddingClient:
         if not text or not str(text).strip():
             raise ValueError("Cannot generate embedding for empty text")
 
-        request_body = {
-                "texts": [text],
-                "input_type": "search_document"
-            }
+        request_body = build_embedding_request([text], INPUT_TYPE_DOCUMENT)
         
         try:
             response = self.client.invoke_model(

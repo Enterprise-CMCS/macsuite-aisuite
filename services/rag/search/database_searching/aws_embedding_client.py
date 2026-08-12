@@ -3,6 +3,10 @@ import asyncio
 import boto3
 import os
 
+from common.utils.embedding_input_types import (
+    INPUT_TYPE_QUERY,
+    build_embedding_request,
+)
 from common.utils.settings import aws_client
 from common.utils.settings import (MODEL_ID, EMBEDDING_DIMENSION)
 
@@ -26,10 +30,7 @@ class BedrockEmbeddingClient:
     def invoke_model_sync(self, text):
         
 
-        request_body = {
-                "texts": [text],
-                "input_type": "search_document"
-            }
+        request_body = build_embedding_request([text], INPUT_TYPE_QUERY)
         
         try:
             response = self.client.invoke_model(

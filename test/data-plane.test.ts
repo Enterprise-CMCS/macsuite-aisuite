@@ -201,6 +201,24 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       expect(serialized).toContain("us.cohere.embed-v4:0");
       expect(serialized).toContain("cohere.rerank-v3-5:0");
       expect(bySid.BedrockRerank?.Action).toEqual("bedrock:Rerank");
+      expect(bySid.BedrockRerank?.Resource).toBe("*");
+      expect(bySid.BedrockRerankInvokeModel).toBeDefined();
+      expect(
+        Array.isArray(bySid.BedrockRerankInvokeModel?.Action)
+          ? bySid.BedrockRerankInvokeModel.Action
+          : [bySid.BedrockRerankInvokeModel?.Action],
+      ).toContain("bedrock:InvokeModel");
+      expect(bySid.BedrockRerankInvokeModel?.Resource).toEqual(
+        expect.arrayContaining([
+          "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0",
+          "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0",
+        ]),
+      );
+      expect(
+        JSON.stringify(bySid.BedrockRerankInvokeModel?.Resource),
+      ).not.toContain(
+        "arn:aws:bedrock:us-east-2::foundation-model/cohere.rerank-v3-5:0",
+      );
       expect(bySid.BedrockDataAutomationRuntime).toBeDefined();
     });
 

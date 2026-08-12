@@ -171,6 +171,29 @@ contract’s `embeddings_table_name`.
 The agent accepts only a natural-language `query`. Results come from the active
 contract embeddings table configured in the INI / `EMBEDDINGS_TABLE_NAME`.
 
+The default agent tool is `hybrid_search`; `semantic_search` remains available as
+a cheaper fallback. Hybrid search runs Postgres full-text search with
+`plainto_tsquery` and vector search, combines the ranked lists with Reciprocal
+Rank Fusion (`k = 60`), then reranks the fused candidates with Bedrock Cohere
+`cohere.rerank-v3-5:0`. If reranking fails, the query still succeeds and returns
+the fused RRF order.
+
+The full-text leg receives the normalized query, while the vector leg receives
+the expanded query. Query embeddings use Cohere `input_type=search_query`;
+corpus ingest embeddings continue to use `search_document`, so no corpus
+re-embedding is required.
+
+`analyze_requirement_with_rag` was removed. Batch and Excel flows call
+`search_agent.run`. Responses cite document names and pages from `doc_name` and
+`page` metadata; the system prompt forbids citing `Hybrid Search Results` as a
+source.
+
+Run the RAG unit tests from the repository root:
+
+```sh
+cd services/rag && python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
 ## Per-contract configuration (dev)
 
 Multi-contract isolation uses shared S3 buckets with per-contract prefixes and a

@@ -1,3 +1,5 @@
+import asyncio
+
 from dotenv import load_dotenv
 from common.utils.helper import Helper
 from common.utils.settings import aws_client, AWS_REGION, MODEL_ID
@@ -45,27 +47,15 @@ class CohereReranker:
         
 
         num_results = min(top_k, len(source))
-        
-        response = self.client.rerank(
-                        queries=[
-                            {
-                                "type": "TEXT",
-                                "textQuery": {
-                                    "text": query
-                                }
-                            }
-                        ],
-                        sources=source,
-                        rerankingConfiguration={
-                            "type": "BEDROCK_RERANKING_MODEL",
-                            "bedrockRerankingConfiguration": {
-                            "numberOfResults": num_results,
-                            "modelConfiguration": {
-                            "modelArn": self.model_package_arn,
-                                }
-                            }
-                        }
-        )
+
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            self.invoke_rerank_sync,
+            query,
+            source,
+            num_results
+            )
 
         results = response['results']
     
@@ -84,6 +74,29 @@ class CohereReranker:
             })
             
         return reranked
+
+    def invoke_rerank_sync(self, query, sources, num_results):
+
+        return self.client.rerank(
+                        queries=[
+                            {
+                                "type": "TEXT",
+                                "textQuery": {
+                                    "text": query
+                                }
+                            }
+                        ],
+                        sources=sources,
+                        rerankingConfiguration={
+                            "type": "BEDROCK_RERANKING_MODEL",
+                            "bedrockRerankingConfiguration": {
+                            "numberOfResults": num_results,
+                            "modelConfiguration": {
+                            "modelArn": self.model_package_arn,
+                                }
+                            }
+                        }
+        )
 
 
 
