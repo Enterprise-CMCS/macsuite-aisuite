@@ -147,7 +147,7 @@ CITATION FORMAT:
 """
 
 
-model_id = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-pro-v1:0")
+model_id = os.environ.get("BEDROCK_MODEL_ID", "us.amazon.nova-pro-v1:0")
 model = BedrockConverseModel(model_id)
 
 search_agent = Agent(

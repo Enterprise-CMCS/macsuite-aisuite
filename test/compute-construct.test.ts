@@ -19,6 +19,11 @@ const EXPECTED_OUTPUTS = [
   "ApiServiceName",
   "ApiEcrRepositoryUri",
 ] as const;
+const REMOVED_PIPELINE_CODE_ENVIRONMENT_NAME = [
+  "PIPELINE",
+  "CODE",
+  "BUCKET",
+].join("_");
 
 function synthesize(environmentName: DeploymentEnvironmentName): Template {
   const app = new cdk.App({ context: { [STUB_VPC_CONTEXT_KEY]: true } });
@@ -170,8 +175,8 @@ describe.each(["dev", "prod"] as const)(
       expect(environment.POST_PROCESSING_BUCKET).toBe(
         `aisuite-${environmentName}-contract-rag-post-processing`,
       );
-      expect(environment.PIPELINE_CODE_BUCKET).toBe(
-        `aisuite-${environmentName}-llm-pipeline-code`,
+      expect(environment).not.toHaveProperty(
+        REMOVED_PIPELINE_CODE_ENVIRONMENT_NAME,
       );
       expect(environment.PIPELINE_TEMP_BUCKET).toBe(
         `aisuite-${environmentName}-llm-pipeline-temp`,

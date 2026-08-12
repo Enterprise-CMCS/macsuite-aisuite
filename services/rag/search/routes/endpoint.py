@@ -107,7 +107,7 @@ async def root():
         "service": "Agentic RAG API",
         "version": "2.0.0",
         "status": "operational",
-        "model": os.environ.get('BEDROCK_MODEL_ID', 'amazon.nova-pro-v1:0'),
+        "model": os.environ.get('BEDROCK_MODEL_ID', 'us.amazon.nova-pro-v1:0'),
         "endpoints": [
             {"path": "/agent", "methods": ["GET", "POST"], "description": "AI agent endpoint"},
             {"path": "/health", "methods": ["GET"], "description": "Health check"},

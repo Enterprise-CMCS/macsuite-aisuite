@@ -115,7 +115,6 @@ overrides first, then the active `[contract:…]` section, then `[default]`.
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | AWS region |
 | `DOCUMENTS_BUCKET` | Source documents bucket |
 | `POST_PROCESSING_BUCKET` | BDA / RAG post-processing bucket |
-| `PIPELINE_CODE_BUCKET` | Pipeline code bucket |
 | `PIPELINE_TEMP_BUCKET` | Temp / summary logs bucket |
 | `DB_SECRET_ARN` (or `DB_SECRET_NAME`) | Secrets Manager secret for app DB credentials |
 | `BEDROCK_MODEL_ID` | Foundation LLM |
@@ -186,8 +185,7 @@ per-contract embeddings table on the same RDS instance.
 
 Contract-specific paths and `embeddings_table_name` live in `[contract:…]` sections of
 `common/utils/aws.properties.ini`. ECS still overrides bucket names via env
-(`DOCUMENTS_BUCKET`, `POST_PROCESSING_BUCKET`, `PIPELINE_CODE_BUCKET`,
-`PIPELINE_TEMP_BUCKET`).
+(`DOCUMENTS_BUCKET`, `POST_PROCESSING_BUCKET`, `PIPELINE_TEMP_BUCKET`).
 
 ### Active contract
 

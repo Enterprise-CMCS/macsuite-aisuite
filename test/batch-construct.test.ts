@@ -9,6 +9,12 @@ import { describe, expect, it } from "vitest";
 import { BatchConstruct } from "../src/constructs/batch-construct";
 import { getDeploymentConfig } from "../src/deployment-config";
 
+const REMOVED_PIPELINE_CODE_ENVIRONMENT_NAME = [
+  "PIPELINE",
+  "CODE",
+  "BUCKET",
+].join("_");
+
 function synthesize(): {
   batch: BatchConstruct;
   template: Template;
@@ -33,7 +39,6 @@ function synthesize(): {
     dbSecret: new secretsmanager.Secret(stack, "AppDbSecret"),
     deploymentConfig: getDeploymentConfig("dev"),
     documentsBucket: new s3.Bucket(stack, "DocumentsBucket"),
-    pipelineCodeBucket: new s3.Bucket(stack, "PipelineCodeBucket"),
     pipelineTempBucket: new s3.Bucket(stack, "PipelineTempBucket"),
     postProcessingBucket: new s3.Bucket(stack, "PostProcessingBucket"),
     taskRole,
@@ -88,13 +93,15 @@ describe("BatchConstruct", () => {
         expect.arrayContaining([
           "DOCUMENTS_BUCKET",
           "POST_PROCESSING_BUCKET",
-          "PIPELINE_CODE_BUCKET",
           "PIPELINE_TEMP_BUCKET",
           "DB_SECRET_ARN",
           "BEDROCK_MODEL_ID",
           "BEDROCK_EMBED_MODEL_ID",
           "AWS_REGION",
         ]),
+      );
+      expect(environmentNames).not.toContain(
+        REMOVED_PIPELINE_CODE_ENVIRONMENT_NAME,
       );
       expect(container?.Image).toEqual(
         expect.objectContaining({ "Fn::Join": expect.any(Array) }),

@@ -22,7 +22,6 @@ export interface BatchConstructProps {
   dbSecret: secretsmanager.ISecret;
   deploymentConfig: DeploymentConfig;
   documentsBucket: s3.IBucket;
-  pipelineCodeBucket: s3.IBucket;
   pipelineTempBucket: s3.IBucket;
   postProcessingBucket: s3.IBucket;
   taskRole: iam.IRole;
@@ -99,7 +98,6 @@ export class BatchConstruct extends Construct {
       BEDROCK_MODEL_ID,
       DB_SECRET_ARN: props.dbSecret.secretArn,
       DOCUMENTS_BUCKET: props.documentsBucket.bucketName,
-      PIPELINE_CODE_BUCKET: props.pipelineCodeBucket.bucketName,
       PIPELINE_TEMP_BUCKET: props.pipelineTempBucket.bucketName,
       POST_PROCESSING_BUCKET: props.postProcessingBucket.bucketName,
     };
