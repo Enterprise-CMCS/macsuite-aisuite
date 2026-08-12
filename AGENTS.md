@@ -59,6 +59,7 @@ Use `pnpm run test:coverage` when coverage is relevant. CI runs the same gates.
 - Do not commit CDK VPC lookup context/cache values; CI/deploy synth should produce them.
 - In repo docs, avoid AWS profile names and account numbers; prefer outcome wording (e.g. non-prod done, prod pending).
 - Base work on `main` with ephemeral feature branches; push only when explicitly asked.
+- Explainer-backlog child specs: cut ephemeral branches from `bp-forward`, merge back into `bp-forward`, delete the feature branch, and push only `bp-forward`. Do not push per-spec feature branches.
 - On large harness runs, often stop before commit until deslop/review/gates finish.
 
 ## Learned Workspace Facts
