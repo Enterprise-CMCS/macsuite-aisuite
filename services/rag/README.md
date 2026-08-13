@@ -339,6 +339,65 @@ Bootstrap creates each contract’s embeddings table (and indexes) so switching 
 does not require a re-run for DDL. Ingestion uses the active contract table;
 search can select a configured contract per request.
 
+## Reindex after a chunking change
+
+This change does not silently mutate existing embeddings or run a reindex.
+Operators must reindex each contract that should use the new chunks; other
+contracts' tables continue to contain the previous generation until they are
+reindexed.
+
+Embeddings writes are append-only. The RAG process uses
+`INSERT INTO {table} (text, metadata, embedding)` in
+`data_embeddings_storage/database/data_processing_embeddings.py`; there is no
+upsert, delete, or chunk-identity unique key. Re-running the `rag-process` task
+without resetting its table therefore duplicates rows instead of replacing
+them.
+
+### Preferred in dev: truncate and reload
+
+**Warning: this is destructive and dev-only.** For the default active contract,
+remove every existing TennCare embedding row before loading the replacement
+generation:
+
+```sql
+TRUNCATE TABLE aisuite_schema.embeddings_tn_6756_tenncare;
+```
+
+After the truncate completes, re-run `rag-process`. Re-run pre-processing first
+only when the split JSON in post-processing storage is also stale. Do not use
+this procedure outside dev without an environment-specific recovery and
+cutover plan.
+
+### Blue/green alternative
+
+For a non-destructive cutover:
+
+1. Choose a new `embeddings_table_name`.
+2. Set that name on the active `[contract:*]` section in
+   `common/utils/aws.properties.ini`.
+3. Run bootstrap so the new table and indexes exist.
+4. Run `rag-process` and verify the new table's row count.
+5. Flip search to the new table only after verification.
+
+When event-driven ingestion is present, its prefix and table are pinned at
+synth time. An INI table rename therefore requires bootstrap and a re-synth.
+`aisuite:activateIngestion` is not currently in this repository; if and when
+that context flag is enabled, freeze its value through the first reindex so a
+mid-reindex synth does not retarget the trigger.
+
+### Runtime, cost, and generation visibility
+
+Every chunk causes a Bedrock embedding call. The RAG process invokes
+`EmbeddingProcessor.process_data(..., batch_size=30)` in `creating_main.py`,
+while `data_processing_embeddings.py` defaults
+`max_concurrent_requests` to `1`. Changing chunking changes the chunk count and
+therefore the embedding call volume, runtime, and cost.
+
+TEXT chunks stamp `chunking_version` (currently `v2-recursive-cascade` from
+`chunk_documents.py`), `chunk_index`, and `chunk_count` into the metadata JSONB
+column. Mixed-generation tables can be observed with
+`metadata->>'chunking_version'`, but they are not automatically reconciled.
+
 ## One-time DB bootstrap (app user)
 
 CDK manages an on-demand Fargate task that bootstraps the private RDS database.

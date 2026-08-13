@@ -20,6 +20,8 @@ class Helper:
         "model_id_bedrock_profile_embed": ("BEDROCK_EMBED_MODEL_ID",),
         "model_id_bedrock_embeddings": ("BEDROCK_EMBED_MODEL_ID",),
         "embeddings_table_name": ("EMBEDDINGS_TABLE_NAME",),
+        "chunk_size": ("CHUNK_SIZE",),
+        "chunk_overlap": ("CHUNK_OVERLAP",),
     }
 
     @staticmethod
@@ -110,6 +112,28 @@ class Helper:
         except Exception as lclEx:
             Helper.print_exception("get_property", lclEx, f" Exception occurred while getting property '{str_property_name}'.")
             raise lclEx
+
+    @staticmethod
+    def get_positive_int_property(str_property_name, config_file='aws.properties.ini'):
+        try:
+            value = Helper.get_property(str_property_name, config_file=config_file)
+        except KeyError as error:
+            raise ValueError(
+                f"Property '{str_property_name}' is required and must be a positive integer."
+            ) from error
+
+        try:
+            parsed_value = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Property '{str_property_name}' must be a positive integer; got {value!r}."
+            ) from error
+
+        if parsed_value <= 0:
+            raise ValueError(
+                f"Property '{str_property_name}' must be greater than zero; got {value!r}."
+            )
+        return parsed_value
 
     @staticmethod
     def get_config_aws_properties(config_file='aws.properties.ini'):

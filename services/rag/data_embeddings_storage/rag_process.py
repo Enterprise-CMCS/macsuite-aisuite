@@ -7,6 +7,7 @@ import json
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data_embeddings_storage.database.recursive_text_splitter import RecursiveCharacterTextSplitter
+from data_embeddings_storage.database.chunk_documents import split_documents
 from common.utils.helper import Helper
 from common.utils.settings import aws_client
 from common.utils.aws_files_access import AwsFilesAccess
@@ -153,8 +154,8 @@ async def invoke_rag_process():
 
         # Initialize text splitter
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1024,
-            chunk_overlap=30,
+            chunk_size=Helper.get_positive_int_property("chunk_size"),
+            chunk_overlap=Helper.get_positive_int_property("chunk_overlap"),
             length_function=len,
             is_separator_regex=False,
         )
@@ -162,26 +163,7 @@ async def invoke_rag_process():
         # Split documents and maintain JSON format
         log.info("Split documents and maintain JSON format")
 
-        split_docs = []
-        for doc in all_json_data:
-            metadata = doc.get('metadata', {})
-            element_type = metadata.get('element_type')
-            if element_type == "TEXT":
-                text_content = doc.get('text', "")
-                # Split the text content into chunks
-                text_chunks = text_splitter.split_text(text_content)
-
-                # Create a new JSON entry for each chunk
-                for idx, chunk in enumerate(text_chunks):
-                    split_entry = {
-                        "text": chunk,
-                        "metadata": {
-                            **metadata,
-                        }
-                    }
-                    split_docs.append(split_entry)
-            else:
-                split_docs.append(doc)
+        split_docs = split_documents(all_json_data, text_splitter)
 
         log.info(f"Total number of chunks after splitting: split_docs = {len(split_docs)}")
 

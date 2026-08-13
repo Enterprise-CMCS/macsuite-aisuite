@@ -1,0 +1,68 @@
+SYNTHETIC SERVICES AGREEMENT
+
+1. Purpose and Scope.
+
+1.1 The Agency retains Meridian Transit Services, Inc. solely for the fictional services described in this Agreement. Meridian shall coordinate scheduled transportation requests, confirm pickup windows, and provide status notices to the Agency's designated coordinator. The parties intend this text only as an authored software-test fixture; it does not describe an actual procurement, person, company, benefit program, or contract. Every duty stated here is subject to the service levels, recordkeeping rules, and review procedures set out below.
+
+1.2 Meridian shall maintain a written operating plan for each Service Month. The plan must identify anticipated request volume, available dispatch coverage, escalation contacts, and continuity measures for severe weather or temporary system outages. No later than five Business Days before a Service Month begins, Meridian shall send the plan to the Agency for review. Agency review does not transfer operational responsibility, waive any requirement, or prevent the Agency from requesting a reasonable correction.
+
+2. Defined Terms.
+
+2.1 The following terms have the meanings stated below:
+"Agency" means the fictional public office identified for purposes of this test fixture;
+"Authorized Request" means a request that contains the required scheduling fields and a valid approval reference;
+"Business Day" means Monday through Friday, excluding a day observed as a state holiday;
+"Confidential Record" means a record marked confidential or containing information that the parties have agreed to protect;
+"Service Month" means a calendar month during the Term;
+"Service Window" means the period beginning thirty minutes before and ending thirty minutes after a confirmed pickup time; and
+"Subcontractor" means a third party engaged by Meridian to perform a material portion of the Services.
+
+2.2 A defined term applies in both the singular and plural when the context reasonably permits. A reference to a section includes its subsections, and the words "including" and "includes" do not limit the words that precede them. Headings assist navigation but do not alter an obligation. If a deadline falls on a day that is not a Business Day, the deadline moves to the next Business Day unless the relevant section expressly states otherwise.
+
+3. Scheduling and Performance.
+
+3.1 The Agency may submit an Authorized Request through the designated intake channel during published operating hours. Meridian shall acknowledge receipt within one Business Day and shall either confirm the requested Service Window or propose the nearest available alternative. An acknowledgment is not a confirmation. Meridian may reject a duplicate, incomplete, or facially invalid request, but its rejection notice must identify the missing or inconsistent field so that the Agency can correct and resubmit the request.
+
+3.2 Meridian shall use commercially reasonable efforts to begin each scheduled trip within the applicable Service Window. When a delay becomes reasonably foreseeable, Meridian shall notify the Agency coordinator, state the expected duration, and describe any available alternative. Meridian shall not represent an estimate as a guarantee. A delay caused by inaccurate request information is recorded separately from a provider-caused delay, provided that Meridian preserves the request and dispatch records supporting that classification.
+
+3.3 Meridian shall maintain sufficient trained personnel to receive requests, dispatch scheduled trips, and respond to routine status inquiries. Training must address respectful communications, secure handling of Confidential Records, incident escalation, and accurate time entry. Meridian shall review its training materials at least annually and after any material process change. Upon reasonable notice, the Agency may inspect the current curriculum and a summary showing completion dates, but the Agency shall not request unrelated personnel information.
+
+4. Records, Reports, and Review.
+
+4.1 Meridian shall create a service record for each Authorized Request. The record must contain the request identifier, time received, scheduled Service Window, dispatch status, material notices, and final disposition. Meridian shall retain each record for three years after the applicable Service Month unless a longer period is required by a written preservation notice. Records must remain searchable by request identifier and Service Month, and corrections must preserve an audit entry showing what changed and when.
+
+4.2 Within ten Business Days after each Service Month, Meridian shall deliver a summary report. The report must state the number of requests received, confirmed, rejected, completed, canceled, and delayed outside the Service Window. It must also describe unresolved incidents and corrective actions that remain open. The Agency may ask one round of reasonable follow-up questions within fifteen Business Days after receipt, and Meridian shall answer those questions using the records maintained under Section 4.1.
+
+4.3 The Agency may conduct a process review no more than twice in a contract year, except that a review concerning a credible security incident or material reporting discrepancy does not count toward that limit. Reviews will occur during normal business hours and with reasonable advance notice. Meridian shall provide relevant policies, sample records, and knowledgeable personnel. The Agency shall minimize operational disruption and shall protect Meridian information that is unrelated to the review purpose.
+
+5. Information Protection.
+
+5.1 Each party shall use Confidential Records only to perform or administer this Agreement. Access must be limited to personnel who need the records for an assigned function and who are bound by appropriate confidentiality duties. Each party shall apply reasonable administrative, technical, and physical safeguards. Confidentiality obligations do not apply to information that the receiving party can document was lawfully public, already known without restriction, independently developed, or properly received from another source.
+
+5.2 Meridian shall notify the Agency without unreasonable delay after confirming unauthorized access to a Confidential Record in Meridian's custody. The notice must summarize the known facts, identify containment measures, and name a response contact. Meridian shall provide material updates as the investigation proceeds and a final written summary when corrective work is complete. A notice is not an admission of fault, and the parties will coordinate any external statement when coordination is legally permitted.
+
+5.3 Meridian may use a Subcontractor only after completing a risk review proportionate to the services assigned. Every approved Subcontractor must accept written duties concerning confidentiality, incident reporting, record retention, and return or destruction of Agency information. Meridian remains responsible for performance of the subcontracted work. The Agency may request the name and assigned function of a material Subcontractor, but it may not unreasonably withhold approval based on an unrelated commercial preference.
+
+6. Fees and Invoices.
+
+6.1 Meridian may invoice once per Service Month for completed services and approved fixed charges. Each invoice must identify the billing period, applicable line item, quantity, rate, and supporting request identifiers. Taxes, if legally applicable, must appear separately. The Agency may dispute a charge by giving a reasonably detailed written notice within thirty days after receipt. The parties shall work in good faith to resolve the disputed amount while the Agency timely pays all undisputed amounts.
+
+6.2 A corrected invoice must clearly identify the invoice it replaces and explain each adjustment. Meridian shall not rebill a rejected charge without new support or an explanation addressing the rejection. Payment does not by itself establish acceptance of a service, waive a preserved dispute, or limit an available audit remedy. Any credit confirmed by Meridian may be applied to the next invoice unless the final invoice has already issued, in which case Meridian shall provide the credit through a separate reconciliation.
+
+7. Continuity and Excused Delay.
+
+7.1 Meridian shall maintain continuity procedures designed to preserve intake, dispatch, and status communications during a localized interruption. The procedures must identify alternate communications, backup responsibilities, and criteria for restoring normal operations. Meridian shall exercise the procedures annually using a scenario that does not expose real personal information. After the exercise, Meridian shall record material observations, assign corrective actions, and track those actions to completion.
+
+7.2 Neither party is responsible for a delay caused solely by an event beyond its reasonable control if the affected party promptly gives notice and continues reasonable mitigation. The notice must describe the affected obligation, expected duration, and mitigation steps. Lack of funds, avoidable staffing shortages, or failure of a Subcontractor without an independent qualifying event is not an excused delay. When the event ends, performance shall resume as soon as reasonably practicable.
+
+8. Term and Closeout.
+
+8.1 The Term begins on the fictional effective date stated in the applicable order and continues for one year unless ended earlier under this Agreement. The parties may extend the Term only by a written amendment signed by authorized representatives. Either party may terminate for a material breach that remains uncured thirty days after detailed written notice. The Agency may require a shorter cure period for an urgent information-security breach when a longer period would create a material and continuing risk.
+
+8.2 At expiration or termination, Meridian shall cooperate in an orderly closeout. Meridian shall deliver outstanding reports, reconcile undisputed charges, return Agency-provided materials, and securely dispose of Confidential Records not subject to a preservation requirement. For thirty days, Meridian shall answer reasonable questions needed to transfer open scheduling records. Closeout assistance does not require Meridian to disclose proprietary tools, license third-party software, or perform new services without an agreed written authorization.
+
+9. General Provisions.
+
+9.1 Notices under this Agreement must be in writing and delivered to the contacts designated by each party. Routine scheduling messages and status updates are not legal notices. A waiver is effective only when written and applies solely to the circumstance identified. If a provision is held unenforceable, the remaining provisions continue to the fullest extent permitted. This Agreement may be amended only in a writing that identifies the change and is signed by authorized representatives of both parties.
+
+9.2 This synthetic fixture contains the complete fictional language needed for the regression tests that reference it. It intentionally includes numbered sections, defined terms, semicolon-delimited entries, and multi-sentence paragraphs so that chunk boundaries exercise the configured separator cascade. No statement in this file should be treated as legal advice, production data, or evidence of an actual relationship. The final sentence marks a stable and deliberate end to the fixture.
