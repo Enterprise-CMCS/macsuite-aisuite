@@ -1,8 +1,9 @@
 import os
 import sys
 import json
+from collections import Counter
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import strawberry
 import structlog
@@ -21,8 +22,19 @@ from common.utils.contract_registry import (  # noqa: E402
     list_contracts,
     resolve_contract,
 )
+from search.requirements import verdicts as requirements_verdicts  # noqa: E402
 
 logger = structlog.get_logger(__name__)
+
+DEFAULT_MAX_BATCH_SIZE = 25
+try:
+    MAX_BATCH_SIZE = int(
+        os.environ.get("REQUIREMENTS_MAX_BATCH_SIZE", DEFAULT_MAX_BATCH_SIZE)
+    )
+    if MAX_BATCH_SIZE < 1:
+        MAX_BATCH_SIZE = DEFAULT_MAX_BATCH_SIZE
+except (TypeError, ValueError):
+    MAX_BATCH_SIZE = DEFAULT_MAX_BATCH_SIZE
 
 
 def _load_contract_config():
@@ -112,6 +124,44 @@ class AgentResponse(BaseModel):
     contract_id: str = Field(..., description="Contract the query was scoped to")
 
 
+class RequirementItem(BaseModel):
+    """One requirement to grade."""
+    text: str = Field(..., min_length=1, max_length=2000)
+    id: Optional[str] = None
+
+
+class RequirementsRequest(BaseModel):
+    """Batch requirement grading request."""
+    requirements: list[RequirementItem] = Field(..., min_length=1)
+    retry_unclear: bool = True
+
+
+class RequirementVerdict(BaseModel):
+    """One graded requirement result."""
+    id: Union[str, int]
+    success: bool
+    error: Optional[str] = None
+    Requirement: str
+    Recommendation: str
+    Response: str
+    Source: str
+    Page: Union[str, int]
+
+
+class RequirementsSummary(BaseModel):
+    """Aggregate counts for a requirements batch."""
+    total: int
+    succeeded: int
+    failed: int
+    by_recommendation: dict[str, int]
+
+
+class RequirementsResponse(BaseModel):
+    """Batch requirement grading response."""
+    results: list[RequirementVerdict]
+    summary: RequirementsSummary
+
+
 # FastAPI application
 app = FastAPI(
     title="Agentic RAG API",
@@ -143,6 +193,7 @@ async def root():
         "model": os.environ.get('BEDROCK_MODEL_ID', 'us.amazon.nova-pro-v1:0'),
         "endpoints": [
             {"path": "/agent", "methods": ["GET", "POST"], "description": "AI agent endpoint"},
+            {"path": "/requirements", "methods": ["POST"], "description": "Batch requirement grading endpoint"},
             {"path": "/contracts", "methods": ["GET"], "description": "Available contract ids"},
             {"path": "/health", "methods": ["GET"], "description": "Health check"},
             {"path": "/query", "methods": ["GET", "POST"], "description": "GraphQL API"},
@@ -171,6 +222,45 @@ async def list_available_contracts():
 async def health_check():
     """Service health status."""
     return {"status": "healthy", "service": "agentic-rag-api", "version": "2.0.0"}
+
+
+@app.post(
+    "/requirements",
+    response_model=RequirementsResponse,
+    tags=["Requirements"],
+)
+async def requirements_post(request: RequirementsRequest):
+    """Grade a batch of requirements."""
+    if len(request.requirements) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Too many requirements (max {MAX_BATCH_SIZE})",
+        )
+
+    items = [
+        {
+            "text": item.text,
+            **({"id": item.id} if item.id is not None else {}),
+        }
+        for item in request.requirements
+    ]
+    results = await requirements_verdicts.grade_requirements(
+        items,
+        retry_unclear=request.retry_unclear,
+    )
+    succeeded = sum(result.get("success") is True for result in results)
+
+    return {
+        "results": results,
+        "summary": {
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "by_recommendation": dict(
+                Counter(result["Recommendation"] for result in results)
+            ),
+        },
+    }
 
 
 async def process_agent_query(query: str, contract_id: Optional[str] = None) -> AgentResponse:

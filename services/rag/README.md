@@ -79,6 +79,7 @@ python -m search.routes.endpoint
 | `GET /health` | Health check |
 | `GET /agent?query=…` | Agent answer (query string) |
 | `POST /agent` | Agent answer; body `{"query": "…"}` |
+| `POST /requirements` | Batch requirement grading (synchronous) |
 | `GET /contracts` | Available contract IDs and the default |
 | `GET/POST /query` | GraphQL |
 | `GET /docs` | OpenAPI UI |
@@ -90,7 +91,36 @@ curl -s "http://127.0.0.1:8001/agent?query=What+is+coverage+for+NEMT%3F"
 curl -s -X POST "http://127.0.0.1:8001/agent" \
   -H "Content-Type: application/json" \
   -d '{"query":"What is coverage for NEMT?"}'
+curl -s -X POST "http://127.0.0.1:8001/requirements" \
+  -H "Content-Type: application/json" \
+  -d '{"requirements":[{"id":"row-12","text":"The Contractor shall provide NEMT services statewide."}],"retry_unclear":true}'
 ```
+
+`POST /requirements` is synchronous request/response. The batch is capped at
+`MAX_BATCH_SIZE` (default 25, override with `REQUIREMENTS_MAX_BATCH_SIZE`) and
+each item `text` is capped at 2000 characters. Envelope validation failures
+return 4xx without invoking the model; a failing item returns
+`Recommendation: "ERROR"` with HTTP 200 for the rest of the batch. This route
+grades against the single active `[contract:*]` embeddings table and does **not**
+accept a per-request `contract_id` (use `GET`/`POST /agent` for that).
+
+### Excel CRT client
+
+`search.excel_process.process_excel_with_rag` posts requirement rows to
+`POST /requirements`. It never calls the agent in-process. The input workbook is
+not mutated; verdicts are written to an output copy.
+
+```sh
+python -m search.excel_process.process_excel_with_rag \
+  --input /path/to/crt.xlsx \
+  --output /path/to/crt_rag_results.xlsx \
+  --api-url http://127.0.0.1:8001 \
+  --max-rows 25 \
+  --batch-size 25
+```
+
+`--api-url` defaults to `REQUIREMENTS_API_URL` or `http://127.0.0.1:8001`.
+`--input` is required. `--output`, `--max-rows`, and `--batch-size` are optional.
 
 ### Cloud operation
 
@@ -187,12 +217,15 @@ the expanded query. Query embeddings use Cohere `input_type=search_query`;
 corpus ingest embeddings continue to use `search_document`, so no corpus
 re-embedding is required.
 
-`analyze_requirement_with_rag` was removed. Batch and Excel flows call
-`search_agent.run`. Responses cite document names and pages from `doc_name` and
+`analyze_requirement_with_rag` was removed. `POST /requirements` and the Excel
+client share `search.requirements.verdicts`; the Excel script is an HTTP client
+of that endpoint. Responses cite document names and pages from `doc_name` and
 `page` metadata; the system prompt forbids citing `Hybrid Search Results` as a
 source.
 
-Run the RAG unit tests from the repository root:
+Run the RAG unit tests from a project `.venv` (system `python3` is often PEP 668
+managed). This command is a per-task acceptance gate and is **not** wired into
+GitHub Actions by this change:
 
 ```sh
 cd services/rag && python3 -m unittest discover -s tests -p 'test_*.py'

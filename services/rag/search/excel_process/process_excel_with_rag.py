@@ -1,42 +1,75 @@
 #!/usr/bin/env python3
 
-import sys
-import json
+import argparse
 import asyncio
-import re
+import os
+import sys
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import pandas as pd
 
 src_path = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_path))
 
-from search.database_searching.agents import search_agent
-from search.database_searching.deps import build_chat_deps
 from common.utils.logger import get_logger
+from search.excel_process.crt_layout import (
+    DATA_START_INDEX,
+    HEADER_ROW_INDEX,
+    RAG_RESPONSE_COL,
+    RECOMMENDATION_COL,
+    REQUIREMENT_COL,
+    SOURCE_COL,
+)
 
 logger = get_logger(__name__)
 
-HEADER_ROW_INDEX = 10
-DATA_START_INDEX = 11
-REQUIREMENT_COL = "Requirement"
-RECOMMENDATION_COL = "Recommendation"
-RAG_RESPONSE_COL = "RAG Response"
-SOURCE_COL = "Source"
+if DATA_START_INDEX != HEADER_ROW_INDEX + 1:
+    raise RuntimeError("CRT data rows must start immediately after the header row")
+
+DEFAULT_API_URL = "http://127.0.0.1:8001"
+DEFAULT_BATCH_SIZE = 25
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
+def parse_args(args=None):
+    parser = argparse.ArgumentParser(
+        description="Grade requirements from a CRT workbook through the requirements API."
+    )
+    parser.add_argument("--input", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--api-url",
+        default=os.environ.get("REQUIREMENTS_API_URL", DEFAULT_API_URL),
+    )
+    parser.add_argument("--max-rows", type=positive_int)
+    parser.add_argument("--batch-size", type=positive_int, default=DEFAULT_BATCH_SIZE)
+    return parser.parse_args(args)
 
 
 class ExcelRAGProcessor:
-
-    def __init__(self, excel_file_path: str):
+    def __init__(
+        self,
+        excel_file_path: str,
+        api_url: str = DEFAULT_API_URL,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+    ):
         self.excel_file_path = Path(excel_file_path)
+        self.api_url = api_url.rstrip("/")
+        self.batch_size = batch_size
         self.df: Optional[pd.DataFrame] = None
         self.processed_count = 0
         self.error_count = 0
         logger.info(f"Initialized ExcelRAGProcessor for: {self.excel_file_path}")
 
     def load_excel(self):
-
         if not self.excel_file_path.exists():
             raise FileNotFoundError(f"Excel file not found: {self.excel_file_path}")
 
@@ -46,164 +79,125 @@ class ExcelRAGProcessor:
             header=HEADER_ROW_INDEX,
             engine="openpyxl",
         )
-        logger.info(f"Loaded dataframe with {len(self.df)} data rows, columns: {list(self.df.columns)}")
+        logger.info(
+            f"Loaded dataframe with {len(self.df)} data rows, "
+            f"columns: {list(self.df.columns)}"
+        )
 
         for col in [RECOMMENDATION_COL, RAG_RESPONSE_COL, SOURCE_COL]:
-            self.df[col] = pd.Series([pd.NA] * len(self.df), dtype="object", index=self.df.index)
+            self.df[col] = pd.Series(
+                [pd.NA] * len(self.df),
+                dtype="object",
+                index=self.df.index,
+            )
 
         return self.df
 
-    async def process_requirement(self, requirement: str, retry_unclear: bool = True) -> dict:
+    def _set_error(self, idx, message: str):
+        self.df.at[idx, RECOMMENDATION_COL] = "ERROR"
+        self.df.at[idx, RAG_RESPONSE_COL] = message
+        self.df.at[idx, SOURCE_COL] = "N/A"
+        self.error_count += 1
+
+    async def _process_batch(self, client: httpx.AsyncClient, rows):
+        payload = {
+            "requirements": [
+                {"id": str(idx), "text": requirement}
+                for idx, requirement in rows
+            ],
+            "retry_unclear": True,
+        }
+
         try:
-            logger.info(f"Processing: {requirement[:80]}...")
+            response = await client.post(
+                f"{self.api_url}/requirements",
+                json=payload,
+            )
+            response.raise_for_status()
+            response_body = response.json()
+            results_by_id = {
+                str(result["id"]): result
+                for result in response_body["results"]
+            }
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            logger.error(f"Requirements batch failed: {exc}")
+            for idx, _ in rows:
+                self._set_error(idx, f"Requirements API batch failed: {exc}")
+            self.processed_count += len(rows)
+            return
 
-            deps = build_chat_deps()
-            agent_response = await search_agent.run(user_prompt=requirement, deps=deps)
-
-            if hasattr(agent_response, 'output'):
-                response_text = agent_response.output
-            else:
-                response_text = str(agent_response)
-
-            logger.info(f"Agent raw output (first 200 chars): {response_text[:200]}...")
-
-            parsed = self._parse_agent_response(response_text)
-            recommendation = parsed.get('recommendation', 'UNCLEAR')
-
-            if recommendation == 'UNCLEAR' and retry_unclear:
-                logger.info("Result is UNCLEAR, retrying with more specific prompt...")
-                retry_prompt = (
-                    "Based on the available documentation, please determine if the following "
-                    "requirement is MET or NOT MET. If there is insufficient information, "
-                    "explain what specific information is missing.\n\n"
-                    f"Requirement: {requirement}\n\n"
-                    "Please provide a clear MET or NOT MET determination with specific evidence, "
-                    "or explain exactly what information is needed."
+        for idx, _ in rows:
+            result = results_by_id.get(str(idx))
+            if result is None:
+                self._set_error(
+                    idx,
+                    f"Requirements API returned no result for row {idx}",
                 )
-
-                retry_response = await search_agent.run(user_prompt=retry_prompt, deps=deps)
-                if hasattr(retry_response, 'output'):
-                    retry_text = retry_response.output
-                else:
-                    retry_text = str(retry_response)
-
-                parsed = self._parse_agent_response(retry_text)
-                recommendation = parsed.get('recommendation', 'UNCLEAR')
-                logger.info(f"Retry result - Recommendation: {recommendation}")
-
-            logger.info(f"[OK] Processed successfully - Recommendation: {recommendation}")
-
-            return {
-                "recommendation": parsed.get('recommendation', 'UNCLEAR'),
-                "response": parsed.get('response', 'No response'),
-                "source": parsed.get('source', 'N/A'),
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing requirement: {str(e)}")
-            self.error_count += 1
-            return {
-                "recommendation": "ERROR",
-                "response": f"Error processing requirement: {str(e)}",
-                "source": "N/A",
-            }
-
-    def _parse_agent_response(self, response_text: str) -> dict:
-        try:
-            response_text = re.sub(r'<thinking>.*?</thinking>', '', response_text, flags=re.DOTALL)
-            response_text = response_text.strip()
-
-            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
-
-            if json_match:
-                json_str = json_match.group()
-                try:
-                    result = json.loads(json_str)
-                except json.JSONDecodeError:
-                    result = {
-                        "Response": response_text[:500],
-                        "Recommendation": "UNCLEAR",
-                        "Source": "N/A",
-                    }
             else:
-                result = {
-                    "Response": response_text[:500],
-                    "Recommendation": "UNCLEAR",
-                    "Source": "N/A",
-                }
+                self.df.at[idx, RECOMMENDATION_COL] = result["Recommendation"]
+                self.df.at[idx, RAG_RESPONSE_COL] = result["Response"]
+                self.df.at[idx, SOURCE_COL] = result["Source"]
+                if result["Recommendation"] == "ERROR":
+                    self.error_count += 1
+            self.processed_count += 1
 
-            recommendation = result.get('Recommendation', result.get('Verdict', 'UNCLEAR'))
-            response = result.get('Response', result.get('Reasoning', response_text[:500]))
-            source = result.get('Source', 'N/A')
-            page = result.get('Page', '')
-
-            source_with_page = f"{source}: {page}" if page and page != 'N/A' else source
-
-            return {
-                "recommendation": recommendation.upper() if recommendation else 'UNCLEAR',
-                "response": response if response else 'No response provided',
-                "source": source_with_page,
-            }
-
-        except Exception as e:
-            logger.error(f"Error parsing response: {str(e)}")
-            return {
-                "recommendation": "UNCLEAR",
-                "response": response_text[:500] if response_text else "Error parsing response",
-                "source": "N/A",
-            }
-
-    async def process_all(self, max_rows: Optional[int] = None):
+    async def process_all(
+        self,
+        max_rows: Optional[int] = None,
+        client: Optional[httpx.AsyncClient] = None,
+    ):
         if self.df is None:
             raise RuntimeError("Call load_excel() first")
 
-        requirement_rows = self.df[self.df[REQUIREMENT_COL].notna()].index.tolist()
+        requirement_rows = []
+        for idx in self.df[self.df[REQUIREMENT_COL].notna()].index:
+            requirement = str(self.df.at[idx, REQUIREMENT_COL]).strip()
+            if requirement:
+                requirement_rows.append((idx, requirement))
 
-        if max_rows:
+        if max_rows is not None:
             requirement_rows = requirement_rows[:max_rows]
 
-        total = len(requirement_rows)
-        logger.info(f"Processing {total} requirements...")
+        owns_client = client is None
+        if client is None:
+            client = httpx.AsyncClient()
 
-        for i, idx in enumerate(requirement_rows):
-            requirement = str(self.df.at[idx, REQUIREMENT_COL]).strip()
-            if not requirement:
-                continue
-
-            logger.info(f"\n[{i+1}/{total}] Row {idx}: {requirement[:100]}...")
-
-            result = await self.process_requirement(requirement)
-
-            self.df.at[idx, RECOMMENDATION_COL] = result['recommendation']
-            self.df.at[idx, RAG_RESPONSE_COL] = result['response']
-            self.df.at[idx, SOURCE_COL] = result['source']
-
-            self.processed_count += 1
-            logger.info(f"Row {idx} updated | Rec='{result['recommendation']}' | Total: {self.processed_count}/{total}")
-
-            if self.processed_count % 5 == 0:
-                self.save_progress()
-
-    def save_progress(self):
         try:
-            output_file = self.excel_file_path.parent / "rag_results.xlsx"
-            self._save_to_excel(output_file)
-            logger.info(f"[SAVED] Progress saved to: {output_file}")
-        except Exception as e:
-            logger.error(f"Error saving progress: {str(e)}")
+            for start in range(0, len(requirement_rows), self.batch_size):
+                await self._process_batch(
+                    client,
+                    requirement_rows[start : start + self.batch_size],
+                )
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    def _default_output_path(self) -> Path:
+        return self.excel_file_path.with_name(
+            f"{self.excel_file_path.stem}_rag_results"
+            f"{self.excel_file_path.suffix}"
+        )
+
+    def save_progress(self, output_path: Optional[Path] = None):
+        output_path = output_path or self._default_output_path()
+        try:
+            self._save_to_excel(output_path)
+            logger.info(f"[SAVED] Progress saved to: {output_path}")
+        except Exception as exc:
+            logger.error(f"Error saving progress: {exc}")
 
     def save_final(self, output_path: Optional[Path] = None):
-        if output_path is None:
-            output_path = self.excel_file_path.parent / "rag_results.xlsx"
-
+        output_path = output_path or self._default_output_path()
         self._save_to_excel(output_path)
-        logger.info(f"\n{'='*80}")
         logger.info(f"[SUCCESS] FINAL EXCEL SAVED: {output_path}")
-        logger.info(f"{'='*80}")
         logger.info(f"Total requirements processed: {self.processed_count}")
         logger.info(f"Errors encountered: {self.error_count}")
 
     def _save_to_excel(self, output_path: Path):
+        output_path = Path(output_path)
+        if output_path.resolve() == self.excel_file_path.resolve():
+            raise ValueError("Output path must be different from the input workbook")
+
         header_df = pd.read_excel(
             self.excel_file_path,
             header=None,
@@ -216,45 +210,18 @@ class ExcelRAGProcessor:
             self.df.to_excel(writer, index=False, startrow=HEADER_ROW_INDEX)
 
 
-async def main():
-    print("=" * 100)
-    print("EXCEL RAG PROCESSOR (Pandas)")
-    print("Reads requirements, queries RAG agent, writes Recommendation/RAG Response/Source")
-    print("=" * 100)
-    print()
-
-    data_dir = Path(__file__).parent.parent / "data"
-    excel_file = data_dir / "Summary of Specific MCGCRT Record-2026-03-27-13-12-58.xlsx"
-
-    if not excel_file.exists():
-        print(f"Excel file not found: {excel_file}")
-        return 1
-
-    print(f"[OK] Excel file: {excel_file.name}")
-    print()
-
-    processor = ExcelRAGProcessor(str(excel_file))
+async def main(argv=None):
+    args = parse_args(argv)
+    processor = ExcelRAGProcessor(
+        str(args.input),
+        api_url=args.api_url,
+        batch_size=args.batch_size,
+    )
     processor.load_excel()
-
-    print(f"Requirements to process: {processor.df[REQUIREMENT_COL].notna().sum()}")
-    print("This may take several minutes...")
-    print()
-
-    await processor.process_all(max_rows=None)
-
-    processor.save_final()
-
-    print("\n" + "=" * 100)
-    print("PROCESSING COMPLETE")
-    print("=" * 100)
-    print(f"Processed: {processor.processed_count} | Errors: {processor.error_count}")
-    print("Results written to columns: Recommendation, RAG Response, Source")
-    print(f"Output file: {processor.excel_file_path.parent / 'rag_results.xlsx'}")
-    print()
-
+    await processor.process_all(max_rows=args.max_rows)
+    processor.save_final(args.output)
     return 0
 
 
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    sys.exit(asyncio.run(main()))
