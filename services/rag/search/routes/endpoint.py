@@ -23,6 +23,11 @@ from common.utils.contract_registry import (  # noqa: E402
     list_contracts,
     resolve_contract,
 )
+from search.database_searching.agents import search_agent  # noqa: E402
+from search.database_searching.deps import build_chat_deps  # noqa: E402
+from search.foundational_model.foundational_llm_model import (  # noqa: E402
+    process_query_with_foundational_model,
+)
 from search.requirements import verdicts as requirements_verdicts  # noqa: E402
 from search.routes import security  # noqa: E402
 
@@ -76,8 +81,6 @@ class Mutation:
     """GraphQL mutation root."""
     @strawberry.mutation
     async def process_query(self, query: str, contract_id: Optional[str] = None) -> QueryResponse:
-        from search.foundational_model.foundational_llm_model import process_query_with_foundational_model
-
         if contract_id:
             try:
                 resolved_contract_id = resolve_contract(
@@ -289,9 +292,6 @@ async def process_agent_query(query: str, contract_id: Optional[str] = None) -> 
         logger.info("agent_request", query=query[:100], contract_id=resolved_contract_id)
 
     try:
-        from search.database_searching.agents import search_agent
-        from search.database_searching.deps import build_chat_deps
-
         deps = build_chat_deps(resolved_contract_id)
         if resolved_contract_id is None:
             resolved_contract_id = resolve_contract(_load_contract_config(), None).contract_id
@@ -310,14 +310,6 @@ async def process_agent_query(query: str, contract_id: Optional[str] = None) -> 
             response=result.output,
             success=True,
             contract_id=resolved_contract_id,
-        )
-
-    except ImportError as e:
-        error_msg = f"Module import failed: {str(e)}"
-        logger.error("import_error", error=error_msg, exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Service configuration error: {error_msg}"
         )
 
     except Exception as e:

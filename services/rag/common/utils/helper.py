@@ -3,6 +3,7 @@ import os
 
 from common.utils.logger import log
 from common.utils import contract_config as contract_cfg
+from common.utils import contract_registry as contract_reg
 
 _RAISE_IF_MISSING = object()
 
@@ -63,15 +64,11 @@ class Helper:
 
     @staticmethod
     def list_contracts(config_file='aws.properties.ini'):
-        from common.utils import contract_registry as contract_reg
-
         config = Helper.load_config(config_file)
         return contract_reg.list_contracts(config)
 
     @staticmethod
     def resolve_contract(contract_id, config_file='aws.properties.ini'):
-        from common.utils import contract_registry as contract_reg
-
         config = Helper.load_config(config_file)
         return contract_reg.resolve_contract(config, contract_id)
 
