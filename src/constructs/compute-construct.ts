@@ -132,6 +132,7 @@ export class ComputeConstruct extends Construct {
         DOCUMENTS_BUCKET: props.documentsBucket.bucketName,
         PIPELINE_TEMP_BUCKET: props.pipelineTempBucket.bucketName,
         POST_PROCESSING_BUCKET: props.postProcessingBucket.bucketName,
+        VERDICT_PERSISTENCE_ENABLED: name === "dev" ? "true" : "false",
       },
       image: ecs.ContainerImage.fromEcrRepository(this.repository, imageTag),
       logging: ecs.LogDrivers.awsLogs({ logGroup, streamPrefix: "rag-api" }),

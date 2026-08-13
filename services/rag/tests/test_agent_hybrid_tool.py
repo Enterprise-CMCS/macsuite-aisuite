@@ -71,6 +71,10 @@ class AgentHybridToolTests(unittest.IsolatedAsyncioTestCase):
         )
         return agents_mod.search_agent.tools["hybrid_search"]
 
+    def _semantic_tool(self):
+        self.assertIn("semantic_search", agents_mod.search_agent.tools)
+        return agents_mod.search_agent.tools["semantic_search"]
+
     def test_hybrid_search_is_registered(self):
         self.assertTrue(
             "hybrid_search" in agents_mod.search_agent.tools
@@ -166,6 +170,149 @@ class AgentHybridToolTests(unittest.IsolatedAsyncioTestCase):
             result["metadata"], {"doc_name": "contract.pdf", "page": 7}
         )
         self.assertEqual(result["rerank_score"], 0.97)
+        self.assertEqual(self.deps.last_retrieval, results)
+
+    async def test_semantic_provenance_is_ordered_capped_and_keeps_fields(self):
+        semantic_search = self._semantic_tool()
+        self.deps.search_engine.semantic_search = AsyncMock(
+            return_value=[
+                {
+                    "id": f"hit-{index}",
+                    "text": f"Contract text {index}",
+                    "metadata": json.dumps({"page": index}),
+                    "distance": index / 10,
+                }
+                for index in range(10)
+            ]
+        )
+
+        results = await semantic_search(self.context, "unmatched")
+
+        self.assertEqual([result["id"] for result in results], [
+            f"hit-{index}" for index in range(agents_mod.FINAL_RESULTS)
+        ])
+        self.assertEqual(self.deps.last_retrieval, results)
+        self.assertEqual(len(self.deps.last_retrieval), agents_mod.FINAL_RESULTS)
+        for index, result in enumerate(results):
+            self.assertTrue(
+                {
+                    "text",
+                    "metadata",
+                    "id",
+                    "distance",
+                    "_relevance_score",
+                }.issubset(result)
+            )
+            self.assertEqual(result["metadata"], {"page": index})
+            self.assertEqual(result["distance"], index / 10)
+
+    async def test_second_semantic_search_replaces_provenance(self):
+        semantic_search = self._semantic_tool()
+        self.deps.search_engine.semantic_search = AsyncMock(
+            side_effect=[
+                [
+                    {
+                        "id": "first",
+                        "text": "First result",
+                        "metadata": {},
+                        "distance": 0.1,
+                    }
+                ],
+                [
+                    {
+                        "id": "second",
+                        "text": "Second result",
+                        "metadata": {},
+                        "distance": 0.2,
+                    }
+                ],
+            ]
+        )
+
+        await semantic_search(self.context, "first query")
+        second = await semantic_search(self.context, "second query")
+
+        self.assertEqual([result["id"] for result in second], ["second"])
+        self.assertEqual(self.deps.last_retrieval, second)
+
+    async def test_second_hybrid_search_replaces_provenance(self):
+        hybrid_search = self._hybrid_tool()
+        self.deps.search_engine.hybrid_search = AsyncMock(
+            side_effect=[
+                [
+                    {
+                        "id": "first",
+                        "text": "First result",
+                        "metadata": {},
+                        "distance": None,
+                        "retrieval_leg": "fulltext",
+                        "fusion_rank": 1,
+                    }
+                ],
+                [
+                    {
+                        "id": "second",
+                        "text": "Second result",
+                        "metadata": {},
+                        "distance": 0.2,
+                        "retrieval_leg": "vector",
+                        "fusion_rank": 1,
+                    }
+                ],
+            ]
+        )
+
+        await hybrid_search(self.context, "first query")
+        second = await hybrid_search(self.context, "second query")
+
+        self.assertEqual([result["id"] for result in second], ["second"])
+        self.assertEqual(self.deps.last_retrieval, second)
+
+    async def test_cache_hits_restore_provenance_for_both_tools(self):
+        for tool_name in ("semantic_search", "hybrid_search"):
+            with self.subTest(tool=tool_name):
+                deps = agents_mod.ChatDeps(acronyms={})
+                context = _Ctx(deps)
+                tool = agents_mod.search_agent.tools[tool_name]
+                raw_result = {
+                    "id": tool_name,
+                    "text": "Cached result",
+                    "metadata": {},
+                    "distance": 0.1,
+                }
+                if tool_name == "hybrid_search":
+                    raw_result.update(
+                        retrieval_leg="vector",
+                        fusion_rank=1,
+                    )
+                search_mock = AsyncMock(return_value=[raw_result])
+                setattr(deps.search_engine, tool_name, search_mock)
+
+                expected = await tool(context, "same query")
+                deps.last_retrieval = [{"id": "stale"}]
+                actual = await tool(context, "same query")
+
+                self.assertEqual(actual, expected)
+                self.assertEqual(deps.last_retrieval, expected)
+                search_mock.assert_awaited_once()
+
+    async def test_empty_and_exception_paths_clear_provenance(self):
+        for tool_name in ("semantic_search", "hybrid_search"):
+            with self.subTest(tool=tool_name):
+                deps = agents_mod.ChatDeps(acronyms={})
+                context = _Ctx(deps)
+                tool = agents_mod.search_agent.tools[tool_name]
+                search_mock = AsyncMock(return_value=[])
+                setattr(deps.search_engine, tool_name, search_mock)
+                deps.last_retrieval = [{"id": "stale"}]
+
+                self.assertEqual(await tool(context, "empty query"), [])
+                self.assertEqual(deps.last_retrieval, [])
+
+                search_mock.side_effect = RuntimeError("search unavailable")
+                deps.last_retrieval = [{"id": "stale"}]
+                self.assertEqual(await tool(context, "error query"), [])
+                self.assertEqual(deps.last_retrieval, [])
 
     def test_prompt_version_and_sha256_match_system_prompt(self):
         self.assertTrue(

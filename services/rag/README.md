@@ -104,6 +104,60 @@ return 4xx without invoking the model; a failing item returns
 grades against the single active `[contract:*]` embeddings table and does **not**
 accept a per-request `contract_id` (use `GET`/`POST /agent` for that).
 
+### Verdict persistence
+
+Verdict persistence uses `aisuite_schema.verdicts` for one row per graded
+requirement and `aisuite_schema.verdict_chunks` for its ranked supporting
+chunks. A verdict row records the requirement text and SHA-256, the
+`MET` / `NOT MET` / `UNCLEAR` / `ERROR` result, response, source and page,
+foundation and embedding models, prompt version and SHA-256, model settings,
+retrieval JSON, latency, and `schema_version`. A chunk row records its verdict
+and embeddings-row pointers, rank, document and page, nullable `distance`,
+relevance score, `retrieval_leg`, `fusion_rank`, `rerank_score`, and chunk
+SHA-256.
+
+`VERDICT_PERSISTENCE_ENABLED` is off by default in code; CDK sets it to `"true"`
+for dev only. `VERDICT_STORE_CHUNK_TEXT` defaults to false, so chunks retain a
+pointer, scores, and SHA-256 rather than copied text. Do not enable chunk-text
+storage in dev without a recorded decision.
+
+DDL is bootstrap-only and never runs on the application/search path. The master
+SQL is `scripts/sql/init-aisuite-schema.sql`; the Python bootstrap uses
+`ensure_verdict_tables` in
+`data_embeddings_storage/database/bootstrap.py`. In v1, the only write site is
+`POST /requirements` through `search/requirements/verdicts.py`.
+`GET`/`POST /agent` free-text requests are not persisted. Persisted rows always
+use `source = requirements_batch`; `client` is currently always `NULL`.
+
+#### Eval read contract
+
+The read contract is `schema_version = 1`. An eval harness may rely on:
+
+- `verdicts`: `id`, `created_at`, `request_id`, `source`, `client`,
+  `contract_id`, `embeddings_table`, `requirement_text`,
+  `requirement_sha256`, `verdict`, `response_text`, `source_text`, `page_text`,
+  `raw_output`, `parsed_ok`, `model_id`, `embed_model_id`, `prompt_version`,
+  `prompt_sha256`, `model_settings`, `retrieval`, `latency_ms`, and
+  `schema_version`;
+- `verdict_chunks`: `verdict_id`, `rank`, `embeddings_table`,
+  `embedding_row_id`, `doc_name`, `page`, nullable `distance`,
+  `relevance_score`, `retrieval_leg`, `fusion_rank`, `rerank_score`,
+  `chunk_sha256`, and nullable `chunk_text`.
+
+No eval harness is built by this item. That work belongs to the separate
+`scored-eval-set` spec.
+
+#### Privacy and retention open questions
+
+- No PHI/PII determination is recorded in this repo. Contract language is
+  assumed to be public procurement text, not PHI; this is an assumption, not a
+  determination.
+- Requirement text and model explanations are free text, so minimization
+  applies.
+- Chunk text is not copied unless `VERDICT_STORE_CHUNK_TEXT=true`.
+- No retention, TTL, or purge job exists or is planned here. Retention and
+  deletion requirements must be answered before qa, uat, or prod enablement.
+
 ### Excel CRT client
 
 `search.excel_process.process_excel_with_rag` posts requirement rows to
@@ -312,6 +366,7 @@ The bootstrap entrypoint is
 - migrates any legacy `public.embeddings*` tables into `aisuite_schema`;
 - creates each contract’s embeddings table (from `aws.properties.ini`) and HNSW,
   metadata GIN, trigram GIN, and full-text GIN indexes matching `table_setup.py`;
+- creates `verdicts`, `verdict_chunks`, and their indexes in `aisuite_schema`;
 - creates `aisuite_app` or safely updates its password from the app secret;
 - creates the shared `aisuite_app_owner` NOLOGIN group role, grants it to
   both rotation logins, and reassigns `aisuite_schema` (tables and sequences)
@@ -338,8 +393,10 @@ export AWS_PROFILE=aisuite-dev
 ```
 
 `init-aisuite-schema.sql` creates the schema, migrates leftover
-`public.embeddings*`, installs `aisuite_app_owner`, reassigns object
-ownership, and grants both app roles (not full table DDL).
+`public.embeddings*`, creates the verdict tables and indexes, installs
+`aisuite_app_owner`, reassigns object ownership, and grants both app roles.
+Embeddings tables and indexes remain driven by `aws.properties.ini` and created
+through the Python bootstrap path.
 
 After bootstrap, applications use
 `aisuite/{env}/rag-app-db-credentials`, not the master

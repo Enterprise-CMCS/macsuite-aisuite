@@ -25,6 +25,64 @@ BEGIN
   END LOOP;
 END $$;
 
+-- Verdict persistence tables (mirrors
+-- services/rag/data_embeddings_storage/database/verdict_schema.py).
+CREATE TABLE IF NOT EXISTS aisuite_schema.verdicts (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  request_id UUID NOT NULL,
+  source TEXT NOT NULL,
+  client TEXT,
+  contract_id TEXT NOT NULL,
+  embeddings_table TEXT NOT NULL,
+  requirement_text TEXT NOT NULL,
+  requirement_sha256 TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (
+    verdict IN ('MET', 'NOT MET', 'UNCLEAR', 'ERROR')
+  ),
+  response_text TEXT,
+  source_text TEXT,
+  page_text TEXT,
+  raw_output TEXT,
+  parsed_ok BOOLEAN NOT NULL,
+  model_id TEXT NOT NULL,
+  embed_model_id TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  prompt_sha256 TEXT NOT NULL,
+  model_settings JSONB,
+  retrieval JSONB,
+  latency_ms INTEGER,
+  schema_version SMALLINT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS aisuite_schema.verdict_chunks (
+  id BIGSERIAL PRIMARY KEY,
+  verdict_id BIGINT NOT NULL REFERENCES aisuite_schema.verdicts(id)
+    ON DELETE CASCADE,
+  rank SMALLINT NOT NULL,
+  embeddings_table TEXT NOT NULL,
+  embedding_row_id INTEGER,
+  doc_name TEXT,
+  page TEXT,
+  distance DOUBLE PRECISION,
+  relevance_score DOUBLE PRECISION,
+  retrieval_leg TEXT,
+  fusion_rank SMALLINT,
+  rerank_score DOUBLE PRECISION,
+  chunk_sha256 TEXT NOT NULL,
+  chunk_text TEXT,
+  UNIQUE (verdict_id, rank)
+);
+
+CREATE INDEX IF NOT EXISTS idx_verdicts_created_at
+  ON aisuite_schema.verdicts (created_at);
+CREATE INDEX IF NOT EXISTS idx_verdicts_requirement_sha256
+  ON aisuite_schema.verdicts (requirement_sha256);
+CREATE INDEX IF NOT EXISTS idx_verdicts_contract_id_created_at
+  ON aisuite_schema.verdicts (contract_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_verdict_chunks_verdict_id
+  ON aisuite_schema.verdict_chunks (verdict_id);
+
 -- Shared NOLOGIN owner role so both Secrets Manager rotation logins can
 -- satisfy Postgres ownership checks (CREATE INDEX, ALTER TABLE, etc.).
 DO $$

@@ -14,6 +14,11 @@ from data_embeddings_storage.database.table_objects import (
     ensure_indexes,
     ensure_table,
 )
+from data_embeddings_storage.database.verdict_schema import (
+    create_verdict_chunks_table_sql,
+    create_verdicts_table_sql,
+    verdict_index_statements,
+)
 
 
 APP_ROLE = "aisuite_app"
@@ -34,6 +39,13 @@ def embeddings_tables_to_bootstrap() -> list[str]:
 async def ensure_embeddings_table(connection, table_name: str) -> None:
     await ensure_table(connection, table_name)
     await ensure_indexes(connection, table_name)
+
+
+async def ensure_verdict_tables(connection) -> None:
+    await connection.execute(create_verdicts_table_sql())
+    await connection.execute(create_verdict_chunks_table_sql())
+    for statement in verdict_index_statements():
+        await connection.execute(statement)
 
 
 async def role_exists(connection, role_name: str) -> bool:
@@ -272,6 +284,8 @@ async def bootstrap_database() -> None:
 
             for table_name in embeddings_tables_to_bootstrap():
                 await ensure_embeddings_table(connection, table_name)
+
+            await ensure_verdict_tables(connection)
 
             await reassign_schema_objects(connection, schema)
 

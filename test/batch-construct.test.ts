@@ -7,7 +7,10 @@ import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { describe, expect, it } from "vitest";
 
 import { BatchConstruct } from "../src/constructs/batch-construct";
-import { getDeploymentConfig } from "../src/deployment-config";
+import {
+  type DeploymentEnvironmentName,
+  getDeploymentConfig,
+} from "../src/deployment-config";
 
 const REMOVED_PIPELINE_CODE_ENVIRONMENT_NAME = [
   "PIPELINE",
@@ -15,13 +18,13 @@ const REMOVED_PIPELINE_CODE_ENVIRONMENT_NAME = [
   "BUCKET",
 ].join("_");
 
-function synthesize(): {
+function synthesize(environmentName: DeploymentEnvironmentName = "dev"): {
   batch: BatchConstruct;
   template: Template;
 } {
   const app = new cdk.App();
   const stack = new cdk.Stack(app, "BatchTestStack", {
-    env: getDeploymentConfig("dev").awsEnvironment,
+    env: getDeploymentConfig(environmentName).awsEnvironment,
   });
   const vpc = new ec2.Vpc(stack, "Vpc", {
     maxAzs: 2,
@@ -37,7 +40,7 @@ function synthesize(): {
   const batch = new BatchConstruct(stack, "Batch", {
     appSecurityGroup,
     dbSecret: new secretsmanager.Secret(stack, "AppDbSecret"),
-    deploymentConfig: getDeploymentConfig("dev"),
+    deploymentConfig: getDeploymentConfig(environmentName),
     documentsBucket: new s3.Bucket(stack, "DocumentsBucket"),
     pipelineTempBucket: new s3.Bucket(stack, "PipelineTempBucket"),
     postProcessingBucket: new s3.Bucket(stack, "PostProcessingBucket"),
@@ -88,6 +91,9 @@ describe("BatchConstruct", () => {
         Image: unknown;
       }>;
       const environmentNames = container?.Environment.map(({ Name }) => Name);
+      const environment = Object.fromEntries(
+        container?.Environment.map(({ Name, Value }) => [Name, Value]) ?? [],
+      );
 
       expect(environmentNames).toEqual(
         expect.arrayContaining([
@@ -98,8 +104,10 @@ describe("BatchConstruct", () => {
           "BEDROCK_MODEL_ID",
           "BEDROCK_EMBED_MODEL_ID",
           "AWS_REGION",
+          "VERDICT_PERSISTENCE_ENABLED",
         ]),
       );
+      expect(environment.VERDICT_PERSISTENCE_ENABLED).toBe("true");
       expect(environmentNames).not.toContain(
         REMOVED_PIPELINE_CODE_ENVIRONMENT_NAME,
       );
@@ -112,6 +120,26 @@ describe("BatchConstruct", () => {
     template.hasResourceProperties("AWS::ECR::Repository", {
       RepositoryName: "aisuite-dev-rag-batch",
     });
+  });
+
+  it("disables verdict persistence for both task definitions outside dev", () => {
+    const { template } = synthesize("qa");
+    const taskDefinitions = Object.values(
+      template.findResources("AWS::ECS::TaskDefinition"),
+    );
+
+    expect(taskDefinitions).toHaveLength(2);
+    for (const taskDefinition of taskDefinitions) {
+      const [container] = taskDefinition.Properties
+        ?.ContainerDefinitions as Array<{
+        Environment: Array<{ Name: string; Value: unknown }>;
+      }>;
+      const environment = Object.fromEntries(
+        container?.Environment.map(({ Name, Value }) => [Name, Value]) ?? [],
+      );
+
+      expect(environment.VERDICT_PERSISTENCE_ENABLED).toBe("false");
+    }
   });
 
   it("creates no always-on service or schedule", () => {

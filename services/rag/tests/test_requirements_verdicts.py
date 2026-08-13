@@ -361,5 +361,129 @@ class RequirementVerdictGradingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([result["id"] for result in results], [0, 1])
 
 
+class RequirementVerdictPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.deps = object()
+
+    def _patch_record_verdict(self, record_verdict):
+        return patch(
+            "search.requirements.verdicts.record_verdict", record_verdict
+        )
+
+    def _patch_agent_run(self, *responses, side_effect=None):
+        agent_run = AsyncMock(side_effect=side_effect)
+        if responses:
+            agent_run.side_effect = [SimpleNamespace(output=text) for text in responses]
+        return patch.object(
+            agents_mod.search_agent, "run", agent_run, create=True
+        )
+
+    async def test_grade_requirement_records_one_verdict_per_call(self):
+        record_verdict = AsyncMock()
+
+        with (
+            self._patch_agent_run(_verdict(recommendation="MET")),
+            self._patch_record_verdict(record_verdict),
+        ):
+            result = await grade_requirement(
+                "A requirement", self.deps, retry_unclear=False
+            )
+
+        record_verdict.assert_awaited_once()
+        kwargs = record_verdict.await_args.kwargs
+        self.assertEqual(kwargs["source"], "requirements_batch")
+        self.assertIsNone(kwargs["client"])
+        self.assertEqual(kwargs["requirement_text"], "A requirement")
+        self.assertEqual(kwargs["verdict"], "MET")
+        self.assertTrue(kwargs["parsed_ok"])
+        self.assertEqual(result["Recommendation"], "MET")
+
+    async def test_batch_records_one_verdict_per_item(self):
+        items = [
+            {"id": "a", "text": "first"},
+            {"id": "b", "text": "second"},
+            {"id": "c", "text": "third"},
+        ]
+        agent_run = AsyncMock(
+            side_effect=[
+                SimpleNamespace(output=_verdict(requirement=item["text"]))
+                for item in items
+            ]
+        )
+        record_verdict = AsyncMock()
+
+        with (
+            patch.object(
+                agents_mod.search_agent, "run", agent_run, create=True
+            ),
+            patch(
+                "search.requirements.verdicts.build_chat_deps",
+                side_effect=[object() for _ in items],
+            ),
+            self._patch_record_verdict(record_verdict),
+        ):
+            results = await grade_requirements(items, retry_unclear=False)
+
+        self.assertEqual(record_verdict.await_count, len(items))
+        self.assertTrue(all(result["success"] for result in results))
+
+    async def test_persistence_failure_leaves_payload_unchanged(self):
+        record_verdict = AsyncMock(side_effect=RuntimeError("store unavailable"))
+
+        with (
+            self._patch_agent_run(_verdict(recommendation="MET")),
+            self._patch_record_verdict(record_verdict),
+        ):
+            result = await grade_requirement(
+                "A requirement", self.deps, retry_unclear=False
+            )
+
+        record_verdict.assert_awaited_once()
+        self.assertEqual(result["Recommendation"], "MET")
+        self.assertTrue(result["success"])
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["Source"], "Service requirements: 12")
+
+    async def test_error_path_records_error_verdict(self):
+        record_verdict = AsyncMock()
+
+        with (
+            self._patch_agent_run(side_effect=RuntimeError("model unavailable")),
+            self._patch_record_verdict(record_verdict),
+        ):
+            result = await grade_requirement(
+                "A requirement", self.deps, retry_unclear=False
+            )
+
+        record_verdict.assert_awaited_once()
+        kwargs = record_verdict.await_args.kwargs
+        self.assertEqual(kwargs["verdict"], "ERROR")
+        self.assertFalse(kwargs["parsed_ok"])
+        self.assertEqual(kwargs["raw_output"], result["Response"])
+        self.assertEqual(result["Recommendation"], "ERROR")
+        self.assertFalse(result["success"])
+
+    async def test_unparsed_model_output_records_raw_output(self):
+        raw = "The contractor appears to meet the requirement, but this is not JSON."
+        record_verdict = AsyncMock()
+
+        with (
+            self._patch_agent_run(raw),
+            self._patch_record_verdict(record_verdict),
+        ):
+            result = await grade_requirement(
+                "A requirement", self.deps, retry_unclear=False
+            )
+
+        record_verdict.assert_awaited_once()
+        kwargs = record_verdict.await_args.kwargs
+        self.assertEqual(result["Recommendation"], "UNCLEAR")
+        self.assertTrue(result["success"])
+        self.assertNotIn("parsed_ok", result)
+        self.assertFalse(kwargs["parsed_ok"])
+        self.assertEqual(kwargs["raw_output"], raw)
+        self.assertEqual(kwargs["verdict"], "UNCLEAR")
+
+
 if __name__ == "__main__":
     unittest.main()

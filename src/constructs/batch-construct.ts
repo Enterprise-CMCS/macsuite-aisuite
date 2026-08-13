@@ -100,6 +100,7 @@ export class BatchConstruct extends Construct {
       DOCUMENTS_BUCKET: props.documentsBucket.bucketName,
       PIPELINE_TEMP_BUCKET: props.pipelineTempBucket.bucketName,
       POST_PROCESSING_BUCKET: props.postProcessingBucket.bucketName,
+      VERDICT_PERSISTENCE_ENABLED: name === "dev" ? "true" : "false",
     };
     const imageTag =
       (this.node.tryGetContext(BATCH_IMAGE_TAG_CONTEXT_KEY) as

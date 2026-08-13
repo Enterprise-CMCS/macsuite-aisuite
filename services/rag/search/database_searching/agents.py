@@ -44,6 +44,7 @@ class ChatDeps:
     acronyms: dict
     timing: dict = field(default_factory=dict)
     search_engine: SearchEngine = field(default_factory=SearchEngine)
+    last_retrieval: list = field(default_factory=list)
     _result_cache: dict = field(default_factory=dict)  # Cache for search results
     _cache_hits: int = 0
     _cache_misses: int = 0
@@ -304,7 +305,9 @@ async def semantic_search(context: RunContext[ChatDeps], query: str) -> List[Dic
             misses = context.deps._cache_misses
             cache_ratio = hits / (hits + misses)
             logger.info(f"[SEMANTIC] Cache hit (ratio: {cache_ratio:.2%})")
-            return context.deps._result_cache[cache_key]
+            cached = context.deps._result_cache[cache_key]
+            context.deps.last_retrieval = cached
+            return cached
 
         context.deps._cache_misses += 1
         logger.info(f"[SEMANTIC] Query: {query}")
@@ -320,6 +323,7 @@ async def semantic_search(context: RunContext[ChatDeps], query: str) -> List[Dic
             logger.warning("[SEMANTIC] No results found")
             response: List[Dict[str, Any]] = []
             context.deps._result_cache[cache_key] = response
+            context.deps.last_retrieval = response
             return response
 
 
@@ -334,11 +338,14 @@ async def semantic_search(context: RunContext[ChatDeps], query: str) -> List[Dic
                 {
                     "text": text,
                     "metadata": metadata,
+                    "id": r.get("id"),
+                    "distance": r.get("distance"),
                     "_relevance_score": float(r.get("_relevance_score", 0.0)),
                 }
             )
 
         context.deps._result_cache[cache_key] = cleaned
+        context.deps.last_retrieval = cleaned
         _manage_cache_size(context.deps._result_cache)
 
         logger.info(f"[SEMANTIC] Retrieved {len(cleaned)} ranked results")
@@ -347,7 +354,7 @@ async def semantic_search(context: RunContext[ChatDeps], query: str) -> List[Dic
     except Exception as e:
         error_msg = f"Semantic search failed: {str(e)}"
         logger.error(f"[SEMANTIC] {error_msg}", exc_info=True)
-        
+        context.deps.last_retrieval = []
         return []
 
 
@@ -365,7 +372,9 @@ async def hybrid_search(context: RunContext[ChatDeps], query: str) -> List[Dict[
             misses = context.deps._cache_misses
             cache_ratio = hits / (hits + misses)
             logger.info(f"[HYBRID] Cache hit (ratio: {cache_ratio:.2%})")
-            return context.deps._result_cache[cache_key]
+            cached = context.deps._result_cache[cache_key]
+            context.deps.last_retrieval = cached
+            return cached
 
         context.deps._cache_misses += 1
         logger.info(f"[HYBRID] Query: {query}")
@@ -381,6 +390,7 @@ async def hybrid_search(context: RunContext[ChatDeps], query: str) -> List[Dict[
             logger.warning("[HYBRID] No results found")
             response: List[Dict[str, Any]] = []
             context.deps._result_cache[cache_key] = response
+            context.deps.last_retrieval = response
             return response
 
         # Fusion and reranking already ordered these results; passing a query here
@@ -403,6 +413,7 @@ async def hybrid_search(context: RunContext[ChatDeps], query: str) -> List[Dict[
             cleaned.append(item)
 
         context.deps._result_cache[cache_key] = cleaned
+        context.deps.last_retrieval = cleaned
         _manage_cache_size(context.deps._result_cache)
 
         logger.info(f"[HYBRID] Retrieved {len(cleaned)} fused results")
@@ -411,6 +422,6 @@ async def hybrid_search(context: RunContext[ChatDeps], query: str) -> List[Dict[
     except Exception as e:
         error_msg = f"Hybrid search failed: {str(e)}"
         logger.error(f"[HYBRID] {error_msg}", exc_info=True)
-
+        context.deps.last_retrieval = []
         return []
 

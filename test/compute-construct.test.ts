@@ -186,6 +186,9 @@ describe.each(["dev", "prod"] as const)(
       expect(environment.BEDROCK_EMBED_MODEL_ID).toBe("us.cohere.embed-v4:0");
       expect(environment.AWS_REGION).toBe("us-east-1");
       expect(environment.AWS_DEFAULT_REGION).toBe("us-east-1");
+      expect(environment.VERDICT_PERSISTENCE_ENABLED).toBe(
+        environmentName === "dev" ? "true" : "false",
+      );
     });
 
     it("exposes the compute output contract", () => {
