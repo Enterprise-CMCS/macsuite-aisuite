@@ -122,6 +122,11 @@ python -m search.excel_process.process_excel_with_rag \
 `--api-url` defaults to `REQUIREMENTS_API_URL` or `http://127.0.0.1:8001`.
 `--input` is required. `--output`, `--max-rows`, and `--batch-size` are optional.
 
+### Evaluation
+
+See the [evaluation guide](eval/README.md) to extract human CRT labels, run an
+opt-in live evaluation, and score predictions offline.
+
 ### Cloud operation
 
 - **API**: deployed via the AISuite stack (desired count gated by

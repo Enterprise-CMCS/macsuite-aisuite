@@ -1,0 +1,10 @@
+{"requirement_id":"166f4ef17e08b4c5","requirement":"Lorem requirement alpha.","human_label":"MET","source_row":11}
+{"requirement_id":"f0b3c760e9cd29f3","requirement":"Lorem requirement bravo.","human_label":"NOT_MET","source_row":12}
+{"requirement_id":"7f6433dcbbd2c9f9","requirement":"Lorem requirement charlie.","human_label":"UNCLEAR","source_row":13}
+{"requirement_id":"db1d9bf9378714bb","requirement":"Lorem requirement delta.","human_label":"MET","source_row":14}
+{"requirement_id":"daef21a8db145658","requirement":"Lorem requirement echo.","human_label":"NOT_MET","source_row":15}
+{"requirement_id":"3f13fc5e508e7101","requirement":"Lorem requirement foxtrot.","human_label":"MET","source_row":16}
+{"requirement_id":"11819ae3b85f7488","requirement":"Lorem requirement golf.","human_label":"NOT_MET","source_row":17}
+{"requirement_id":"104968923b1c842a","requirement":"Lorem requirement hotel.","human_label":"MET","source_row":18}
+{"requirement_id":"658a69bc8b4b094b","requirement":"Lorem requirement india.","human_label":"UNCLEAR","source_row":19}
+{"requirement_id":"5ea2c560b334ac6d","requirement":"Lorem requirement juliet.","human_label":"MET","source_row":20}
