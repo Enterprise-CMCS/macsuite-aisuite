@@ -202,8 +202,36 @@ opt-in live evaluation, and score predictions offline.
 - **Batch / bootstrap**: run the corresponding ECS task definitions on the
   private cluster/subnets. Stack outputs include bootstrap cluster name, task
   definition ARN, security group, and subnet IDs (`RunTask` contract).
+- **Automatic ingestion (dev only)**: an S3 `Object Created` event under the
+  active contract's `input_prefix` in the documents bucket flows through
+  EventBridge to a Step Functions workflow. After a debounce wait, it runs
+  `aisuite-dev-pre-processing` and then `aisuite-dev-rag-process`.
 - Bucket names and model IDs are injected via ECS environment variables (see
   below), which override matching keys in `aws.properties.ini`.
+
+The debounce window defaults to 5 minutes and is configurable at synth with
+`aisuite:ingestionDebounceMinutes`. After the wait, only the oldest `RUNNING`
+execution proceeds; other running executions succeed without re-running the
+tasks. Step Functions `ListExecutions` is eventually consistent, so a narrow
+overlap remains possible. Because pre-processing uses `full_refresh`, overlapping
+runs can delete each other's output.
+
+Automatic ingestion is enabled only when `aisuite:activateIngestion=true` is
+passed for dev. Omit the context, set it to `false`, or disable the EventBridge
+rule to stop automatic runs. The rule is always `DISABLED` in non-dev
+environments.
+
+Operators can still use ECS `RunTask` directly, running the
+`aisuite-<env>-pre-processing` task definition before
+`aisuite-<env>-rag-process`. The stack outputs `IngestionStateMachineArn`,
+`IngestionAlertTopicArn`, `IngestionRuleName`, and `IngestionActiveContract`.
+The SNS alert topic is created by the stack; subscriptions are added
+out-of-band.
+
+The active contract is resolved from `common/utils/aws.properties.ini` at synth
+time. The EventBridge rule watches the `input_prefix` that was active then;
+`IngestionActiveContract` shows the resolved contract. Re-synthesize and deploy
+after changing the active contract.
 
 ## Environment variables
 
@@ -393,11 +421,11 @@ For a non-destructive cutover:
 4. Run `rag-process` and verify the new table's row count.
 5. Flip search to the new table only after verification.
 
-When event-driven ingestion is present, its prefix and table are pinned at
-synth time. An INI table rename therefore requires bootstrap and a re-synth.
-`aisuite:activateIngestion` is not currently in this repository; if and when
-that context flag is enabled, freeze its value through the first reindex so a
-mid-reindex synth does not retarget the trigger.
+Event-driven ingestion pins its prefix and table at synth time. An INI table
+rename therefore requires bootstrap and a re-synth. The dev deployment workflow
+passes `aisuite:activateIngestion=true`. Do not arm the trigger mid-reindex if
+the first chunking reindex is still in progress; keep it disabled until that
+reindex finishes so a synth cannot retarget the trigger during the operation.
 
 ### Runtime, cost, and generation visibility
 

@@ -7,6 +7,7 @@ import { BatchConstruct } from "./constructs/batch-construct";
 import { BootstrapConstruct } from "./constructs/bootstrap-construct";
 import { ComputeConstruct } from "./constructs/compute-construct";
 import { DatabaseConstruct } from "./constructs/database-construct";
+import { IngestionConstruct } from "./constructs/ingestion-construct";
 import { NetworkingConstruct } from "./constructs/networking-construct";
 import { SecretsConstruct } from "./constructs/secrets-construct";
 import { StorageConstruct } from "./constructs/storage-construct";
@@ -78,6 +79,15 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
       postProcessingBucket: storage.postProcessingBucket,
       taskRole: appIam.taskRole,
       vpc: networking.vpc,
+    });
+
+    const ingestion = new IngestionConstruct(this, "Ingestion", {
+      cluster: batch.cluster,
+      deploymentConfig,
+      documentsBucket: storage.documentsBucket,
+      preProcessingTaskDefinition: batch.preProcessingTaskDefinition,
+      ragProcessTaskDefinition: batch.ragProcessTaskDefinition,
+      runTaskNetworkConfiguration: batch.runTaskNetworkConfiguration,
     });
 
     const bootstrap = new BootstrapConstruct(this, "Bootstrap", {
@@ -196,6 +206,29 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
     new cdk.CfnOutput(this, "BatchEcrRepositoryUri", {
       description: "ECR repository holding the RAG batch container image.",
       value: batch.repository.repositoryUri,
+    });
+
+    new cdk.CfnOutput(this, "IngestionStateMachineArn", {
+      description: "Step Functions state machine orchestrating RAG ingestion.",
+      value: ingestion.stateMachine.stateMachineArn,
+    });
+
+    new cdk.CfnOutput(this, "IngestionAlertTopicArn", {
+      description:
+        "SNS topic receiving RAG ingestion failures and alarm notifications.",
+      value: ingestion.alertTopic.topicArn,
+    });
+
+    new cdk.CfnOutput(this, "IngestionRuleName", {
+      description:
+        "EventBridge rule starting RAG ingestion on documents bucket uploads.",
+      value: ingestion.rule.ruleName,
+    });
+
+    new cdk.CfnOutput(this, "IngestionActiveContract", {
+      description:
+        "Contract id resolved at synth time and watched by the ingestion rule.",
+      value: ingestion.activeContract.id,
     });
 
     new cdk.CfnOutput(this, "BootstrapClusterName", {

@@ -89,6 +89,7 @@ jobs:
           pnpm run cdk:deploy \
             --context environment=${DEPLOYMENT_ENV} \
             --context aisuite:activateApi=false \
+            --context aisuite:activateIngestion=true \
             --context aisuite:apiImageTag=${{ github.sha }} \
             --context aisuite:batchImageTag=${{ github.sha }}
 
@@ -216,6 +217,7 @@ jobs:
           pnpm run cdk:deploy \
             --context environment=${DEPLOYMENT_ENV} \
             --context aisuite:activateApi=true \
+            --context aisuite:activateIngestion=true \
             --context aisuite:apiImageTag=${{ github.sha }} \
             --context aisuite:batchImageTag=${{ github.sha }}
 
