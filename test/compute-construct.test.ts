@@ -9,6 +9,7 @@ import {
 } from "../src/constructs/compute-construct";
 import { STUB_VPC_CONTEXT_KEY } from "../src/constructs/networking-construct";
 import {
+  type DeploymentConfig,
   type DeploymentEnvironmentName,
   getDeploymentConfig,
 } from "../src/deployment-config";
@@ -25,9 +26,11 @@ const REMOVED_PIPELINE_CODE_ENVIRONMENT_NAME = [
   "BUCKET",
 ].join("_");
 
-function synthesize(environmentName: DeploymentEnvironmentName): Template {
+const TEST_CERTIFICATE_ARN =
+  "arn:aws:acm:us-east-1:123456789012:certificate/test-id";
+
+function synthesizeWithConfig(config: DeploymentConfig): Template {
   const app = new cdk.App({ context: { [STUB_VPC_CONTEXT_KEY]: true } });
-  const config = getDeploymentConfig(environmentName);
   const stack = new AisuiteInfrastructureStack(app, config.stackName, {
     deploymentConfig: config,
     env: config.awsEnvironment,
@@ -35,6 +38,32 @@ function synthesize(environmentName: DeploymentEnvironmentName): Template {
   });
 
   return Template.fromStack(stack);
+}
+
+function synthesize(environmentName: DeploymentEnvironmentName): Template {
+  return synthesizeWithConfig(getDeploymentConfig(environmentName));
+}
+
+function listeners(template: Template): Array<Record<string, unknown>> {
+  return Object.values(
+    template.findResources("AWS::ElasticLoadBalancingV2::Listener"),
+  ).map((listener) => listener.Properties as Record<string, unknown>);
+}
+
+function ingressRules(template: Template): Array<Record<string, unknown>> {
+  const inlineRules = Object.values(
+    template.findResources("AWS::EC2::SecurityGroup"),
+  ).flatMap(
+    (group) =>
+      (group.Properties?.SecurityGroupIngress as Array<
+        Record<string, unknown>
+      >) ?? [],
+  );
+  const standaloneRules = Object.values(
+    template.findResources("AWS::EC2::SecurityGroupIngress"),
+  ).map((rule) => rule.Properties as Record<string, unknown>);
+
+  return [...inlineRules, ...standaloneRules];
 }
 
 function apiContainerEnvironment(
@@ -115,7 +144,13 @@ describe.each(["dev", "prod"] as const)(
 
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::LoadBalancer",
-        { Scheme: "internal", Type: "application" },
+        {
+          LoadBalancerAttributes: Match.arrayWith([
+            { Key: "idle_timeout.timeout_seconds", Value: "300" },
+          ]),
+          Scheme: "internal",
+          Type: "application",
+        },
       );
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::TargetGroup",
@@ -129,25 +164,27 @@ describe.each(["dev", "prod"] as const)(
     });
 
     it("keeps every ingress rule off the public internet", () => {
-      const template = synthesize(environmentName);
+      const rules = ingressRules(synthesize(environmentName));
 
-      const inlineRules = Object.values(
-        template.findResources("AWS::EC2::SecurityGroup"),
-      ).flatMap(
-        (group) =>
-          (group.Properties?.SecurityGroupIngress as Array<
-            Record<string, unknown>
-          >) ?? [],
-      );
-      const standaloneRules = Object.values(
-        template.findResources("AWS::EC2::SecurityGroupIngress"),
-      ).map((rule) => rule.Properties as Record<string, unknown>);
-
-      expect(inlineRules.length).toBeGreaterThan(0);
-      for (const rule of [...inlineRules, ...standaloneRules]) {
+      expect(rules.length).toBeGreaterThan(0);
+      for (const rule of rules) {
         expect(rule).not.toHaveProperty("CidrIp", "0.0.0.0/0");
         expect(rule).not.toHaveProperty("CidrIpv6", "::/0");
       }
+    });
+
+    it("serves plain HTTP while no API certificate is configured", () => {
+      const template = synthesize(environmentName);
+      const albListeners = listeners(template);
+
+      expect(albListeners).toHaveLength(1);
+      expect(albListeners[0]).toMatchObject({ Port: 80, Protocol: "HTTP" });
+      for (const listener of albListeners) {
+        expect(listener).not.toHaveProperty("Certificates");
+      }
+      expect(
+        albListeners.filter((listener) => listener.Protocol === "HTTPS"),
+      ).toHaveLength(0);
     });
 
     it("allows ALB traffic to the application tier on the container port only", () => {
@@ -181,6 +218,11 @@ describe.each(["dev", "prod"] as const)(
       expect(environment.PIPELINE_TEMP_BUCKET).toBe(
         `aisuite-${environmentName}-llm-pipeline-temp`,
       );
+      expect(environment.API_KEY_SECRET_ARN).toMatch(
+        /"(?:Ref|Fn::GetAtt|Fn::Join)"/,
+      );
+      expect(environment.API_KEY_SECRET_ARN).not.toMatch(/^[A-Za-z0-9]{32}$/);
+      expect(environment.API_ALLOWED_ORIGINS).toBe("");
       expect(environment.DB_SECRET_ARN).toBeDefined();
       expect(environment.BEDROCK_MODEL_ID).toBe("us.amazon.nova-pro-v1:0");
       expect(environment.BEDROCK_EMBED_MODEL_ID).toBe("us.cohere.embed-v4:0");
@@ -200,3 +242,65 @@ describe.each(["dev", "prod"] as const)(
     });
   },
 );
+
+describe("AISuite RAG API with an ALB certificate", () => {
+  const template = synthesizeWithConfig({
+    ...getDeploymentConfig("dev"),
+    apiCertificateArn: TEST_CERTIFICATE_ARN,
+  });
+
+  it("terminates TLS on a 443 listener using TLS 1.2 or higher", () => {
+    template.hasResourceProperties("AWS::ElasticLoadBalancingV2::Listener", {
+      Certificates: [{ CertificateArn: TEST_CERTIFICATE_ARN }],
+      Port: 443,
+      Protocol: "HTTPS",
+      SslPolicy: Match.stringLikeRegexp("^ELBSecurityPolicy-TLS13-1-2"),
+    });
+  });
+
+  it("keeps the health-checked target group behind the HTTPS listener", () => {
+    template.resourceCountIs("AWS::ElasticLoadBalancingV2::TargetGroup", 1);
+    template.hasResourceProperties("AWS::ElasticLoadBalancingV2::TargetGroup", {
+      HealthCheckPath: API_HEALTH_CHECK_PATH,
+      Port: API_CONTAINER_PORT,
+      Protocol: "HTTP",
+    });
+    template.hasResourceProperties("AWS::ElasticLoadBalancingV2::Listener", {
+      DefaultActions: [{ TargetGroupArn: Match.anyValue(), Type: "forward" }],
+      Protocol: "HTTPS",
+    });
+  });
+
+  it("redirects the HTTP listener to HTTPS", () => {
+    template.hasResourceProperties("AWS::ElasticLoadBalancingV2::Listener", {
+      DefaultActions: [
+        {
+          RedirectConfig: {
+            Port: "443",
+            Protocol: "HTTPS",
+            StatusCode: "HTTP_301",
+          },
+          Type: "redirect",
+        },
+      ],
+      Port: 80,
+      Protocol: "HTTP",
+    });
+  });
+
+  it("allows 443 from the VPC CIDR only", () => {
+    const rules = ingressRules(template);
+    const httpsRules = rules.filter((rule) => rule.FromPort === 443);
+
+    expect(httpsRules).toHaveLength(1);
+    expect(httpsRules[0]).toMatchObject({
+      CidrIp: "10.0.0.0/16",
+      IpProtocol: "tcp",
+      ToPort: 443,
+    });
+    for (const rule of rules) {
+      expect(rule).not.toHaveProperty("CidrIp", "0.0.0.0/0");
+      expect(rule).not.toHaveProperty("CidrIpv6", "::/0");
+    }
+  });
+});

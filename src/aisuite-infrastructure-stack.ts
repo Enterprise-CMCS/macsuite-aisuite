@@ -50,6 +50,7 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
     });
 
     const appIam = new AppIamConstruct(this, "AppIam", {
+      apiKeySecret: secrets.apiKeySecret,
       dbSecret: database.appDbSecret,
       documentsBucket: storage.documentsBucket,
       pipelineTempBucket: storage.pipelineTempBucket,
@@ -57,6 +58,7 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
     });
 
     const compute = new ComputeConstruct(this, "Compute", {
+      apiKeySecret: secrets.apiKeySecret,
       appSecurityGroup: networking.appSecurityGroup,
       dbSecret: database.appDbSecret,
       deploymentConfig,
@@ -114,6 +116,11 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
       description:
         "Secrets Manager ARN holding the app-scoped RAG database credentials used by ECS containers.",
       value: database.appDbSecret.secretArn,
+    });
+
+    new cdk.CfnOutput(this, "ApiKeySecretArn", {
+      description: "Secrets Manager ARN holding the RAG API key.",
+      value: secrets.apiKeySecret.secretArn,
     });
 
     new cdk.CfnOutput(this, "AppTaskRoleArn", {

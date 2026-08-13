@@ -111,6 +111,8 @@ describe("BatchConstruct", () => {
       expect(environmentNames).not.toContain(
         REMOVED_PIPELINE_CODE_ENVIRONMENT_NAME,
       );
+      expect(environmentNames).not.toContain("API_KEY_SECRET_ARN");
+      expect(environmentNames).not.toContain("API_ALLOWED_ORIGINS");
       expect(container?.Image).toEqual(
         expect.objectContaining({ "Fn::Join": expect.any(Array) }),
       );

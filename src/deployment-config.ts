@@ -44,6 +44,18 @@ export const DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID: Partial<
   dev: "sg-0964f9710d200b1ac",
 };
 
+export const DEPLOYMENT_ENVIRONMENT_API_ALLOWED_ORIGINS: Partial<
+  Record<DeploymentEnvironmentName, string>
+> = {};
+
+/**
+ * ACM certificate ARNs for the internal RAG API ALB. Empty until a certificate
+ * is issued per stage; the ALB stays HTTP-only while a stage is unset.
+ */
+export const DEPLOYMENT_ENVIRONMENT_API_CERTIFICATE_ARN: Partial<
+  Record<DeploymentEnvironmentName, string>
+> = {};
+
 /**
  * Explicit AISuite AWS account IDs (CloudTamer aisuite-non-prod / aisuite-prod).
  * Runtime env overrides (`AISUITE_NONPROD_ACCOUNT_ID` /
@@ -88,6 +100,9 @@ export interface StandardTags {
 
 export interface DeploymentConfig {
   accountTier: AwsAccountTier;
+  apiAllowedOrigins?: string;
+  /** ACM certificate ARN enabling the HTTPS listener on the RAG API ALB. */
+  apiCertificateArn?: string;
   awsEnvironment: cdk.Environment;
   name: DeploymentEnvironmentName;
   protectedEnvironment: boolean;
@@ -129,6 +144,10 @@ export function getDeploymentConfig(
   const deployedAt = process.env.DEPLOYMENT_TIMESTAMP ?? new Date().toISOString();
   return {
     accountTier,
+    apiAllowedOrigins:
+      DEPLOYMENT_ENVIRONMENT_API_ALLOWED_ORIGINS[environmentName],
+    apiCertificateArn:
+      DEPLOYMENT_ENVIRONMENT_API_CERTIFICATE_ARN[environmentName],
     awsEnvironment: {
       account: resolveAccountId(accountTier),
       region: DEFAULT_REGION,

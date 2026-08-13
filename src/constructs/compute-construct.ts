@@ -39,6 +39,7 @@ const TASK_SIZE_BY_ENVIRONMENT = {
 >;
 
 export interface ComputeConstructProps {
+  apiKeySecret: secretsmanager.ISecret;
   appSecurityGroup: ec2.ISecurityGroup;
   dbSecret: secretsmanager.ISecret;
   deploymentConfig: DeploymentConfig;
@@ -124,6 +125,8 @@ export class ComputeConstruct extends Construct {
     const container = taskDefinition.addContainer("Container", {
       containerName: "rag-api",
       environment: {
+        API_ALLOWED_ORIGINS: props.deploymentConfig.apiAllowedOrigins ?? "",
+        API_KEY_SECRET_ARN: props.apiKeySecret.secretArn,
         AWS_DEFAULT_REGION: region,
         AWS_REGION: region,
         BEDROCK_EMBED_MODEL_ID,
@@ -166,6 +169,7 @@ export class ComputeConstruct extends Construct {
     );
 
     this.loadBalancer = new elbv2.ApplicationLoadBalancer(this, "Alb", {
+      idleTimeout: cdk.Duration.seconds(300),
       internetFacing: false,
       loadBalancerName: serviceName,
       securityGroup: loadBalancerSecurityGroup,
@@ -173,19 +177,7 @@ export class ComputeConstruct extends Construct {
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
     });
 
-    const listener = this.loadBalancer.addListener("Listener", {
-      open: false,
-      port: 80,
-      protocol: elbv2.ApplicationProtocol.HTTP,
-    });
-
-    listener.connections.allowFrom(
-      ec2.Peer.ipv4(props.vpc.vpcCidrBlock),
-      ec2.Port.tcp(80),
-      "RAG API HTTP from inside the VPC",
-    );
-
-    listener.addTargets("Targets", {
+    const targetOptions: elbv2.AddApplicationTargetsProps = {
       deregistrationDelay: cdk.Duration.seconds(30),
       healthCheck: {
         healthyThresholdCount: 2,
@@ -202,6 +194,59 @@ export class ComputeConstruct extends Construct {
           containerPort: API_CONTAINER_PORT,
         }),
       ],
+    };
+
+    const { apiCertificateArn } = props.deploymentConfig;
+
+    if (apiCertificateArn) {
+      const httpsListener = this.loadBalancer.addListener("HttpsListener", {
+        certificates: [elbv2.ListenerCertificate.fromArn(apiCertificateArn)],
+        open: false,
+        port: 443,
+        protocol: elbv2.ApplicationProtocol.HTTPS,
+        sslPolicy: elbv2.SslPolicy.RECOMMENDED_TLS,
+      });
+
+      httpsListener.connections.allowFrom(
+        ec2.Peer.ipv4(props.vpc.vpcCidrBlock),
+        ec2.Port.tcp(443),
+        "RAG API HTTPS from inside the VPC",
+      );
+
+      httpsListener.addTargets("Targets", targetOptions);
+
+      const redirectListener = this.loadBalancer.addListener("Listener", {
+        defaultAction: elbv2.ListenerAction.redirect({
+          permanent: true,
+          port: "443",
+          protocol: "HTTPS",
+        }),
+        open: false,
+        port: 80,
+        protocol: elbv2.ApplicationProtocol.HTTP,
+      });
+
+      redirectListener.connections.allowFrom(
+        ec2.Peer.ipv4(props.vpc.vpcCidrBlock),
+        ec2.Port.tcp(80),
+        "RAG API HTTP from inside the VPC",
+      );
+
+      return;
+    }
+
+    const listener = this.loadBalancer.addListener("Listener", {
+      open: false,
+      port: 80,
+      protocol: elbv2.ApplicationProtocol.HTTP,
     });
+
+    listener.connections.allowFrom(
+      ec2.Peer.ipv4(props.vpc.vpcCidrBlock),
+      ec2.Port.tcp(80),
+      "RAG API HTTP from inside the VPC",
+    );
+
+    listener.addTargets("Targets", targetOptions);
   }
 }

@@ -16,6 +16,7 @@ const EXPECTED_OUTPUTS = [
   "DbEndpoint",
   "DbSecretArn",
   "AppDbSecretArn",
+  "ApiKeySecretArn",
   "AppTaskRoleArn",
   "DocumentsBucketName",
   "PostProcessingBucketName",
@@ -113,13 +114,13 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       }
     });
 
-    it("encrypts RDS storage and provisions master + app database secrets", () => {
+    it("encrypts RDS storage and provisions database + API key secrets", () => {
       const template = synthesize(environmentName);
 
       template.hasResourceProperties("AWS::RDS::DBInstance", {
         StorageEncrypted: true,
       });
-      template.resourceCountIs("AWS::SecretsManager::Secret", 2);
+      template.resourceCountIs("AWS::SecretsManager::Secret", 3);
       template.hasResourceProperties("AWS::SecretsManager::Secret", {
         Name: Match.stringLikeRegexp("/rag-db-credentials$"),
         GenerateSecretString: {
@@ -136,6 +137,15 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
               Match.arrayWith([Match.stringLikeRegexp("aisuite_app")]),
             ]),
           },
+        },
+      });
+      template.hasResourceProperties("AWS::SecretsManager::Secret", {
+        Name: `aisuite/${environmentName}/rag-api-key`,
+        GenerateSecretString: {
+          ExcludePunctuation: true,
+          GenerateStringKey: "apiKey",
+          PasswordLength: 32,
+          SecretStringTemplate: Match.serializedJson({}),
         },
       });
     });
@@ -172,6 +182,7 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       );
 
       expect(bySid.RagAppDatabaseCredentials).toBeDefined();
+      expect(bySid.RagApiKey).toBeDefined();
       expect(bySid.RagDatabaseCredentials).toBeUndefined();
       expect(bySid.DocumentsBucketList?.Action).toBe("s3:ListBucket");
       expect(bySid.DocumentsBucketRead?.Action).toBe("s3:GetObject");
@@ -190,6 +201,22 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       expect(bySid.PipelineTempBucketAccess?.Action).not.toEqual(
         expect.arrayContaining(["s3:DeleteObject"]),
       );
+
+      const taskRoleSecretReads = statements.filter((statement) => {
+        const actions = Array.isArray(statement.Action)
+          ? statement.Action
+          : [statement.Action];
+        return (
+          actions.includes("secretsmanager:GetSecretValue") &&
+          ["RagAppDatabaseCredentials", "RagApiKey"].includes(
+            statement.Sid ?? "",
+          )
+        );
+      });
+      expect(taskRoleSecretReads).toHaveLength(2);
+      expect(
+        taskRoleSecretReads.every((statement) => statement.Resource !== "*"),
+      ).toBe(true);
 
       const serialized = JSON.stringify(statements);
       expect(serialized).not.toContain("llm-pipeline-code");
@@ -284,7 +311,7 @@ describe("environment-specific data protection", () => {
           resource.UpdateReplacePolicy === "Retain",
       );
 
-      expect(resources).toHaveLength(7);
+      expect(resources).toHaveLength(8);
     },
   );
 });

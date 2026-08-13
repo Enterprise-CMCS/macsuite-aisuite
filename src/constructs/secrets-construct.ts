@@ -16,6 +16,7 @@ export interface SecretsConstructProps {
 export class SecretsConstruct extends Construct {
   public readonly dbSecret: secretsmanager.ISecret;
   public readonly appDbSecret: rds.DatabaseSecret;
+  public readonly apiKeySecret: secretsmanager.ISecret;
 
   public constructor(
     scope: Construct,
@@ -48,5 +49,17 @@ export class SecretsConstruct extends Construct {
       username: DB_APP_USERNAME,
     });
     this.appDbSecret.applyRemovalPolicy(removalPolicy);
+
+    this.apiKeySecret = new secretsmanager.Secret(this, "RagApiKey", {
+      description: `AISuite ${name} RAG API key.`,
+      generateSecretString: {
+        excludePunctuation: true,
+        generateStringKey: "apiKey",
+        passwordLength: 32,
+        secretStringTemplate: JSON.stringify({}),
+      },
+      removalPolicy,
+      secretName: `${APPLICATION_NAME}/${name}/rag-api-key`,
+    });
   }
 }

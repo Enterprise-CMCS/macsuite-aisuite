@@ -7,8 +7,9 @@ from typing import Optional, Union
 
 import strawberry
 import structlog
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from strawberry.fastapi import GraphQLRouter
 
@@ -23,6 +24,7 @@ from common.utils.contract_registry import (  # noqa: E402
     resolve_contract,
 )
 from search.requirements import verdicts as requirements_verdicts  # noqa: E402
+from search.routes import security  # noqa: E402
 
 logger = structlog.get_logger(__name__)
 
@@ -171,13 +173,20 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    """Require an API key on every route except the health check."""
+    status_code, message = security.check_request(
+        request.url.path,
+        request.headers.get("x-api-key"),
+    )
+    if status_code is not None:
+        return JSONResponse(status_code=status_code, content={"detail": message})
+    return await call_next(request)
+
+
+# Added last so CORS wraps the auth middleware and answers preflight OPTIONS.
+app.add_middleware(CORSMiddleware, **security.build_cors_kwargs())
 
 graphql_app = GraphQLRouter(schema)
 app.include_router(graphql_app, prefix="/query")

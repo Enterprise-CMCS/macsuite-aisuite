@@ -20,6 +20,7 @@ const BEDROCK_RERANK_MODEL = "cohere.rerank-v3-5:0";
 const BEDROCK_RERANK_REGIONS = ["us-east-1", "us-west-2"] as const;
 
 export interface AppIamConstructProps {
+  apiKeySecret: secretsmanager.ISecret;
   dbSecret: secretsmanager.ISecret;
   documentsBucket: s3.IBucket;
   pipelineTempBucket: s3.IBucket;
@@ -93,6 +94,13 @@ export class AppIamConstruct extends Construct {
         actions: ["secretsmanager:GetSecretValue"],
         resources: [props.dbSecret.secretArn],
         sid: "RagAppDatabaseCredentials",
+      }),
+    );
+    this.taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [props.apiKeySecret.secretArn],
+        sid: "RagApiKey",
       }),
     );
 

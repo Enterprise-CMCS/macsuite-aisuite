@@ -64,6 +64,7 @@ class ExcelRAGProcessor:
         self.excel_file_path = Path(excel_file_path)
         self.api_url = api_url.rstrip("/")
         self.batch_size = batch_size
+        self.api_key = os.environ.get("AISUITE_EVAL_API_KEY")
         self.df: Optional[pd.DataFrame] = None
         self.processed_count = 0
         self.error_count = 0
@@ -112,6 +113,7 @@ class ExcelRAGProcessor:
             response = await client.post(
                 f"{self.api_url}/requirements",
                 json=payload,
+                headers={"x-api-key": self.api_key} if self.api_key else {},
             )
             response.raise_for_status()
             response_body = response.json()

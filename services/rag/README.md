@@ -84,14 +84,28 @@ python -m search.routes.endpoint
 | `GET/POST /query` | GraphQL |
 | `GET /docs` | OpenAPI UI |
 
+### Authentication
+
+The API key is stored in Secrets Manager as `aisuite/<env>/rag-api-key`, using
+the JSON key `apiKey`. Authorized callers send that value in the `x-api-key`
+header. `/health` is the only unauthenticated route.
+
+Rotation is manual: rotate the secret value in Secrets Manager, then restart or
+redeploy the API tasks so the process cache refreshes. There is no rotation
+Lambda. CORS origins come from `API_ALLOWED_ORIGINS` as a comma-separated list
+and default to empty.
+
 Example:
 
 ```sh
-curl -s "http://127.0.0.1:8001/agent?query=What+is+coverage+for+NEMT%3F"
+curl -s "http://127.0.0.1:8001/agent?query=What+is+coverage+for+NEMT%3F" \
+  -H "x-api-key: $API_KEY"
 curl -s -X POST "http://127.0.0.1:8001/agent" \
+  -H "x-api-key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"query":"What is coverage for NEMT?"}'
 curl -s -X POST "http://127.0.0.1:8001/requirements" \
+  -H "x-api-key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"requirements":[{"id":"row-12","text":"The Contractor shall provide NEMT services statewide."}],"retry_unclear":true}'
 ```

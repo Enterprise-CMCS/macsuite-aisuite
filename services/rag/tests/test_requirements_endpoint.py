@@ -53,7 +53,28 @@ except (ImportError, ModuleNotFoundError):
     from starlette.testclient import TestClient
 
 import search.database_searching.agents as agents_mod  # noqa: E402
+import search.routes.security as security  # noqa: E402
 from search.routes.endpoint import app  # noqa: E402
+
+TEST_API_KEY = "test-api-key"
+
+
+def _authenticated_client():
+    client = TestClient(app)
+    client.headers.update({"x-api-key": TEST_API_KEY})
+    return client
+
+
+class _ApiKeyTestMixin:
+    def _patch_api_key(self):
+        security._resolved_api_key = None
+        key_patch = patch.object(
+            security,
+            "resolve_api_key",
+            return_value=TEST_API_KEY,
+        )
+        key_patch.start()
+        self.addCleanup(key_patch.stop)
 
 
 def _success_verdict(item_id, requirement, recommendation="MET"):
@@ -69,7 +90,7 @@ def _success_verdict(item_id, requirement, recommendation="MET"):
     }
 
 
-class RequirementsEndpointContractTests(unittest.TestCase):
+class RequirementsEndpointContractTests(_ApiKeyTestMixin, unittest.TestCase):
     def setUp(self):
         self.grade_requirements = AsyncMock()
         self.grader_patch = patch(
@@ -78,7 +99,8 @@ class RequirementsEndpointContractTests(unittest.TestCase):
         )
         self.grader_patch.start()
         self.addCleanup(self.grader_patch.stop)
-        self.client = TestClient(app)
+        self._patch_api_key()
+        self.client = _authenticated_client()
 
     def test_post_requirements_returns_ordered_verdicts(self):
         items = [
@@ -208,7 +230,7 @@ class RequirementsEndpointContractTests(unittest.TestCase):
         )
 
 
-class AgentEndpointRegressionTests(unittest.TestCase):
+class AgentEndpointRegressionTests(_ApiKeyTestMixin, unittest.TestCase):
     def setUp(self):
         self.agent_run = AsyncMock(
             return_value=SimpleNamespace(output="stub-answer")
@@ -221,7 +243,8 @@ class AgentEndpointRegressionTests(unittest.TestCase):
         )
         self.run_patch.start()
         self.addCleanup(self.run_patch.stop)
-        self.client = TestClient(app)
+        self._patch_api_key()
+        self.client = _authenticated_client()
 
     def test_get_agent_keeps_agent_response_shape(self):
         response = self.client.get("/agent", params={"query": "hello"})

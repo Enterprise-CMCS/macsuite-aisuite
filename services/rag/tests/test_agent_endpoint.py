@@ -53,7 +53,10 @@ except (ImportError, ModuleNotFoundError):
     from starlette.testclient import TestClient
 
 import search.database_searching.agents as agents_mod  # noqa: E402
+import search.routes.security as security  # noqa: E402
 from search.routes.endpoint import app  # noqa: E402
+
+TEST_API_KEY = "test-api-key"
 
 
 class AgentEndpointContractTests(unittest.TestCase):
@@ -69,7 +72,16 @@ class AgentEndpointContractTests(unittest.TestCase):
         )
         self.run_patch.start()
         self.addCleanup(self.run_patch.stop)
+        security._resolved_api_key = None
+        self.key_patch = patch.object(
+            security,
+            "resolve_api_key",
+            return_value=TEST_API_KEY,
+        )
+        self.key_patch.start()
+        self.addCleanup(self.key_patch.stop)
         self.client = TestClient(app)
+        self.client.headers.update({"x-api-key": TEST_API_KEY})
 
     def test_contracts_lists_only_public_contract_metadata(self):
         response = self.client.get("/contracts")
