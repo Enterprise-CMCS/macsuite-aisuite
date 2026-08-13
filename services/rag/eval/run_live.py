@@ -46,28 +46,38 @@ def main(argv=None) -> int:
         return 2
 
     ground_truth = read_jsonl(args.ground_truth)
-    payload = {
-        "requirements": [
-            {
-                "id": row["requirement_id"],
-                "text": row["requirement"],
-            }
-            for row in ground_truth
-        ],
-        "retry_unclear": args.retry_unclear,
-    }
     api_key = os.environ.get("AISUITE_EVAL_API_KEY")
-    client_options = {"timeout": 120.0}
+    timeout = float(os.environ.get("AISUITE_EVAL_TIMEOUT", "300"))
+    client_options = {"timeout": timeout}
     if api_key:
         client_options["headers"] = {"x-api-key": api_key}
 
+    try:
+        batch_size = int(os.environ.get("REQUIREMENTS_MAX_BATCH_SIZE", "25"))
+        if batch_size < 1:
+            batch_size = 25
+    except (TypeError, ValueError):
+        batch_size = 25
+    results = []
     with httpx.Client(**client_options) as client:
-        response = client.post(
-            f"{args.api_url.rstrip('/')}/requirements",
-            json=payload,
-        )
-        response.raise_for_status()
-        results = response.json()["results"]
+        for start in range(0, len(ground_truth), batch_size):
+            chunk = ground_truth[start : start + batch_size]
+            payload = {
+                "requirements": [
+                    {
+                        "id": row["requirement_id"],
+                        "text": row["requirement"],
+                    }
+                    for row in chunk
+                ],
+                "retry_unclear": args.retry_unclear,
+            }
+            response = client.post(
+                f"{args.api_url.rstrip('/')}/requirements",
+                json=payload,
+            )
+            response.raise_for_status()
+            results.extend(response.json()["results"])
 
     timestamp = (
         datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

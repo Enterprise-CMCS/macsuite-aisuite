@@ -1,5 +1,3 @@
-"""Red-phase tests for the batch requirements endpoint."""
-
 import sys
 import types
 import unittest

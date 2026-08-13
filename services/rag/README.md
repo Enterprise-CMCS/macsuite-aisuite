@@ -158,9 +158,6 @@ The read contract is `schema_version = 1`. An eval harness may rely on:
   `relevance_score`, `retrieval_leg`, `fusion_rank`, `rerank_score`,
   `chunk_sha256`, and nullable `chunk_text`.
 
-No eval harness is built by this item. That work belongs to the separate
-`scored-eval-set` spec.
-
 #### Privacy and retention open questions
 
 - No PHI/PII determination is recorded in this repo. Contract language is
@@ -190,6 +187,9 @@ python -m search.excel_process.process_excel_with_rag \
 `--api-url` defaults to `REQUIREMENTS_API_URL` or `http://127.0.0.1:8001`.
 `--input` is required. `--output`, `--max-rows`, and `--batch-size` are optional.
 
+The client requires `AISUITE_EVAL_API_KEY` (or the `API_KEY` alias) and sends it
+as the `x-api-key` header. It fails fast if neither is set.
+
 ### Evaluation
 
 See the [evaluation guide](eval/README.md) to extract human CRT labels, run an
@@ -216,10 +216,11 @@ tasks. Step Functions `ListExecutions` is eventually consistent, so a narrow
 overlap remains possible. Because pre-processing uses `full_refresh`, overlapping
 runs can delete each other's output.
 
-Automatic ingestion is enabled only when `aisuite:activateIngestion=true` is
-passed for dev. Omit the context, set it to `false`, or disable the EventBridge
-rule to stop automatic runs. The rule is always `DISABLED` in non-dev
-environments.
+The infrastructure phase (desired count 0) passes
+`aisuite:activateIngestion=false`. The activation phase, after images exist,
+passes `aisuite:activateIngestion=true` for dev. Omit the context, set it to
+`false`, or disable the EventBridge rule to stop automatic runs. The rule is
+always `DISABLED` in non-dev environments.
 
 Operators can still use ECS `RunTask` directly, running the
 `aisuite-<env>-pre-processing` task definition before
@@ -422,8 +423,9 @@ For a non-destructive cutover:
 5. Flip search to the new table only after verification.
 
 Event-driven ingestion pins its prefix and table at synth time. An INI table
-rename therefore requires bootstrap and a re-synth. The dev deployment workflow
-passes `aisuite:activateIngestion=true`. Do not arm the trigger mid-reindex if
+rename therefore requires bootstrap and a re-synth. The activation phase of the
+dev deployment workflow (not the desiredCount-0 infrastructure phase) passes
+`aisuite:activateIngestion=true`. Do not arm the trigger mid-reindex if
 the first chunking reindex is still in progress; keep it disabled until that
 reindex finishes so a synth cannot retarget the trigger during the operation.
 

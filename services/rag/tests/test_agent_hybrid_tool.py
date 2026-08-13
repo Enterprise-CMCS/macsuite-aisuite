@@ -1,5 +1,3 @@
-"""Red-phase tests for the agent-facing hybrid search tool."""
-
 import hashlib
 import json
 import sys
@@ -8,7 +6,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from _stubs import install_offline_stubs
+try:
+    from _stubs import install_offline_stubs
+except ModuleNotFoundError:
+    from tests._stubs import install_offline_stubs
 
 
 install_offline_stubs()
@@ -170,6 +171,7 @@ class AgentHybridToolTests(unittest.IsolatedAsyncioTestCase):
             result["metadata"], {"doc_name": "contract.pdf", "page": 7}
         )
         self.assertEqual(result["rerank_score"], 0.97)
+        self.assertEqual(result["display"], "[result 1]")
         self.assertEqual(self.deps.last_retrieval, results)
 
     async def test_semantic_provenance_is_ordered_capped_and_keeps_fields(self):
@@ -205,6 +207,7 @@ class AgentHybridToolTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(result["metadata"], {"page": index})
             self.assertEqual(result["distance"], index / 10)
+            self.assertEqual(result["display"], f"[result {index + 1}]")
 
     async def test_second_semantic_search_replaces_provenance(self):
         semantic_search = self._semantic_tool()

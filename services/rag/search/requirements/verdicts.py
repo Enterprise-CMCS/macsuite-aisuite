@@ -83,9 +83,9 @@ def _parse_agent_verdict(text) -> tuple[dict, bool, str]:
             response = str(response) if response else "No response provided"
         source = result.get("Source", "N/A")
         page = result.get("Page", "")
-        if page is None:
+        if page in (None, ""):
             page = ""
-        elif not isinstance(page, (str, int)):
+        else:
             page = str(page)
         requirement = result.get("Requirement", "")
 
@@ -160,6 +160,7 @@ async def _persist_grade(
             getattr(getattr(deps, "search_engine", None), "table_name", None)
             or contract.embeddings_table_name
         )
+        page = result.get("Page")
         await record_verdict(
             source=VERDICT_SOURCE,
             client=None,
@@ -167,7 +168,7 @@ async def _persist_grade(
             verdict=result.get("Recommendation", "ERROR"),
             response_text=result.get("Response"),
             source_text=result.get("Source"),
-            page_text=result.get("Page"),
+            page_text=None if page in (None, "") else str(page),
             raw_output=None if parsed_ok else raw_output,
             parsed_ok=parsed_ok,
             model_id=agents.model_id,
@@ -198,11 +199,14 @@ async def grade_requirement(text, deps, retry_unclear=True) -> dict:
         if parsed["Recommendation"] == "UNCLEAR" and retry_unclear:
             retry_prompt = (
                 "Based on the available documentation, please determine if the following "
-                "requirement is MET or NOT MET. If there is insufficient information, "
-                "explain what specific information is missing.\n\n"
+                "requirement is MET, NOT MET, or UNCLEAR.\n\n"
+                "MET: The retrieved text explicitly states the requirement is met.\n"
+                "NOT MET: The retrieved text shows that the requirement is not met.\n"
+                "UNCLEAR: The retrieved text does not provide enough explicit evidence "
+                "to determine whether the requirement is met.\n\n"
                 f"Requirement: {text}\n\n"
-                "Please provide a clear MET or NOT MET determination with specific evidence, "
-                "or explain exactly what information is needed."
+                "Please provide a clear MET, NOT MET, or UNCLEAR determination with "
+                "specific evidence, or explain exactly what information is needed."
             )
             retry_response = await search_agent.run(
                 user_prompt=retry_prompt, deps=deps

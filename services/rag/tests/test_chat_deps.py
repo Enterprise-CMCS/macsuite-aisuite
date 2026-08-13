@@ -1,5 +1,3 @@
-"""Red-phase tests for request-scoped chat dependencies."""
-
 import importlib
 import inspect
 import os

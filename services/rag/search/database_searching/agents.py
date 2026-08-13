@@ -109,6 +109,11 @@ IMPORTANT RULES:
 - Do NOT return a header or footer as source, always refer to the citation or metadata 
 - Always return the document name as source
 
+TOOL SELECTION:
+- Default to hybrid_search for requirement grading.
+- Use semantic_search for conceptual or exploratory questions when exact wording is less important.
+- Use hybrid_search when the requirement mixes specific terms and concepts (the default).
+
 ANALYSIS TASK:
 For each requirement provided by the user, analyze whether the contract text explicitly supports the requirement and provide a recommendation.
 
@@ -126,7 +131,7 @@ Return output in the following JSON format exactly:
     "Requirement": "<repeat the requirement text>",
     "Recommendation": "MET | NOT MET | UNCLEAR",
     "Response": "<detailed explanation with evidence and reasoning. Include quotes if helpful>",
-    "Source": "<Document name: pages | Document name: pages>",
+    "Source": "<Document name>",
     "Page": "<Page number(s) in source where answer is found>"
 }
 
@@ -140,14 +145,14 @@ ADDITIONAL GUIDELINES:
 
 CITATION FORMAT:
 - Reference results as [1], [2], [3] matching the [result 1], [result 2], [result 3], etc. in search results
-- Format Source field as: "Document name: page1, page2 | Another document: page3, page4"
-- Example: "Core Contract Provisions: 10, 15, 23 | CN-680000-FP122: 45, 67"
-- Pair each document name with its page numbers, separated by commas and pipes (|) between documents
+- Format Source field as a document name only. Do not embed page numbers in Source.
+- Put page numbers in the Page field.
+- Example: "Service requirements"
 
 
 """
 
-PROMPT_VERSION = "hybrid-search-v1"
+PROMPT_VERSION = "hybrid-search-v2"
 PROMPT_SHA256 = hashlib.sha256(BASE_SYSTEM_PROMPT.encode()).hexdigest()
 
 
@@ -331,7 +336,7 @@ async def semantic_search(context: RunContext[ChatDeps], query: str) -> List[Dic
         results = results[:FINAL_RESULTS]
 
         cleaned: List[Dict[str, Any]] = []
-        for r in results:
+        for index, r in enumerate(results, start=1):
             text = _truncate_text((r.get("text") or "").strip())
             metadata = _parse_metadata(r.get("metadata", {}))
             cleaned.append(
@@ -341,6 +346,7 @@ async def semantic_search(context: RunContext[ChatDeps], query: str) -> List[Dic
                     "id": r.get("id"),
                     "distance": r.get("distance"),
                     "_relevance_score": float(r.get("_relevance_score", 0.0)),
+                    "display": f"[result {index}]",
                 }
             )
 
@@ -399,7 +405,7 @@ async def hybrid_search(context: RunContext[ChatDeps], query: str) -> List[Dict[
         results = results[:FINAL_RESULTS]
 
         cleaned: List[Dict[str, Any]] = []
-        for r in results:
+        for index, r in enumerate(results, start=1):
             item = {
                 "text": _truncate_text((r.get("text") or "").strip()),
                 "metadata": _parse_metadata(r.get("metadata", {})),
@@ -407,6 +413,7 @@ async def hybrid_search(context: RunContext[ChatDeps], query: str) -> List[Dict[
                 "distance": r.get("distance"),
                 "retrieval_leg": r.get("retrieval_leg"),
                 "fusion_rank": r.get("fusion_rank"),
+                "display": f"[result {index}]",
             }
             if "rerank_score" in r:
                 item["rerank_score"] = r.get("rerank_score")

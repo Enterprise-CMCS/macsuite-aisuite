@@ -1,5 +1,3 @@
-"""Red-phase tests for hybrid retrieval and asynchronous reranking."""
-
 import asyncio
 import sys
 import unittest

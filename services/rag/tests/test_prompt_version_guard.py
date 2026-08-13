@@ -6,7 +6,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from _stubs import install_offline_stubs
+try:
+    from _stubs import install_offline_stubs
+except ModuleNotFoundError:
+    from tests._stubs import install_offline_stubs
 
 
 install_offline_stubs()
@@ -48,10 +51,10 @@ import search.database_searching.agents as agents_mod  # noqa: E402
 
 class PromptVersionGuardTests(unittest.TestCase):
     def test_persisted_prompt_identity_is_explicitly_versioned(self):
-        self.assertEqual(agents_mod.PROMPT_VERSION, "hybrid-search-v1")
+        self.assertEqual(agents_mod.PROMPT_VERSION, "hybrid-search-v2")
         self.assertEqual(
             agents_mod.PROMPT_SHA256,
-            "2fc59a551a2eef96fb4ca2da70fd21b9f5397a6e54ed0a2bc598f655a084a8be",
+            "823de49710e58f6306034874135bd6998df4d91c02f480b8f24835f7e04f1aa5",
         )
 
 

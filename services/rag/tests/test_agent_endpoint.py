@@ -1,5 +1,3 @@
-"""Red-phase tests for the request-scoped agent endpoint surface."""
-
 import sys
 import types
 import unittest
@@ -171,6 +169,79 @@ class AgentEndpointContractTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["contract_id"], "tn_6756")
+
+    def test_agent_error_envelope_uses_default_contract_id(self):
+        self.agent_run.side_effect = RuntimeError("boom")
+
+        response = self.client.get("/agent", params={"query": "hello"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIs(payload["success"], False)
+        self.assertEqual(payload["contract_id"], "tn_6756")
+
+    def test_graphql_unknown_contract_is_rejected(self):
+        response = self.client.post(
+            "/query",
+            json={
+                "query": (
+                    'mutation { processQuery(query: "hello", contractId: "zzz") '
+                    "{ query contractId semantic { searchType response strategy } } }"
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("zzz", response.text)
+        self.agent_run.assert_not_awaited()
+
+    def test_graphql_omitted_contract_defaults(self):
+        response = self.client.post(
+            "/query",
+            json={
+                "query": (
+                    'mutation { processQuery(query: "hello") { query contractId '
+                    "semantic { searchType response strategy } hybrid { response } "
+                    "reranked { response } } }"
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["data"]["processQuery"]
+        self.assertEqual(payload["query"], "hello")
+        self.assertEqual(payload["contractId"], "tn_6756")
+        self.assertEqual(payload["semantic"]["searchType"], "agent")
+        self.assertEqual(payload["semantic"]["response"], "stub-answer")
+        self.assertEqual(payload["semantic"]["strategy"], "agent")
+        self.assertIsNone(payload["hybrid"])
+        self.assertIsNone(payload["reranked"])
+        self.agent_run.assert_awaited_once()
+
+    def test_graphql_explicit_contract_id(self):
+        response = self.client.post(
+            "/query",
+            json={
+                "query": (
+                    'mutation { processQuery(query: "hello", contractId: "wa_6369") '
+                    "{ query contractId semantic { searchType response strategy } "
+                    "hybrid { response } reranked { response } } }"
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["data"]["processQuery"]
+        self.assertEqual(payload["query"], "hello")
+        self.assertEqual(payload["contractId"], "wa_6369")
+        self.assertEqual(payload["semantic"]["searchType"], "agent")
+        self.assertEqual(payload["semantic"]["response"], "stub-answer")
+        self.assertEqual(payload["semantic"]["strategy"], "agent")
+        self.assertIsNone(payload["hybrid"])
+        self.assertIsNone(payload["reranked"])
+        self.agent_run.assert_awaited_once()
+        deps = self.agent_run.await_args.kwargs["deps"]
+        self.assertEqual(deps.search_engine.table_name, "embeddings_wa_6369_ifc")
 
 
 if __name__ == "__main__":

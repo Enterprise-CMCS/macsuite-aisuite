@@ -1,12 +1,12 @@
 import os
 import sys
-import json
 from collections import Counter
 from pathlib import Path
 from typing import Optional, Union
 
 import strawberry
 import structlog
+from cross_web import HTTPException as GraphQLHTTPException
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -25,9 +25,6 @@ from common.utils.contract_registry import (  # noqa: E402
 )
 from search.database_searching.agents import search_agent  # noqa: E402
 from search.database_searching.deps import build_chat_deps  # noqa: E402
-from search.foundational_model.foundational_llm_model import (  # noqa: E402
-    process_query_with_foundational_model,
-)
 from search.requirements import verdicts as requirements_verdicts  # noqa: E402
 from search.routes import security  # noqa: E402
 
@@ -81,29 +78,14 @@ class Mutation:
     """GraphQL mutation root."""
     @strawberry.mutation
     async def process_query(self, query: str, contract_id: Optional[str] = None) -> QueryResponse:
-        if contract_id:
-            try:
-                resolved_contract_id = resolve_contract(
-                    _load_contract_config(), contract_id
-                ).contract_id
-            except UnknownContractError as exc:
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
-        else:
-            resolved_contract_id = resolve_contract(
-                _load_contract_config(), None
-            ).contract_id
-
-        results = await process_query_with_foundational_model(
-            query, contract_id=contract_id or None
-        )
-
+        agent_response = await process_agent_query(query, contract_id)
         return QueryResponse(
-            query=results["query"],
-            contract_id=resolved_contract_id,
+            query=agent_response.query,
+            contract_id=agent_response.contract_id,
             semantic=SearchResponse(
-                search_type=results["semantic"]["search_type"],
-                response=results["semantic"]["response"],
-                strategy=results["semantic"]["strategy"]
+                search_type="agent",
+                response=agent_response.response,
+                strategy="agent",
             ),
         )
 
@@ -191,7 +173,19 @@ async def require_api_key(request: Request, call_next):
 # Added last so CORS wraps the auth middleware and answers preflight OPTIONS.
 app.add_middleware(CORSMiddleware, **security.build_cors_kwargs())
 
-graphql_app = GraphQLRouter(schema)
+
+class _AgentGraphQLRouter(GraphQLRouter):
+    async def process_result(self, request, result):
+        for error in result.errors or []:
+            original = getattr(error, "original_error", None)
+            if isinstance(original, HTTPException):
+                raise GraphQLHTTPException(
+                    original.status_code, str(original.detail)
+                ) from original
+        return await super().process_result(request, result)
+
+
+graphql_app = _AgentGraphQLRouter(schema)
 app.include_router(graphql_app, prefix="/query")
 
 
@@ -277,26 +271,17 @@ async def requirements_post(request: RequirementsRequest):
 
 async def process_agent_query(query: str, contract_id: Optional[str] = None) -> AgentResponse:
     """Process agent query (shared by GET and POST endpoints)."""
-    resolved_contract_id = None
-
-    # Resolve a client-supplied contract before the try block so an unknown id
-    # answers 400 instead of the 200 error envelope returned below.
-    if contract_id:
-        try:
-            resolved_contract_id = resolve_contract(
-                _load_contract_config(), contract_id
-            ).contract_id
-        except UnknownContractError as exc:
-            logger.warning("unknown_contract", contract_id=contract_id[:100])
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
-        logger.info("agent_request", query=query[:100], contract_id=resolved_contract_id)
+    try:
+        resolved_contract_id = resolve_contract(
+            _load_contract_config(), contract_id
+        ).contract_id
+    except UnknownContractError as exc:
+        logger.warning("unknown_contract", contract_id=(contract_id or "")[:100])
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    logger.info("agent_request", query=query[:100], contract_id=resolved_contract_id)
 
     try:
         deps = build_chat_deps(resolved_contract_id)
-        if resolved_contract_id is None:
-            resolved_contract_id = resolve_contract(_load_contract_config(), None).contract_id
-            logger.info("agent_request", query=query[:100], contract_id=resolved_contract_id)
-
         result = await search_agent.run(query, deps=deps)
 
         logger.info(
@@ -324,7 +309,7 @@ async def process_agent_query(query: str, contract_id: Optional[str] = None) -> 
             query=query,
             response=f"Error: {str(e)}. Please try rephrasing or contact support.",
             success=False,
-            contract_id=resolved_contract_id or ""
+            contract_id=resolved_contract_id,
         )
 
 

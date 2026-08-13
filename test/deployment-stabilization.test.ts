@@ -13,6 +13,7 @@ import {
 } from "../src/deployment-config";
 
 const ACTIVATE_API_CONTEXT_KEY = "aisuite:activateApi";
+const ACTIVATE_INGESTION_CONTEXT_KEY = "aisuite:activateIngestion";
 const API_IMAGE_TAG_CONTEXT_KEY = "aisuite:apiImageTag";
 const BATCH_IMAGE_TAG_CONTEXT_KEY = "aisuite:batchImageTag";
 const IMMUTABLE_IMAGE_TAG = "0123456789abcdef0123456789abcdef01234567";
@@ -317,6 +318,30 @@ describe("deployment workflow contract", () => {
 
     expect(positions.every((position) => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((left, right) => left - right));
+  });
+
+  it("passes activateIngestion false in infrastructure and true in activation", () => {
+    const ingestionFalse = workflow.indexOf(
+      `--context ${ACTIVATE_INGESTION_CONTEXT_KEY}=false`,
+    );
+    const ingestionTrue = workflow.indexOf(
+      `--context ${ACTIVATE_INGESTION_CONTEXT_KEY}=true`,
+    );
+    const infraActivateApi = workflow.indexOf(
+      `--context ${ACTIVATE_API_CONTEXT_KEY}=false`,
+    );
+    const activationActivateApi = workflow.indexOf(
+      `--context ${ACTIVATE_API_CONTEXT_KEY}=true`,
+    );
+
+    expect(ingestionFalse).toBeGreaterThan(-1);
+    expect(ingestionTrue).toBeGreaterThan(-1);
+    expect(ingestionFalse).toBeLessThan(ingestionTrue);
+    expect(ingestionFalse).toBeGreaterThan(infraActivateApi);
+    expect(ingestionTrue).toBeGreaterThan(activationActivateApi);
+    expect(
+      workflow.split(`--context ${ACTIVATE_INGESTION_CONTEXT_KEY}=true`).length - 1,
+    ).toBe(1);
   });
 
   it("builds and pushes API and batch SHA images for linux/amd64", () => {

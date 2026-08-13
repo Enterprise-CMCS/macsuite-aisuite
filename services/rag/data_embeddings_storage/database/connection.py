@@ -1,6 +1,14 @@
 import asyncpg
 from pgvector.asyncpg import register_vector
-from common.utils.settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+from common.utils.settings import (
+    DB_HOST,
+    DB_NAME,
+    DB_PASSWORD,
+    DB_POOL_MAX,
+    DB_POOL_MIN,
+    DB_PORT,
+    DB_USER,
+)
 from data_embeddings_storage.database.embeddings_schema import SEARCH_PATH_SQL
 
 postgres_pool = None
@@ -23,8 +31,8 @@ async def initialization_db():
             database=DB_NAME,
             host=DB_HOST,
             port=DB_PORT,
-            min_size=1,
-            max_size=5,
+            min_size=DB_POOL_MIN if DB_POOL_MIN is not None else 1,
+            max_size=DB_POOL_MAX if DB_POOL_MAX is not None else 10,
             init=register_vector_init,
             ssl="require",
         )

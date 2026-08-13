@@ -64,7 +64,11 @@ class ExcelRAGProcessor:
         self.excel_file_path = Path(excel_file_path)
         self.api_url = api_url.rstrip("/")
         self.batch_size = batch_size
-        self.api_key = os.environ.get("AISUITE_EVAL_API_KEY")
+        self.api_key = os.environ.get("AISUITE_EVAL_API_KEY") or os.environ.get("API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "AISUITE_EVAL_API_KEY or API_KEY must be set to call POST /requirements"
+            )
         self.df: Optional[pd.DataFrame] = None
         self.processed_count = 0
         self.error_count = 0
@@ -113,7 +117,7 @@ class ExcelRAGProcessor:
             response = await client.post(
                 f"{self.api_url}/requirements",
                 json=payload,
-                headers={"x-api-key": self.api_key} if self.api_key else {},
+                headers={"x-api-key": self.api_key},
             )
             response.raise_for_status()
             response_body = response.json()
@@ -162,7 +166,7 @@ class ExcelRAGProcessor:
 
         owns_client = client is None
         if client is None:
-            client = httpx.AsyncClient()
+            client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
 
         try:
             for start in range(0, len(requirement_rows), self.batch_size):

@@ -1,5 +1,6 @@
 """Tests for the CRT workbook requirements API client."""
 
+import os
 import sys
 import types
 import unittest
@@ -42,6 +43,18 @@ except (ImportError, ModuleNotFoundError):
     httpx.HTTPError = _HTTPError
     httpx.ConnectError = _HTTPError
     httpx.AsyncClient = MagicMock
+
+    class _Timeout:
+        def __init__(self, timeout):
+            self.connect = timeout
+            self.read = timeout
+            self.write = timeout
+            self.pool = timeout
+
+        def __eq__(self, other):
+            return isinstance(other, _Timeout) and self.connect == other.connect
+
+    httpx.Timeout = _Timeout
     sys.modules["httpx"] = httpx
 
 RAG_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +81,18 @@ def _api_result(row_id, recommendation, response, source):
         "Source": source,
         "Page": "",
     }
+
+
+class ExcelClientApiKeyTests(unittest.TestCase):
+    def test_init_raises_when_api_key_missing(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AISUITE_EVAL_API_KEY", None)
+            os.environ.pop("API_KEY", None)
+            with self.assertRaises(ValueError) as ctx:
+                excel_client.ExcelRAGProcessor("input-workbook")
+
+        self.assertIn("AISUITE_EVAL_API_KEY", str(ctx.exception))
+        self.assertIn("API_KEY", str(ctx.exception))
 
 
 class ExcelClientArgumentTests(unittest.TestCase):
@@ -99,6 +124,13 @@ class ExcelClientArgumentTests(unittest.TestCase):
     "pandas and openpyxl are required for workbook client tests",
 )
 class ExcelClientBatchTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.env_patcher = patch.dict(
+            os.environ, {"AISUITE_EVAL_API_KEY": "test-api-key"}
+        )
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
     async def test_chunks_rows_and_maps_shuffled_results_by_id(self):
         processor = excel_client.ExcelRAGProcessor(
             "input-workbook",
@@ -138,13 +170,17 @@ class ExcelClientBatchTests(unittest.IsolatedAsyncioTestCase):
             excel_client.httpx,
             "AsyncClient",
             return_value=http_client,
-        ):
+        ) as async_client_cls:
             await processor.process_all()
 
+        async_client_cls.assert_called_once_with(
+            timeout=excel_client.httpx.Timeout(300.0)
+        )
         self.assertEqual(http_client.post.await_count, 2)
         first_call = http_client.post.await_args_list[0]
         second_call = http_client.post.await_args_list[1]
         self.assertEqual(first_call.args[0], "http://api.example/requirements")
+        self.assertEqual(first_call.kwargs["headers"]["x-api-key"], "test-api-key")
         self.assertEqual(
             first_call.kwargs["json"],
             {
@@ -196,6 +232,30 @@ class ExcelClientBatchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(processor.df[SOURCE_COL].tolist(), ["N/A", "N/A"])
         self.assertEqual(processor.error_count, 2)
+
+    async def test_post_sends_x_api_key_from_api_key_alias(self):
+        with patch.dict(os.environ, {"API_KEY": "alias-key"}):
+            os.environ.pop("AISUITE_EVAL_API_KEY", None)
+            processor = excel_client.ExcelRAGProcessor("input-workbook")
+        processor.df = pd.DataFrame({REQUIREMENT_COL: ["First"]}, index=[1])
+        for column in [RECOMMENDATION_COL, RAG_RESPONSE_COL, SOURCE_COL]:
+            processor.df[column] = pd.NA
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "results": [_api_result(1, "MET", "first response", "A: 1")]
+        }
+        http_client = MagicMock()
+        http_client.post = AsyncMock(return_value=response)
+        http_client.aclose = AsyncMock()
+
+        await processor.process_all(client=http_client)
+
+        self.assertEqual(
+            http_client.post.await_args.kwargs["headers"]["x-api-key"],
+            "alias-key",
+        )
 
 
 class ExcelClientSourceTests(unittest.TestCase):

@@ -1,17 +1,3 @@
-"""Red-phase tests for best-effort verdict persistence."""
-
-# Expected production API:
-# async def record_verdict(
-#     *, source: str, requirement_text: str, verdict: str,
-#     response_text: str | None = None, source_text: str | None = None,
-#     page_text: str | None = None, raw_output: str | None = None,
-#     parsed_ok: bool, model_id: str, embed_model_id: str,
-#     prompt_version: str, prompt_sha256: str, contract_id: str,
-#     embeddings_table: str, chunks: list[dict], client: str | None = None,
-#     request_id: str | None = None, model_settings: dict | None = None,
-#     retrieval: dict | None = None, latency_ms: int | None = None,
-# ) -> None
-
 import hashlib
 import os
 import re

@@ -1,5 +1,3 @@
-"""Red-phase tests for verdict persistence schema helpers."""
-
 import inspect
 import os
 import re

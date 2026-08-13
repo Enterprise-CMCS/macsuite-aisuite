@@ -1,5 +1,3 @@
-"""Red-phase tests for shared requirement verdict parsing and grading."""
-
 import asyncio
 import json
 import sys
@@ -170,6 +168,23 @@ class RequirementVerdictParsingTests(unittest.TestCase):
         self.assertIsInstance(parsed["Source"], str)
         self.assertIsInstance(parsed["Page"], str)
 
+    def test_numeric_page_parses_as_text(self):
+        parsed = parse_agent_verdict(
+            json.dumps(
+                {
+                    "Requirement": "A requirement",
+                    "Recommendation": "MET",
+                    "Response": "Evidence",
+                    "Source": "Service requirements",
+                    "Page": 12,
+                }
+            )
+        )
+
+        self.assertEqual(parsed["Page"], "12")
+        self.assertIsInstance(parsed["Page"], str)
+        self.assertEqual(parsed["Source"], "Service requirements: 12")
+
 
 class RequirementVerdictGradingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -197,7 +212,22 @@ class RequirementVerdictGradingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["Recommendation"], "MET")
         self.assertEqual(agent_run.await_count, 2)
-        self.assertIn("Requirement: A requirement", agent_run.await_args_list[1].kwargs["user_prompt"])
+        retry_prompt = agent_run.await_args_list[1].kwargs["user_prompt"]
+        self.assertIn("Requirement: A requirement", retry_prompt)
+        self.assertIn("UNCLEAR", retry_prompt)
+
+    async def test_second_pass_unclear_is_accepted(self):
+        run_patch, agent_run = self._patch_agent_run(
+            _verdict(recommendation="UNCLEAR"),
+            _verdict(recommendation="UNCLEAR"),
+        )
+
+        with run_patch:
+            result = await grade_requirement("A requirement", self.deps)
+
+        self.assertEqual(result["Recommendation"], "UNCLEAR")
+        self.assertEqual(agent_run.await_count, 2)
+        self.assertTrue(result["success"])
 
     async def test_retry_unclear_false_does_not_retry(self):
         run_patch, agent_run = self._patch_agent_run(
@@ -483,6 +513,31 @@ class RequirementVerdictPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(kwargs["parsed_ok"])
         self.assertEqual(kwargs["raw_output"], raw)
         self.assertEqual(kwargs["verdict"], "UNCLEAR")
+
+    async def test_numeric_page_persists_as_text(self):
+        record_verdict = AsyncMock()
+        payload = json.dumps(
+            {
+                "Requirement": "A requirement",
+                "Recommendation": "MET",
+                "Response": "Evidence",
+                "Source": "Service requirements",
+                "Page": 12,
+            }
+        )
+
+        with (
+            self._patch_agent_run(payload),
+            self._patch_record_verdict(record_verdict),
+        ):
+            await grade_requirement(
+                "A requirement", self.deps, retry_unclear=False
+            )
+
+        record_verdict.assert_awaited_once()
+        page_text = record_verdict.await_args.kwargs["page_text"]
+        self.assertEqual(page_text, "12")
+        self.assertIsInstance(page_text, str)
 
 
 if __name__ == "__main__":

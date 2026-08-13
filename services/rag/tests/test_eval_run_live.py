@@ -34,16 +34,27 @@ class _RecordingHttp:
     def __init__(self, results):
         self.results = results
         self.calls = []
+        self.client_kwargs = []
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        return _FakeResponse({"results": self.results})
+        posted = kwargs.get("json", {}).get("requirements") or []
+        if not posted:
+            return _FakeResponse({"results": self.results})
+        by_id = {str(result["id"]): result for result in self.results}
+        sliced = [
+            by_id[str(item["id"])]
+            for item in posted
+            if str(item["id"]) in by_id
+        ]
+        return _FakeResponse({"results": sliced})
 
     def client_type(self):
         recorder = self
 
         class RecordingClient:
             def __init__(self, **kwargs):
+                recorder.client_kwargs.append(kwargs)
                 self.default_headers = kwargs.get("headers", {})
 
             def __enter__(self):
@@ -199,6 +210,79 @@ class EvalRunLiveTests(unittest.TestCase):
             url, kwargs = recorder.calls[0]
             self.assertEqual(url, "https://api.example/base/requirements")
             self.assertEqual(kwargs["headers"]["x-api-key"], "test-api-key")
+            self.assertEqual(recorder.client_kwargs[0]["timeout"], 300.0)
+            self.assertEqual(len(kwargs["json"]["requirements"]), 10)
+
+    def test_chunks_ground_truth_into_batches_of_25(self):
+        from eval import run_live
+        from eval.dataset import read_jsonl
+
+        rows = [
+            {
+                "requirement_id": f"req-{index:02d}",
+                "requirement": f"Requirement {index}.",
+                "human_label": "MET",
+                "source_row": index,
+            }
+            for index in range(26)
+        ]
+        results = [
+            {
+                "id": row["requirement_id"],
+                "success": True,
+                "error": None,
+                "Requirement": row["requirement"],
+                "Recommendation": "MET",
+                "Response": "Lorem response.",
+                "Source": "Lorem: 1",
+                "Page": "1",
+            }
+            for row in rows
+        ]
+        recorder = _RecordingHttp(results)
+        with tempfile.TemporaryDirectory() as directory:
+            ground_truth = Path(directory) / "ground_truth.jsonl"
+            output = Path(directory) / "predictions.jsonl"
+            ground_truth.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            args = [
+                "--ground-truth",
+                str(ground_truth),
+                "--output",
+                str(output),
+                "--api-url",
+                "https://api.example/base",
+            ]
+            with (
+                patch.dict(os.environ, {"AISUITE_EVAL_LIVE": "1"}, clear=True),
+                patch.object(
+                    run_live.httpx,
+                    "Client",
+                    recorder.client_type(),
+                    create=True,
+                ),
+                patch.object(run_live.httpx, "post", recorder.post, create=True),
+            ):
+                result = run_live.main(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(len(recorder.calls), 2)
+            self.assertEqual(
+                [item["id"] for item in recorder.calls[0][1]["json"]["requirements"]],
+                [f"req-{index:02d}" for index in range(25)],
+            )
+            self.assertEqual(
+                [item["id"] for item in recorder.calls[1][1]["json"]["requirements"]],
+                ["req-25"],
+            )
+            self.assertEqual(recorder.client_kwargs[0]["timeout"], 300.0)
+            records = read_jsonl(output)
+            self.assertEqual(
+                [record["requirement_id"] for record in records],
+                [f"req-{index:02d}" for index in range(26)],
+            )
 
     def test_api_key_header_is_omitted_when_environment_is_unset(self):
         from eval import run_live

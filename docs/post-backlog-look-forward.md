@@ -96,22 +96,34 @@ curl -sS -X POST "http://${ALB_DNS}/requirements" \
   -H "x-api-key: ${API_KEY}" \
   -H "Content-Type: application/json" \
   --max-time 300 \
-  -d '{"contract_id":"tn_6756","requirements":[{"id":"smoke-1","text":"The Contractor shall provide NEMT services statewide."},{"id":"smoke-2","text":"The Contractor shall maintain a 24-hour member call line."}],"retry_unclear":true}'
+  -d '{"requirements":[{"id":"smoke-1","text":"The Contractor shall provide NEMT services statewide."},{"id":"smoke-2","text":"The Contractor shall maintain a 24-hour member call line."}],"retry_unclear":true}'
 ```
 
 Confirm `GET /contracts` lists the contract you will grade (`tn_6756` is the shipped default).
+`POST /requirements` grades the active indexed contract and does **not** take `contract_id` (use `/agent` for that).
 Confirm the few-row `POST /requirements` returns `MET` / `NOT MET` / `UNCLEAR` (or `ERROR`) with `Source` and `Page`, not a free-text chat answer.
 
 Then rehearse the CRT slice with the Excel client, from `services/rag`, against that same ALB:
 
 ```sh
 export AISUITE_EVAL_API_KEY="${API_KEY}"
+# or: export API_KEY="${API_KEY}"
 python -m search.excel_process.process_excel_with_rag \
   --input /path/to/crt-slice.xlsx \
   --output /path/to/crt-slice_rag_results.xlsx \
   --api-url "http://${ALB_DNS}" \
   --max-rows 40 \
   --batch-size 25
+```
+
+For the lasting CRT grid UI (sibling repo, not this git tree):
+
+```sh
+cd ../aisuite-operator
+source .venv/bin/activate
+export AISUITE_API_BASE_URL="http://${ALB_DNS}"
+PYTHONPATH=. python3 -m operator_app.server
+# open http://127.0.0.1:8765 — drop a CRT .xlsx; key comes from Secrets Manager
 ```
 
 `--max-rows 40` is a dozens-row slice, not a full CRT dump.
