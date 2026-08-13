@@ -78,7 +78,7 @@ class SearchEngine:
                 table_name=self.table_name,
                 error=str(error),
             )
-            return fused[:top_k]
+            return candidates[:top_k]
 
     async def semantic_search(self, query_text, limit=100):
         query_embedding = await self.bedrock_client.get_embedding(query_text)
