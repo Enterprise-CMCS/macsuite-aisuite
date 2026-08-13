@@ -162,6 +162,27 @@ class HybridSearchTests(unittest.IsolatedAsyncioTestCase):
             all(document.get("rerank_score") is None for document in results)
         )
 
+    async def test_reranker_failure_returns_candidate_window_not_full_fused_list(self):
+        self._assert_hybrid_search_exists()
+        self.engine.fulltext_search.return_value = [
+            _fulltext_hit(f"fulltext-{index}") for index in range(40)
+        ]
+        self.engine.semantic_search.return_value = [
+            _vector_hit(f"vector-{index}") for index in range(40)
+        ]
+        self.engine.reranker.rerank_results.side_effect = RuntimeError(
+            "reranker unavailable"
+        )
+
+        results = await self.engine.hybrid_search(
+            "normalized", "expanded", top_k=40
+        )
+
+        self.assertEqual(len(results), 32)
+        self.assertTrue(
+            all(document.get("rerank_score") is None for document in results)
+        )
+
     async def test_empty_fulltext_leg_still_returns_semantic_results(self):
         self._assert_hybrid_search_exists()
         self.engine.fulltext_search.return_value = []
