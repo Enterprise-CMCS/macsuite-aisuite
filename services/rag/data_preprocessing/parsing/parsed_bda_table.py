@@ -9,6 +9,25 @@ from common.utils.helper import Helper
 from common.utils.logger import log
 from data_preprocessing.bedrock.bda_results import BDAResults
 
+def _compact_markdown(md):
+    """Strip BDA's column padding out of a markdown table.
+
+    BDA pads every cell with spaces to the width of its column and draws separators as long dash
+    runs, which together are about two thirds of the characters in a typical table. None of it
+    carries meaning, so cells are trimmed and separators shortened to a single "---"."""
+    lines = []
+    for raw in (md or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "|" in line:
+            cells = [re.sub(r"\s+", " ", c).strip() for c in line.strip("|").split("|")]
+            cells = ["---" if re.fullmatch(r":?-+:?", c) else c for c in cells]
+            line = "| " + " | ".join(cells) + " |"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _parse_markdown_table(md):
 
     rows = []
@@ -105,7 +124,7 @@ def parse_table_elements_simple(source_data):
 
         results.append({
             "doc_id": f"{doc_name}::{table_id}",
-            "text": text.strip(),
+            "text": _compact_markdown(text),
             "metadata": {
                 "doc_id": doc_name,
                 "element_type": "TABLE",
