@@ -79,7 +79,6 @@ python -m search.routes.endpoint
 | `GET /health` | Health check |
 | `GET /agent?query=…` | Agent answer (query string) |
 | `POST /agent` | Agent answer; body `{"query": "…"}` |
-| `GET/POST /query` | GraphQL |
 | `GET /docs` | OpenAPI UI |
 
 Example:

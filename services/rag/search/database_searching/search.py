@@ -18,9 +18,10 @@ class SearchEngine:
                 SELECT
                     id,
                     text,
-                    ts_rank(search_tsv, plainto_tsquery('english', $1)) AS rank
-                FROM {self.table_name}
-                WHERE search_tsv @@ plainto_tsquery('english', $1)
+                    ts_rank_cd(search_tsv, query, 32) AS rank
+                FROM {self.table_name},
+                     to_tsquery('english',NULLIF(replace(plainto_tsquery('english', $1)::text,' & ',' | '),'')) AS query
+                WHERE search_tsv @@ query
                 ORDER BY rank DESC
                 LIMIT $2
             """, query, limit)
