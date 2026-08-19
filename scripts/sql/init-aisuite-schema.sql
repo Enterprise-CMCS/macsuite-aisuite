@@ -25,6 +25,45 @@ BEGIN
   END LOOP;
 END $$;
 
+-- Shared NOLOGIN owner role so both Secrets Manager rotation logins can
+-- satisfy Postgres ownership checks (CREATE INDEX, ALTER TABLE, etc.).
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aisuite_app_owner') THEN
+    CREATE ROLE aisuite_app_owner NOLOGIN;
+  END IF;
+  EXECUTE format('GRANT aisuite_app_owner TO %I', current_user);
+
+  EXECUTE 'ALTER SCHEMA aisuite_schema OWNER TO aisuite_app_owner';
+
+  FOR r IN
+    SELECT tablename
+    FROM pg_tables
+    WHERE schemaname = 'aisuite_schema'
+    ORDER BY tablename
+  LOOP
+    EXECUTE format(
+      'ALTER TABLE aisuite_schema.%I OWNER TO aisuite_app_owner',
+      r.tablename
+    );
+  END LOOP;
+
+  FOR r IN
+    SELECT c.relname
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'aisuite_schema' AND c.relkind = 'S'
+    ORDER BY c.relname
+  LOOP
+    EXECUTE format(
+      'ALTER SEQUENCE aisuite_schema.%I OWNER TO aisuite_app_owner',
+      r.relname
+    );
+  END LOOP;
+END $$;
+
 -- App role is expected to exist (created by Secrets Manager / bootstrap).
 -- Multi-user rotation may also create aisuite_app_clone; grant both when present.
 DO $$
@@ -67,6 +106,8 @@ BEGIN
       'GRANT USAGE, SELECT ON SEQUENCES TO %I',
       role_name
     );
+    EXECUTE format('GRANT aisuite_app_owner TO %I', role_name);
+    EXECUTE format('ALTER ROLE %I INHERIT', role_name);
     EXECUTE format(
       'ALTER ROLE %I SET search_path TO aisuite_schema, public',
       role_name

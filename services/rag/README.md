@@ -243,6 +243,9 @@ The bootstrap entrypoint is
 - creates each contract’s embeddings table (from `aws.properties.ini`) and HNSW,
   metadata GIN, trigram GIN, and full-text GIN indexes matching `table_setup.py`;
 - creates `aisuite_app` or safely updates its password from the app secret;
+- creates the shared `aisuite_app_owner` NOLOGIN group role, grants it to
+  both rotation logins, and reassigns `aisuite_schema` (tables and sequences)
+  to that owner so index DDL succeeds under either Secrets Manager login;
 - grants `CONNECT` on the database and schema/table privileges on
   `aisuite_schema` to `aisuite_app` and `aisuite_app_clone` (Secrets Manager
   multi-user rotation), including `CREATE` on the app schema for idempotent
@@ -253,6 +256,8 @@ The bootstrap entrypoint is
 
 Runtime connections set `search_path` on pool init so unqualified table names
 resolve to `aisuite_schema` regardless of which rotation login is active.
+A fresh environment needs bootstrap (or the master SQL remediation below)
+before the app path can create indexes.
 
 ### Operator remediation (VPN + CLI)
 
@@ -263,7 +268,8 @@ export AWS_PROFILE=aisuite-dev
 ```
 
 `init-aisuite-schema.sql` creates the schema, migrates leftover
-`public.embeddings*`, and grants both app roles (not full table DDL).
+`public.embeddings*`, installs `aisuite_app_owner`, reassigns object
+ownership, and grants both app roles (not full table DDL).
 
 After bootstrap, applications use
 `aisuite/{env}/rag-app-db-credentials`, not the master

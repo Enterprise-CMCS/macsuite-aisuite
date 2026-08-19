@@ -2,6 +2,7 @@ from common.utils.contract_config import validate_embeddings_table_name
 
 EMBEDDING_DIMENSION = 1536
 APP_SCHEMA = "aisuite_schema"
+APP_OWNER_ROLE = "aisuite_app_owner"
 SEARCH_PATH_SQL = f"SET search_path TO {APP_SCHEMA}, public"
 
 
@@ -42,26 +43,33 @@ def create_embeddings_table_sql(table_name, embedding_dimension=EMBEDDING_DIMENS
                 """
 
 
-def embeddings_index_statements(table_name):
+def _index_specs(table_name):
     table = validate_embeddings_table_name(table_name)
     qualified = qualified_embeddings_table(table_name)
+    return (
+        (
+            f"idx_{table}_hnsw",
+            f"ON {qualified} USING hnsw (embedding vector_cosine_ops) "
+            "WITH (m=16, ef_construction=128)",
+        ),
+        (f"idx_{table}_metadata", f"ON {qualified} USING GIN (metadata)"),
+        (
+            f"idx_{table}_search_text_trgm",
+            f"ON {qualified} USING GIN (text gin_trgm_ops)",
+        ),
+        (f"idx_{table}_search_tsv", f"ON {qualified} USING GIN (search_tsv)"),
+    )
+
+
+def expected_index_names(table_name):
+    return tuple(name for name, _ in _index_specs(table_name))
+
+
+def embeddings_index_statements(table_name):
     return [
         f"""
-                CREATE INDEX IF NOT EXISTS idx_{table}_hnsw
-                ON {qualified}
-                USING hnsw (embedding vector_cosine_ops)
-                WITH (m=16, ef_construction=128)
-                """,
-        f"""
-                CREATE INDEX IF NOT EXISTS idx_{table}_metadata
-                ON {qualified} USING GIN (metadata)
-                """,
-        f"""
-                CREATE INDEX IF NOT EXISTS idx_{table}_search_text_trgm
-                ON {qualified} USING GIN (text gin_trgm_ops)
-                """,
-        f"""
-                CREATE INDEX IF NOT EXISTS idx_{table}_search_tsv
-                ON {qualified} USING GIN (search_tsv)
-                """,
+                CREATE INDEX IF NOT EXISTS {name}
+                {body}
+                """
+        for name, body in _index_specs(table_name)
     ]
