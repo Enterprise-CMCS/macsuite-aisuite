@@ -20,6 +20,7 @@ from common.utils.contract_config import (  # noqa: E402
 from data_embeddings_storage.database.embeddings_schema import (  # noqa: E402
     create_embeddings_table_sql,
     embeddings_index_statements,
+    expected_index_names,
 )
 
 
@@ -166,6 +167,14 @@ class ActiveContractResolutionTests(unittest.TestCase):
         self.assertTrue(statements)
         for statement in statements:
             self.assertIn("ON aisuite_schema.embeddings_tn_6756_tenncare", statement)
+
+    def test_index_names_match_statements(self):
+        table = "embeddings_tn_6756_tenncare"
+        names = expected_index_names(table)
+        statements = embeddings_index_statements(table)
+        self.assertEqual(len(names), len(statements))
+        for name, statement in zip(names, statements):
+            self.assertIn(name, statement)
 
 
 if __name__ == "__main__":
