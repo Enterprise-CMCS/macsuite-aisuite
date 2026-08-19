@@ -1,9 +1,13 @@
 import os
+import asyncio
 import base64
 import json
 import boto3
 import datetime
+import time
 from urllib.parse import urlparse
+
+from botocore.config import Config
 
 from data_preprocessing.bedrock.bda_results import BDAResults
 from common.utils.helper import Helper
@@ -63,17 +67,80 @@ def foundational_llm_model_image_analysis(image_string):
         }
     })
 
-    response = bedrock_runtime.invoke_model(
-        body=body,
-        modelId=modelId_bedrock_profile_arn,
-        accept='application/json', 
-        contentType='application/json')
+    max_attempts = 6
+    response = None
+    for attempt in range(max_attempts):
+        try:
+            response = bedrock_runtime.invoke_model(
+                body=body,
+                modelId=modelId_bedrock_profile_arn,
+                accept='application/json',
+                contentType='application/json')
+            break
+        except Exception as lcl_ex:
+            if attempt == max_attempts - 1:
+                log.error(f"foundational_llm_model_image_analysis() Bedrock call failed after {max_attempts} attempts: {lcl_ex}")
+                raise
+
+            wait_time = (attempt + 1) * 5
+            log.warning(f"foundational_llm_model_image_analysis() Bedrock call failed on attempt {attempt + 1}/{max_attempts}. Retrying in {wait_time} seconds. Error: {lcl_ex}")
+            time.sleep(wait_time)
 
     response_body = json.loads(response.get('body').read())
-    
+
     response_text = response_body["output"]["message"]["content"][0]["text"].strip()
-    
+
     return response_text
+
+
+def image_batch_processing(image_strings):
+    log.debug("***************** Parsed_Images.image_batch_processing start *****************************")
+    if not image_strings:
+        return []
+
+    batch_size = int(Helper.get_property("image_batch_size", default=100))
+    if batch_size <= 0:
+        batch_size = 1
+
+    results = []
+    for i in range(0, len(image_strings), batch_size):
+        current_batch = image_strings[i:i + batch_size]
+        log.info(f"image_batch_processing() Analysing image {i + 1} to {i + len(current_batch)} of {len(image_strings)}")
+        results.extend(invoke_image_analysis_batch(current_batch))
+
+    return results
+
+
+def invoke_image_analysis_batch(image_strings):
+    log.debug("***************** Parsed_Images.invoke_image_analysis_batch start *****************************")
+    max_concurrent_calls = int(Helper.get_property("concurrent_bedrock_image_calls", default=5))
+    log.debug(f"invoke_image_analysis_batch() Number of images in this batch={len(image_strings)}, max_concurrent_calls={max_concurrent_calls}")
+
+    async def run_batch():
+        # The semaphore keeps only max_concurrent_calls images in Bedrock at any moment.
+        semaphore = asyncio.Semaphore(max_concurrent_calls)
+
+        async def invoke_single(image_string):
+            async with semaphore:
+                return await asyncio.to_thread(foundational_llm_model_image_analysis, image_string)
+
+        results = await asyncio.gather(
+            *[invoke_single(image_string) for image_string in image_strings],
+            return_exceptions=True
+        )
+
+        # One bad image must not stop the document. Its analysis text is left empty.
+        clean_results = []
+        for result in results:
+            if isinstance(result, Exception):
+                log.error(f"invoke_image_analysis_batch() Image analysis failed: {result}")
+                clean_results.append("")
+            else:
+                clean_results.append(result)
+
+        return clean_results
+
+    return asyncio.run(run_batch())
 
 
 def image_text_organization(data, elements, image_analysis_text, source_key,  doc_id):
@@ -114,15 +181,13 @@ def parsed_image_info(source_data):
     log.info("***************** Parsed_Images.parsed_image_info start *****************************")
     total_images_analysed=0
     image_data = []
+    # Images are collected here first and then sent to Bedrock together, so the calls run concurrently.
+    pending_analysis_items = []
     source_key = source_data.get("metadata", {}).get("s3_key")
     log.debug(f"s3_akey from data. source_key={source_key}")
     doc_id = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     log.debug(f"Getting doc_id={doc_id}")
 
-    #test = source_data.get("elements").get("type")["FIGURE"]
-    #ll = len(f"Test = {test}")
-    #log.debug(f"s3_akey from data. source_key {ll}")
-    #r=1/0
     for elements in source_data.get("elements"):
         element_type = elements.get("type")
         if element_type == "FIGURE":
@@ -142,16 +207,26 @@ def parsed_image_info(source_data):
                 # image.show()
 
                 str_encoded = base64.b64encode(image_s3_key).decode("utf-8")
-                image_analysis_text = foundational_llm_model_image_analysis(str_encoded)
-                image_data_temp = image_text_organization(source_data, elements, image_analysis_text, source_key,doc_id)
-                image_data.extend([image_data_temp])
-                total_images_analysed = total_images_analysed + 1
+                # Keep the place of this image in image_data so the order of the document does not change
+                pending_analysis_items.append((len(image_data), elements, str_encoded))
+                image_data.append(None)
                 continue
 
             image_analysis_text = ''
             other_subtype_document = image_text_organization(source_data,elements,image_analysis_text,source_key,doc_id)
             total_images_analysed = total_images_analysed + 1
             image_data += [other_subtype_document]
+
+    # All the images of this document are analysed together and then put back in their own place
+    if pending_analysis_items:
+        image_strings = [item[2] for item in pending_analysis_items]
+        image_analysis_texts = image_batch_processing(image_strings)
+
+        for (record_index, elements, str_encoded), image_analysis_text in zip(pending_analysis_items, image_analysis_texts):
+            image_data_temp = image_text_organization(source_data, elements, image_analysis_text, source_key, doc_id)
+            image_data[record_index] = image_data_temp
+            total_images_analysed = total_images_analysed + 1
+
     log.info(f"parsed_image_info() Total Images for {source_key} document. totalImagesAnalysed={total_images_analysed}")
     return image_data
 
@@ -161,9 +236,18 @@ def invoke_parsed_images_data():
         output_bucket = Helper.get_property("output_bucket")
         output_prefix = Helper.get_property("output_prefix")
         foundation_llm_model_id = Helper.get_property("foundation_llm_model_id")
+        max_concurrent_image_calls = int(Helper.get_property("concurrent_bedrock_image_calls", default=5))
 
         global bedrock_runtime
-        bedrock_runtime = aws_client('bedrock-runtime')
+        bedrock_runtime = aws_client(
+            'bedrock-runtime',
+            config=Config(
+                connect_timeout=10,
+                read_timeout=120,
+                max_pool_connections=max_concurrent_image_calls + 2
+            )
+        )
+        log.info(f"invoke_parsed_images_data() max_concurrent_image_calls={max_concurrent_image_calls}, max_pool_connections={max_concurrent_image_calls + 2}")
         if not bedrock_runtime:
             log.info(f"invoke_parsed_images_data() Failed to access Bedrock-runtime.")
             raise Exception(f"invoke_parsed_images_data() Failed to access Bedrock-runtime while calling aws_client(bedrock-runtime)")

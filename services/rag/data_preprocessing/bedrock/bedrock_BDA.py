@@ -12,6 +12,9 @@ from common.utils.settings import aws_client,aws_session
 from botocore.exceptions import ClientError
 
 
+MAX_IN_FLIGHT = 10              
+POLL_DELAY_SECONDS = 20         
+BATCH_TIMEOUT_SECONDS = 3600    
 bedrock_runtime = None
 bda_runtime_client = None
 bda_client = None
@@ -95,18 +98,17 @@ def create_bda_project(projectname, project_description, project_stage):
     projects_list = bda_client.list_data_automation_projects(projectStageFilter=project_stage)["projects"]
     print("list_data_automation_projects project_list=" + str(projects_list))
 
-    projects_existing = []
+    existing_project_arn = None
     for project in projects_list:
         if project["projectName"] == projectname:
-            projects_existing.append(project)
-    log.debug(f"list_data_automation_projects projects_existing={projects_existing}")
+            existing_project_arn = project["projectArn"]
+            break
+    log.debug(f"list_data_automation_projects existing_project_arn={existing_project_arn}")
 
-    log.debug(f"Checking if BDA project name is in BDA client list_data_automation_projects. If exists Delete it.")
-    if len(projects_existing) > 0:
-        log.info(f"Deleting existing project: {projects_existing[0]}")
-        bda_client.delete_data_automation_project(projectArn=projects_existing[0]["projectArn"])
-    else:
-        log.debug(f"Skipping delete, as project does not exist")
+    log.debug(f"Checking if BDA project name is in BDA client list_data_automation_projects. If exists reuse it.")
+    if existing_project_arn:
+        log.info(f"Reusing the existing {project_stage} project. Project Name={projectname}, project_arn={existing_project_arn}. The project and its description are not deleted or changed.")
+        return existing_project_arn
 
     log.debug(f"Creating BDA - Bedrock Data Automation Project. Project Name={projectname}")
     response = bda_client.create_data_automation_project(
@@ -123,38 +125,113 @@ def create_bda_project(projectname, project_description, project_stage):
     return new_project_arn
 
 
-def wait_for_all_jobs(jobs, max_iterations=15, delay=30):
-    log.info(f"***************** bedrock_BDA.wait_for_all_jobs start ***** Number of jobs={len(jobs)} *****")
-    pending = list(jobs)
+def get_nested_value(data, path):
+    log.debug("***************** bedrock_BDA.get_nested_value start *****************************")
+    keys = path.split('.')
+    for key in keys:
+        if isinstance(data, dict) and key in data:
+            data = data[key]
+        else:
+            return None
+    return data
 
+
+def wait_for_completion(client,get_status_function,status_kwargs,status_path_in_response,completion_states,error_states,max_iterations=60,delay=10):
+    log.info("***************** bedrock_BDA.wait_for_completion start *****************************")
     for currentIterations in range(max_iterations):
         log.debug(f" Current Iteration={currentIterations}")
-        still_pending = []
-        for job in pending:
-            try:
-                response = bda_runtime_client.get_data_automation_status(invocationArn=job["arn"])
-                status = response.get("status")
-            except ClientError as lclException:
-                print("Error Occurred")
-                Helper.print_exception("wait_for_all_jobs", lclException, extra_msg="Exception occurred")
-                raise Exception(f"Exception Occurred Error checking status: {str(lclException)}")
+        try:
+            response = get_status_function(**status_kwargs)
+            status = get_nested_value(response, status_path_in_response)
 
-            if status == "Success":
-                log.info(f"Job completed for {job['name']}: final status={status}")
-            elif status in ['ClientError', 'ServiceError']:
-                log.error("Error", error=f"wait_for_all_jobs() Job failed for {job['name']} with status: {status}")
-                raise Exception(f"wait_for_all_jobs() Job failed for {job['name']} with status: {status}")
-            else:
-                log.debug(f"Current status for {job['name']}: {status}. Waiting...")
-                still_pending.append(job)
+            if status in completion_states:
+                log.debug(f"Operation completed successfully with status: {status}")
+                return response
 
-        pending = still_pending
-        if not pending:
-            log.info("***************** bedrock_BDA.wait_for_all_jobs End ***** All jobs completed *****")
-            return
-        time.sleep(delay)
+            if status in error_states:
+                log.error("Error", error=f"wait_for_completion() Operation failed with status: {status}")
+                raise Exception(f"wait_for_completion() Operation failed with status: {status}")
 
-    raise Exception(f"wait_for_all_jobs() Operation timed out after {max_iterations} iterations. Jobs still running={[job['name'] for job in pending]}")
+            log.debug(f"Current status: {status}. Waiting...")
+            time.sleep(delay) 
+
+        except ClientError as lclException:
+            print("Error Occurred")
+            Helper.print_exception("wait_for_completion", lclException, extra_msg="Exception occurred")
+            raise Exception(f"Exception Occurred Error checking status: {str(lclException)}")
+
+    raise Exception(f"wait_for_completion() Operation timed out after {max_iterations} iterations")
+
+
+def wait_for_job_to_complete(invocation_arn):
+    log.debug("***************** bedrock_BDA.wait_for_job_to_complete start *****************************")
+    get_status_response = wait_for_completion(
+        client=bda_runtime_client,
+        get_status_function=bda_runtime_client.get_data_automation_status,
+        status_kwargs={'invocationArn': invocation_arn},
+        completion_states=['Success'],
+        error_states=['ClientError', 'ServiceError'],
+        status_path_in_response='status',
+        max_iterations=15,
+        delay=30
+    )
+    log.info(f"***************** bedrock_BDA.wait_for_job_to_complete End ******** Returning get_status_response= {get_status_response}***************")
+    return get_status_response
+
+
+def is_already_processed(output_bucket, prefix_check, rename_file_info):
+    log.debug("***************** bedrock_BDA.is_already_processed start *****************************")
+    paginator = s3AwsClient.get_paginator("list_objects_v2")
+    try:
+        for page in paginator.paginate(Bucket=output_bucket, Prefix=prefix_check):
+            for obj in page.get("Contents", []):
+                if obj.get("Key", "").endswith("job_metadata.json"):
+                    log.info(f'Checked if Key Ends with job_metadata.json, If found then the file was already processed {obj.get("Key", "")}')
+                    return True
+    except ClientError as lclEx:
+        log.info(f"Warning: could not check outputs for {rename_file_info}: {lclEx}")
+        raise Exception(f"is_already_processed() Warning: could not check outputs for {rename_file_info}: {lclEx}")
+    return False
+
+
+def submit_job(project_arn, input_bucket, key, output_bucket, prefix_check, da_profile_arn, project_stage):
+    log.debug("***************** bedrock_BDA.submit_job start *****************************")
+    input_s3_uri = f"s3://{input_bucket}/{key}"
+    output_s3_uri = f"s3://{output_bucket}/{prefix_check}"
+
+    log.info(f"Invoking BDA for: {key}")
+    log.debug(f"Input:  {input_s3_uri}")
+    log.debug(f"Output: {output_s3_uri}")
+
+    response = bda_runtime_client.invoke_data_automation_async(
+        inputConfiguration={"s3Uri": input_s3_uri},
+        outputConfiguration={"s3Uri": output_s3_uri},
+        dataAutomationConfiguration={"dataAutomationProjectArn": project_arn, "stage": project_stage},
+        dataAutomationProfileArn=da_profile_arn,
+    )
+    return response.get("invocationArn")
+
+
+def poll_pending_jobs(pending, succeeded, failed):
+    """One polling round. Finished jobs are removed from pending and added to succeeded or failed."""
+    log.debug(f"***************** bedrock_BDA.poll_pending_jobs start ***** Number of pending jobs={len(pending)}")
+    for invocation_arn, rename_file_info in list(pending.items()):
+        try:
+            response = bda_runtime_client.get_data_automation_status(invocationArn=invocation_arn)
+        except ClientError as lclEx:
+            # Throttling or a transient error. Keep the job pending and check it again next round.
+            log.info(f"poll_pending_jobs() Could not read status for {rename_file_info}, will retry: {lclEx}")
+            continue
+
+        status = response.get("status")
+        if status == "Success":
+            log.info(f"Job completed for {rename_file_info}: final status={status}")
+            succeeded.append(pending.pop(invocation_arn))
+        elif status in ("ClientError", "ServiceError"):
+            log.error("Error", error=f"poll_pending_jobs() Job failed for {rename_file_info} with status: {status}")
+            failed.append(pending.pop(invocation_arn))
+        else:
+            log.debug(f"Job for {rename_file_info} is still running. Current status: {status}")
 
 
 def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da_profile_arn, project_stage):
@@ -164,15 +241,15 @@ def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da
     # Delete All file in output bucket
     full_refresh = Helper.get_property("full_refresh")
     full_refresh= (full_refresh == "True")
+    s3_resource = boto3.resource('s3')
     if full_refresh is True:
         log.debug(f"full_refresh = {full_refresh}, if true delete all object before updates ")
-        s3_resource = boto3.resource('s3')
         Helper.delete_bucket_file_recursively(s3_resource, output_bucket, out_prefix)
     else:
         log.debug(f"full_refresh = {full_refresh}, if NOT True Dont delete all object before updates ")
 
-    invoked = []
-
+    # Build the work list first. A file that already has an output is processed again after its old output is deleted.
+    work_list = []
     for key in p_files:
         log.info(f"********************************** Key ={key} *********************** START ")
         str_basename = os.path.basename(key)
@@ -183,50 +260,59 @@ def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da
 
         prefix_check = f"{out_prefix.rstrip('/')}/{rename_file_info}"
         log.info(f"strBasename={str_basename}, rename_file_info={rename_file_info}, Setting prefix_check variable. prefix_check={ prefix_check} ")
-        found_metadata = False
-        paginator = s3AwsClient.get_paginator("list_objects_v2")
-        try:
-            for page in paginator.paginate(Bucket=output_bucket, Prefix=prefix_check):
-                for obj in page.get("Contents", []):
-                    if obj.get("Key", "").endswith("job_metadata.json"):
-                        found_metadata = True
-                        log.info(f'Checked if Key Ends with job_metadata.json, If found then skip {obj.get("Key", "")}')
-                        break
-                if found_metadata:
-                    break
-        except ClientError as lclEx:
-            log.info(f"Warning: could not check outputs for {rename_file_info}: {lclEx}")
-            raise Exception(f"bda_invoke() Warning: could not check outputs for {rename_file_info}: {lclEx}")
 
-        if found_metadata:
-            log.info(f"Checked if Key Ends with job_metadata.json, If found then Skipping (already processed): {rename_file_info}")
-            continue
+        if is_already_processed(output_bucket, prefix_check, rename_file_info):
+            log.info(f"Already processed: {rename_file_info}. Deleting the old output at {prefix_check} and processing the file again.")
+            Helper.delete_bucket_file_recursively(s3_resource, output_bucket, prefix_check)
 
-        input_s3_uri = f"s3://{input_bucket}/{key}"
-        output_s3_uri = f"s3://{output_bucket}/{prefix_check}"
-
-        log.info(f"Invoking BDA for: {rename_file_info}")
-        log.debug(f"Input:  {input_s3_uri}")
-        log.debug(f"Output: {output_s3_uri}")
-
-        response = bda_runtime_client.invoke_data_automation_async(
-                inputConfiguration={"s3Uri": input_s3_uri},
-                outputConfiguration={"s3Uri": output_s3_uri},
-                dataAutomationConfiguration={"dataAutomationProjectArn": project_arn, "stage": project_stage},
-                dataAutomationProfileArn=da_profile_arn,
-            )
-        
-        invocation_arn = response.get("invocationArn")
-        if invocation_arn:
-            log.info(f"Started BDA job for {rename_file_info}. invocation_arn={invocation_arn}")
-            invoked.append({"name": rename_file_info, "key": key, "arn": invocation_arn})
-
+        work_list.append((key, rename_file_info, prefix_check))
         log.debug(f"********************************** Key ={key} *********************** End  ")
 
-    log.info(f"All BDA jobs started. Number of jobs={len(invoked)}. Now waiting for them to finish.")
-    wait_for_all_jobs(invoked)
-    log.debug(f"****************** bda_invoke() ******************************* End ****************************")
-    return invoked
+    log.info(f"Number of files to invoke = {len(work_list)} out of {len(p_files)} files. MAX_IN_FLIGHT={MAX_IN_FLIGHT}")
+
+    pending = {}    
+    succeeded = []
+    failed = []
+    next_index = 0
+    start_time = time.time()
+
+    # Submit up to MAX_IN_FLIGHT jobs, then poll them all together in rounds.
+    # Every time a job finishes a free slot is filled with the next file.
+    while next_index < len(work_list) or pending:
+        while next_index < len(work_list) and len(pending) < MAX_IN_FLIGHT:
+            key, rename_file_info, prefix_check = work_list[next_index]
+            next_index += 1
+            try:
+                invocation_arn = submit_job(project_arn, input_bucket, key, output_bucket, prefix_check, da_profile_arn, project_stage)
+            except ClientError as lclEx:
+                # One bad file must not stop the batch. Mark it failed and keep going.
+                log.error("Error", error=f"bda_invoke() Could not submit {rename_file_info}: {lclEx}")
+                failed.append(rename_file_info)
+                continue
+
+            if invocation_arn:
+                pending[invocation_arn] = rename_file_info
+                log.debug(f"Submitted {rename_file_info}, invocation_arn={invocation_arn}. Jobs in flight={len(pending)}")
+            else:
+                log.error("Error", error=f"bda_invoke() No invocationArn returned for {rename_file_info}")
+                failed.append(rename_file_info)
+
+        if not pending:
+            continue
+
+        if time.time() - start_time > BATCH_TIMEOUT_SECONDS:
+            not_finished = list(pending.values()) + [info for _, info, _ in work_list[next_index:]]
+            log.error("Error", error=f"bda_invoke() Batch timed out after {BATCH_TIMEOUT_SECONDS} seconds. Not finished={not_finished}")
+            failed.extend(not_finished)
+            pending.clear()
+            break
+
+        time.sleep(POLL_DELAY_SECONDS)
+        poll_pending_jobs(pending, succeeded, failed)
+
+    summary = {"success_count": len(succeeded), "failed_count": len(failed), "failed_files": failed}
+    log.info(f"****************** bda_invoke() ******************* End **** Summary={summary}")
+    return summary
 
 
 def invoke_bedrock_bda():
@@ -289,6 +375,10 @@ def invoke_bedrock_bda():
         output_bucket = Helper.get_property("output_bucket")
         output_prefix = Helper.get_property("output_prefix")
         project_stage = Helper.get_property("ProjectStage")
+        if project_stage and project_stage.strip().upper() == "DEVELOPMENT":
+            project_stage = "DEVELOPMENT"
+        else:
+            project_stage = "LIVE"
         data_automation_v = Helper.get_property("DataAutomationV")
 
         log.info(
@@ -315,6 +405,8 @@ def invoke_bedrock_bda():
         print(f"Formatted da_profile_arn={da_profile_arn}")
         bda_results = bda_invoke(project_arn, input_bucket_name, data_files, output_bucket, output_prefix, da_profile_arn,
                                  project_stage)
+        Helper.summary_file("BEDROCK", f"\n{now} BDA batch summary=" + str(bda_results))
+        log.info(f"BDA batch summary={bda_results}")
         log.info("***************** invokeParsedBDATable End. __name__=" + str(__name__))
         return True
 
@@ -323,3 +415,4 @@ def invoke_bedrock_bda():
         # Re-raise the same exception
         log.info(f"***************** invokeParsedBDATable End. __name__={__name__}. Returning False")
         return False
+    
