@@ -15,8 +15,13 @@ import {
   type DeploymentConfig,
   type DeploymentEnvironmentName,
 } from "../deployment-config";
+import { STUB_VPC_CONTEXT_KEY } from "./networking-construct";
 
 export const API_CONTAINER_PORT = 8001;
+
+/** Placeholder ACM ARN used only when synthesizing with `aisuite:stubVpc`. */
+const STUB_ALB_CERTIFICATE_ARN =
+  "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000";
 
 export const API_HEALTH_CHECK_PATH = "/health";
 
@@ -197,9 +202,13 @@ export class ComputeConstruct extends Construct {
       // Best-effort: if the method or bucket doesn't resolve during synth, continue.
     }
 
-    // Require an ACM certificate ARN in the deployment config and create an
-    // HTTPS (443) listener only.
-    const albCertArn = props.deploymentConfig.albCertificateArn as string | undefined;
+    // Require an ACM certificate ARN for HTTPS (443). When synthesizing with
+    // stub VPC (unit tests / PR CI), fall back to a placeholder ARN so qa/uat/prod
+    // templates can still synth before real certs are configured.
+    const configuredCertArn = props.deploymentConfig.albCertificateArn;
+    const stubVpcContext = this.node.tryGetContext(STUB_VPC_CONTEXT_KEY);
+    const usingStubVpc = stubVpcContext === true || stubVpcContext === "true";
+    const albCertArn = configuredCertArn ?? (usingStubVpc ? STUB_ALB_CERTIFICATE_ARN : undefined);
     if (!albCertArn) {
       throw new Error(
         "ALB certificate ARN is required in deploymentConfig.albCertificateArn to create an HTTPS listener",
