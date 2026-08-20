@@ -5,7 +5,8 @@ import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
-import type * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3 from "aws-cdk-lib/aws-s3";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import type * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
 
@@ -166,24 +167,56 @@ export class ComputeConstruct extends Construct {
       },
     );
 
+    // Allow HTTPS from the CMS Cloud VPN Prefix List (custom source)
+    loadBalancerSecurityGroup.addIngressRule(
+      ec2.Peer.prefixList("pl-006315be223e9c9a7"),
+      ec2.Port.tcp(443),
+      "Allow Traffic from CMS Cloud VPN Prefix List",
+    );
+
     this.loadBalancer = new elbv2.ApplicationLoadBalancer(this, "Alb", {
       internetFacing: false,
       loadBalancerName: serviceName,
       securityGroup: loadBalancerSecurityGroup,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      deletionProtection: protectedEnvironment,
     });
 
+    // Configure ALB access logging to the central access-logs bucket under
+    // the `ALB-Access-Logs` prefix. We reference the existing bucket by name.
+    try {
+      const accessLogsBucket = s3.Bucket.fromBucketName(
+        this,
+        "CentralAccessLogsBucket",
+        props.deploymentConfig.accessLogsBucketName,
+      );
+      // Use a prefix based on the ALB/service name so logs are organized per ALB.
+      this.loadBalancer.logAccessLogs(accessLogsBucket, `${serviceName}/`);
+    } catch {
+      // Best-effort: if the method or bucket doesn't resolve during synth, continue.
+    }
+
+    // Require an ACM certificate ARN in the deployment config and create an
+    // HTTPS (443) listener only.
+    const albCertArn = props.deploymentConfig.albCertificateArn as string | undefined;
+    if (!albCertArn) {
+      throw new Error(
+        "ALB certificate ARN is required in deploymentConfig.albCertificateArn to create an HTTPS listener",
+      );
+    }
+    const cert = acm.Certificate.fromCertificateArn(this, "AlbCertificate", albCertArn);
     const listener = this.loadBalancer.addListener("Listener", {
       open: false,
-      port: 80,
-      protocol: elbv2.ApplicationProtocol.HTTP,
+      port: 443,
+      protocol: elbv2.ApplicationProtocol.HTTPS,
+      certificates: [cert],
     });
 
     listener.connections.allowFrom(
       ec2.Peer.ipv4(props.vpc.vpcCidrBlock),
-      ec2.Port.tcp(80),
-      "RAG API HTTP from inside the VPC",
+      ec2.Port.tcp(443),
+      "RAG API HTTPS (443) from inside the VPC",
     );
 
     listener.addTargets("Targets", {

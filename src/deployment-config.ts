@@ -44,6 +44,13 @@ export const DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID: Partial<
   dev: "sg-0964f9710d200b1ac",
 };
 
+/** Per-environment ACM certificate ARNs for the ALB HTTPS listener. */
+export const DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN: Partial<
+  Record<DeploymentEnvironmentName, string>
+> = {
+  dev: "arn:aws:acm:us-east-1:205501819586:certificate/5b20cd15-197a-4efc-b05c-0063a371ff30",
+};
+
 /**
  * Explicit AISuite AWS account IDs (CloudTamer aisuite-non-prod / aisuite-prod).
  * Runtime env overrides (`AISUITE_NONPROD_ACCOUNT_ID` /
@@ -97,6 +104,10 @@ export interface DeploymentConfig {
   vpcName: (typeof DEPLOYMENT_ENVIRONMENT_VPC_NAME)[DeploymentEnvironmentName];
   /** CloudTamer cmscloud-vpn SG id when this stage allows VPN access to RDS. */
   vpnSecurityGroupId?: string;
+  /** Optional ARN of an ACM certificate to use for the ALB HTTPS listener. */
+  albCertificateArn?: string;
+  /** Name of the central S3 bucket that receives server access logs (managed externally). */
+  accessLogsBucketName: string;
 }
 
 const ACCOUNT_ID_PATTERN = /^\d{12}$/;
@@ -146,8 +157,9 @@ export function getDeploymentConfig(
       DeployedAt: deployedAt
     },
     vpcName: DEPLOYMENT_ENVIRONMENT_VPC_NAME[environmentName],
-    vpnSecurityGroupId:
-      DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
+    vpnSecurityGroupId: DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
+    albCertificateArn: DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN[environmentName],
+    accessLogsBucketName: `cms-cloud-${resolveAccountId(accountTier)}-${DEFAULT_REGION}-access-logs`,
   };
 }
 
