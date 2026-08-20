@@ -107,10 +107,32 @@ describe.each(["dev", "prod"] as const)(
 
     it("fronts the service with an internal ALB targeting the health endpoint", () => {
       const template = synthesize(environmentName);
+      const protectedEnvironment = environmentName !== "dev";
 
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::LoadBalancer",
-        { Scheme: "internal", Type: "application" },
+        {
+          Scheme: "internal",
+          Type: "application",
+          LoadBalancerAttributes: Match.arrayWith([
+            {
+              Key: "deletion_protection.enabled",
+              Value: String(protectedEnvironment),
+            },
+          ]),
+        },
+      );
+      template.hasResourceProperties(
+        "AWS::ElasticLoadBalancingV2::Listener",
+        {
+          Port: 443,
+          Protocol: "HTTPS",
+          Certificates: Match.arrayWith([
+            Match.objectLike({
+              CertificateArn: Match.stringLikeRegexp("^arn:aws:acm:"),
+            }),
+          ]),
+        },
       );
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::TargetGroup",
