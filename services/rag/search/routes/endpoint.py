@@ -4,10 +4,10 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from search.database_searching.agents import search_agent, ChatDeps
-from search.database_searching.search import SearchEngine
+from search.database_searching.agents import answer_question, build_deps
 
 logger = structlog.get_logger(__name__)
+_deps = None
 
 class AgentRequest(BaseModel):
     """Request model for agent endpoint."""
@@ -68,12 +68,15 @@ async def process_agent_query(query: str) -> AgentResponse:
     """Process agent query (shared by GET and POST endpoints)."""
     logger.info("agent_request", query=query[:100])
 
+    global _deps
     try:
-        deps = ChatDeps(acronyms={}, timing={}, search_engine=SearchEngine())
-        result = await search_agent.run(query, deps=deps)
+        if _deps is None:
+            _deps = build_deps()
 
-        logger.info("agent_success", query=query[:100], length=len(result.output))
-        return AgentResponse(query=query, response=result.output, success=True)
+        answer = await answer_question(query, deps=_deps)
+
+        logger.info("agent_success", query=query[:100], length=len(answer))
+        return AgentResponse(query=query, response=answer, success=True)
 
     except ImportError as e:
         error_msg = f"Module import failed: {str(e)}"

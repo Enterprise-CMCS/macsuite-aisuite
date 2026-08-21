@@ -30,16 +30,80 @@ flowchart LR
   ragProcess --> embed[Bedrock_embeddings]
   embed --> pgvector[RDS_pgvector]
   pgvector --> api[RAG_API_agent]
+  pgvector --> crt[CRT_workbook_review]
   api --> llm[Bedrock_LLM]
+  crt --> llm
 ```
 
 1. **Pre-processing** lists source docs under the active contract’s S3 prefix,
    runs Bedrock Data Automation, and writes parsed text/table/image outputs to
-   the post-processing bucket.
+   the post-processing bucket, plus a table-of-contents index (see below).
 2. **RAG process** loads those outputs, chunks text, writes split JSON, embeds
    with Bedrock, and stores vectors in the active contract’s embeddings table.
 3. **API** answers natural-language questions via search over that table and a
    Bedrock foundation model.
+4. **Contract review** runs the requirements in a CMS Contract Review Tool
+   workbook through the same retrieval and writes the findings back into the
+   workbook.
+
+### Retrieval
+
+`search/database_searching/search.py` offers four strategies over the active
+contract’s embeddings table:
+
+| Method | What it does |
+|--------|--------------|
+| `semantic_search` | Cosine nearest neighbours via the pgvector HNSW index |
+| `fulltext_search` | Postgres full-text search over the generated `search_tsv` column |
+| `hybrid_search` | Both of the above in one round trip, fused with reciprocal rank fusion |
+| `reranked_search` | `hybrid_search` for recall, then Cohere rerank for precision |
+
+Hybrid is the default for contract review. Vector search alone misses exact
+contract vocabulary (statute cites, defined terms, “shall not”); full-text alone
+misses paraphrased requirements. RRF needs no score normalisation between the
+two, which matters because `ts_rank_cd` and cosine distance are not on
+comparable scales.
+
+Every row carries a **retrieval confidence**, which is the cosine similarity
+(`1 - distance` from pgvector’s `<=>`) clamped to 0–1. `hybrid_search` scores the
+lexical arm against the query vector too, so a chunk that only full-text found
+still reports a confidence instead of a blank. The number is never shown to a
+model — a model told a chunk scored 0.47 hands that back as its own confidence,
+which would leave the two confidence columns in the workbook saying the same
+thing twice.
+
+### What gets embedded
+
+`data_preprocessing/parsing/parsed_text_data.py` drops text that would compete
+with real provisions at retrieval time:
+
+| Filter | Why |
+|--------|-----|
+| `SKIP_SUBTYPES` — `PAGE_NUMBER`, `FOOTER`, `HEADER` | A running footer embeds like any other chunk. This contract had 201 identical `RFP Boilerplate I 07012019` footers and 199 page numbers. |
+| Printed-contents pages | Their text is section titles against page labels, which is answer-shaped enough to out-rank the provision being asked about. `parsed_toc` already turned those pages into the index. BDA lays those pages out as tables too, so `parsed_bda_table` skips the same pages. |
+| `MIN_CONTENT_CHARS` | Empty list scaffolding (`- \n- \n-`), a stray `[X]`, a bare `## J.` — nothing anyone could retrieve. |
+
+Section headers are kept: they are how a requirement about a named section gets
+found. On the Nebraska contract these filters take 2,464 text elements down to
+1,543.
+
+Page numbers come from `page_indices` where BDA gives one and from
+`locations[].page_index` where it does not, because a couple of hundred elements
+only carry the latter and would otherwise land with no page — and a chunk with no
+page cannot be cited.
+
+### Table-of-contents index
+
+`data_preprocessing/parsing/parsed_toc.py` builds an outline of each source PDF
+from the section headings BDA reports, and reads the printed page labels off the
+`PAGE_NUMBER` elements. The result is written once per pre-processing run to
+`BDAToCOutputFolder` / `BDAToCOutputFilename` in the post-processing bucket.
+
+Chunk metadata only carries `doc_id` and a zero-based page index. At query time
+`search/database_searching/toc_index.py` turns that pair into a citation a
+reviewer can act on — `V.R.11 Contingency Plan, Page 149` — by finding the
+innermost outline entry whose page range covers the chunk. If the index is
+missing, citations fall back to document and page index and nothing else breaks.
 
 ## Running the service
 
@@ -56,6 +120,7 @@ VPN/bastion).
 | Query API | `python -m search.routes.endpoint` (or Docker image `CMD` → uvicorn) | Always-on ECS Fargate service on port `8001` |
 | Pre-process batch | `python -m data_preprocessing.pre_processing` | ECS on-demand task |
 | Embeddings batch | `python -m data_embeddings_storage.rag_process` | ECS on-demand task |
+| Contract review | `python search/excel_process/process_excel_with_rag.py` | not deployed yet; run it on demand |
 | DB bootstrap | usually not local (needs master secret) | One-shot Fargate task: `python -m data_embeddings_storage.database.bootstrap` |
 
 Typical ingest order after documents land in the input prefix:
@@ -89,6 +154,47 @@ curl -s -X POST "http://127.0.0.1:8001/agent" \
   -H "Content-Type: application/json" \
   -d '{"query":"What is coverage for NEMT?"}'
 ```
+
+### Contract review run job
+
+Drop the CMS Contract Review Tool workbook (`.xlsm` or `.xlsx`) into
+`output_excel/` at the repository root and run:
+
+```sh
+python search/excel_process/process_excel_with_rag.py
+```
+
+Every requirement row goes through retrieval and three agents — an analyst that
+commits to a status, a challenger that argues the opposing case over the same
+evidence, and an adjudicator that settles it. Findings are written back into the
+columns a reviewer already works from (Status, Where Found, Follow-up Required,
+General Comments), and everything that does not fit a form field — the
+counter-argument, both confidence scores, the verified quotes with their contents
+section and printed page — goes onto an added **RAG Analysis** sheet keyed by
+sheet and row.
+
+| Flag | Effect |
+|------|--------|
+| `--folder` | Where to look for workbooks (default `output_excel/`) |
+| `--sheet` | Only this sheet; repeatable |
+| `--limit` | Stop after N requirements, for a smoke test |
+| `--concurrency` | Requirements in flight at once (default 4) |
+| `--no-challenge` | Analyst only, skip the challenge and adjudication |
+| `--skip-answered` | Leave rows that already have a Status alone |
+| `--fresh` | Discard the sidecar and review everything again |
+
+A full CRT is 667 requirements at three model calls each, so each finding is
+appended to a `<name>.xlsm.reviewed.jsonl` sidecar as it completes. Re-running
+resumes from that sidecar rather than paying for the same rows twice. The
+reviewed workbook is saved as `<name>.reviewed.xlsm`; the uploaded file is never
+modified.
+
+Two things to know about the output. Status is left blank when the verdict has no
+matching dropdown option — `A. Completeness` offers Yes/No and has nowhere to put
+an UNCLEAR — and the reason goes in General Comments. And openpyxl warns that it
+is dropping the workbook's conditional-formatting extension: macros, dropdowns
+and layout survive the round trip, the colour-scale rules on the Summary sheet do
+not.
 
 ### Cloud operation
 
@@ -131,16 +237,19 @@ env plain text, workflow args, or logs):
 
 ### Local development
 
+There is no `.env` file and no dotenv loading. AWS credentials and the default
+region come from the standard AWS CLI configuration (`aws configure`, or
+`AWS_PROFILE` for a named profile) via the boto3 default credential chain;
+database credentials always come from Secrets Manager.
+
 | Variable | Role |
 |----------|------|
-| Standard AWS credential chain | S3, Bedrock, Secrets Manager (no profile names required in docs) |
 | `AIPropFile` | Path to an alternate properties INI (absolute or relative) |
-| `db_host`, `db_name`, `db_user`, `db_password`, `db_port` | Direct Postgres; if all of host/name/user/password are set, Secrets Manager is skipped |
-| `DB_SECRET_ARN` / `DB_SECRET_NAME` | Used when local `db_*` vars are not fully set |
+| `DB_SECRET_ARN` / `DB_SECRET_NAME` | Secrets Manager secret for app DB credentials (INI `vector-db-admin-secret` otherwise) |
 | `API_HOST`, `API_PORT`, `API_RELOAD` | API bind (defaults `0.0.0.0`, `8001`, `false`) |
 | Same bucket/model vars as cloud | Optional overrides over the shipped INI |
 
-Optional tuning (INI fallback if unset): `embedding_dimension`,
+Tuning values are read from the INI only: `embedding_dimension`,
 `embedding_batch_size`, `db_pool_min`, `db_pool_max`.
 
 Constraints: private RDS is not open to the public internet; Bedrock and S3
@@ -190,7 +299,7 @@ Contract-specific paths and `embeddings_table_name` live in `[contract:…]` sec
 
 ### Active contract
 
-Exactly one section may have `active = true`. Default for dev is `tn_6756` (TennCare).
+Exactly one section may have `active = true`. Currently `ne_102897` (Nebraska).
 To switch:
 
 1. Set `active = true` on the target `[contract:…]` section.
@@ -203,10 +312,11 @@ To switch:
 | ID | Active | `input_prefix` | `embeddings_table_name` |
 |----|--------|----------------|-------------------------|
 | `me_0002` | false | `state_of_ME/MCR-ME-0002-NEMT/` | `embeddings_me_0002_nemt` |
-| `tn_6756` | true | `state_of_TN/MCCRS-TN-6756-TennCare/` | `embeddings_tn_6756_tenncare` |
+| `tn_6756` | false | `state_of_TN/MCCRS-TN-6756-TennCare/` | `embeddings_tn_6756_tenncare` |
 | `wa_6369` | false | `state_of_WA/MCCRS-WA-6369-IFC/` | `embeddings_wa_6369_ifc` |
 | `wa_6472` | false | `state_of_WA/MCCRS-WA-6472-AHIMC/` | `embeddings_wa_6472_ahimc` |
 | `wa_6473` | false | `state_of_WA/MCCRS-WA-6473-IFC/` | `embeddings_wa_6473_ifc` |
+| `ne_102897` | true | `NE/` | `embeddings_ne_102897` |
 
 Full `output_prefix` / BDA / RAG folder paths are in the INI under each contract section.
 

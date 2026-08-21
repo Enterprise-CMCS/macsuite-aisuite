@@ -1,9 +1,6 @@
-import os
 import boto3
 import json
-from pathlib import Path
 
-from dotenv import load_dotenv, find_dotenv
 from botocore.exceptions import ClientError
 from common.utils.helper import Helper
 from common.utils.logger import log
@@ -11,16 +8,12 @@ from common.utils.logger import log
 log.debug(f"***************** File *****************************{__file__}")
 
 
-AWS_ACCESS_KEY_ID = ""      # os.getenv("aws_access_key_id")
-AWS_SECRET_ACCESS_KEY = ""  # os.getenv("aws_secret_access_key")
-AWS_SESSION_TOKEN = ""      # os.getenv("aws_session_token")
-AWS_REGION = ""             # os.getenv("aws_region")
 
-MODEL_ID = None             # os.getenv("model_id")
-EMBEDDING_DIMENSION = None  # int(os.getenv("embedding_dimension", 1536))
-EMBEDDING_BATCH_SIZE = None # os.getenv("embedding_batch_size")
-DB_POOL_MIN = None          # int(os.getenv("db_pool_min", 1))
-DB_POOL_MAX = None          # int(os.getenv("db_pool_max", 5))
+MODEL_ID = None
+EMBEDDING_DIMENSION = None
+EMBEDDING_BATCH_SIZE = None
+DB_POOL_MIN = None
+DB_POOL_MAX = None
 
 DB_HOST = None
 DB_NAME = None
@@ -31,48 +24,20 @@ DB_PORT = None
 
 def load_env():
     log.debug("************************* LoadENV Start *******************************************")
-    log.debug("Loading Environment variables")
+    log.debug("Resolving AWS region; credentials come from the boto3 default chain (aws configure / IAM role).")
 
-    env_path = find_dotenv()
-    if not env_path:
-        batch_dir = Path(__file__).parent.parent.parent.parent
-        env_path = batch_dir / ".env"
-        if not env_path.exists():
-            log.warning(f"Could not find .env file at {env_path}")
-    load_dotenv(dotenv_path=env_path)
-    log.debug(f"Loading env from: {env_path}")
-
-    global AWS_ACCESS_KEY_ID
-    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("aws_access_key_id")
-    global AWS_SECRET_ACCESS_KEY
-    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("aws_secret_access_key")
-    global AWS_SESSION_TOKEN
-    AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN") or os.getenv("aws_session_token")
     global AWS_REGION
-    AWS_REGION = Helper.get_property("aws_region", default=None)
-
-    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
-        log.debug("load_env() Static AWS credentials are set in the environment and will be used.")
-    else:
-        log.debug("load_env() No static AWS credentials set; boto3 default credential chain will be used.")
+    AWS_REGION = Helper.get_property("aws_region", default=None) or boto3.Session().region_name
 
     if AWS_REGION == "" or AWS_REGION is None:
         raise Exception(
-            "LoadENV() AWS region is not set. Set AWS_REGION or AWS_DEFAULT_REGION, "
-            "or 'aws_region' in aws.properties.ini.")
+            "LoadENV() AWS region is not set. Set 'aws_region' in aws.properties.ini "
+            "or a default region via 'aws configure'.")
     else:
         log.debug(f"AWS_REGION - {AWS_REGION}, is set properly.")
 
 
 def aws_session():
-    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
-        return boto3.Session(
-            aws_access_key_id = AWS_ACCESS_KEY_ID,
-            aws_secret_access_key = AWS_SECRET_ACCESS_KEY,
-            aws_session_token = AWS_SESSION_TOKEN or None,
-            region_name = AWS_REGION
-        )
-
     return boto3.Session(region_name = AWS_REGION)
 
 
@@ -145,52 +110,35 @@ def init_env():
 
     log.debug(f"init_env() MODEL_ID={MODEL_ID}")
     global EMBEDDING_DIMENSION
-
-    EMBEDDING_DIMENSION = int(os.getenv("embedding_dimension", Helper.get_property("embedding_dimension")))
-
+    EMBEDDING_DIMENSION = int(Helper.get_property("embedding_dimension"))
     log.debug(f"init_env() EMBEDDING_DIMENSION={EMBEDDING_DIMENSION}")
 
     global EMBEDDING_BATCH_SIZE
-    EMBEDDING_BATCH_SIZE = os.getenv("embedding_batch_size", Helper.get_property("embedding_batch_size"))
+    EMBEDDING_BATCH_SIZE = Helper.get_property("embedding_batch_size")
     log.debug(f"init_env() EMBEDDING_BATCH_SIZE={EMBEDDING_BATCH_SIZE}")
 
     global DB_POOL_MIN
-    DB_POOL_MIN = int(os.getenv("db_pool_min", Helper.get_property("db_pool_min")))
+    DB_POOL_MIN = int(Helper.get_property("db_pool_min"))
     log.debug(f"init_env() DB_POOL_MIN={DB_POOL_MIN}")
 
     global DB_POOL_MAX
-    DB_POOL_MAX = int(os.getenv("db_pool_max", Helper.get_property("db_pool_max")))
+    DB_POOL_MAX = int(Helper.get_property("db_pool_max"))
     log.debug(f"init_env() DB_POOL_MAX={DB_POOL_MAX}")
 
     global DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
 
-    db_host_env = os.getenv("db_host")
-    db_name_env = os.getenv("db_name")
-    db_user_env = os.getenv("db_user")
-    db_password_env = os.getenv("db_password")
-    db_port_env = os.getenv("db_port")
-
-    if db_host_env and db_name_env and db_user_env and db_password_env:
-        log.debug(f"init_env() Using database credentials from .env file (local development)")
-        DB_HOST = db_host_env
-        DB_PORT = int(db_port_env) if db_port_env else 5432
-        DB_NAME = db_name_env
-        DB_USER = db_user_env
-        DB_PASSWORD = db_password_env
-        log.debug(f"init_env() DB_HOST={DB_HOST}, DB_PORT={DB_PORT}, DB_NAME={DB_NAME}, DB_USER={DB_USER}")
-    else:
-        log.debug(f"init_env() Database credentials not found in .env, fetching from AWS Secrets Manager")
-        db_credentials = get_secret()
-        log.debug(f"init_env()  after calling get_secret(). Setting database parameters got from secret string")
-        DB_HOST = db_credentials.get("host")
-        log.debug(f"init_env() DB_HOST={DB_HOST}")
-        DB_PORT = int(db_credentials.get("port"))
-        log.debug(f"init_env() DB_PORT={DB_PORT}")
-        DB_NAME = db_credentials.get("dbname")
-        log.debug(f"init_env() DB_NAME={DB_NAME}")
-        DB_USER = db_credentials.get("username")
-        log.debug(f"init_env() DB_USER={DB_USER}")
-        DB_PASSWORD = db_credentials.get("password")
+    log.debug(f"init_env() Fetching database credentials from AWS Secrets Manager")
+    db_credentials = get_secret()
+    log.debug(f"init_env()  after calling get_secret(). Setting database parameters got from secret string")
+    DB_HOST = db_credentials.get("host")
+    log.debug(f"init_env() DB_HOST={DB_HOST}")
+    DB_PORT = int(db_credentials.get("port"))
+    log.debug(f"init_env() DB_PORT={DB_PORT}")
+    DB_NAME = db_credentials.get("dbname")
+    log.debug(f"init_env() DB_NAME={DB_NAME}")
+    DB_USER = db_credentials.get("username")
+    log.debug(f"init_env() DB_USER={DB_USER}")
+    DB_PASSWORD = db_credentials.get("password")
 
 
 init_env()

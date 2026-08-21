@@ -1,259 +1,238 @@
 #!/usr/bin/env python3
+"""Run job: review every requirement in the workbooks dropped into output_excel/.
 
-import sys
-import json
+Point it at a folder, it finds the Contract Review Tool workbooks in there, sends
+each requirement through the review agents, and writes a reviewed copy alongside
+the original. The uploaded file is never modified.
+
+    python search/excel_process/process_excel_with_rag.py
+    python search/excel_process/process_excel_with_rag.py --sheet "E. Providers & Network"
+    python search/excel_process/process_excel_with_rag.py --limit 20 --concurrency 2
+
+A full CRT is 667 requirements and each one costs three model calls, so progress
+is appended to a .reviewed.jsonl sidecar as it goes. Re-running picks up where the
+last run stopped; --fresh throws the sidecar away and starts over.
+"""
+
+import argparse
 import asyncio
-import re
+import json
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
-import pandas as pd
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-src_path = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(src_path))
+from common.utils.logger import log
+from data_embeddings_storage.database.connection import close_db
+from search.database_searching.agents import build_deps, review_requirement
+from search.database_searching.review_models import RequirementReview
+from search.excel_process.crt_workbook import CRTWorkbook
 
-from search.database_searching.agents import search_agent, ChatDeps
-from common.utils.logger import get_logger
+WORKBOOK_SUFFIXES = (".xlsm", ".xlsx")
 
-logger = get_logger(__name__)
-
-HEADER_ROW_INDEX = 10
-DATA_START_INDEX = 11
-REQUIREMENT_COL = "Requirement"
-RECOMMENDATION_COL = "Recommendation"
-RAG_RESPONSE_COL = "RAG Response"
-SOURCE_COL = "Source"
+# Bedrock throttles per account, and the connection pool tops out at five, so a
+# handful of requirements in flight is the sweet spot. Raise it if you have the
+# on-demand quota for it.
+DEFAULT_CONCURRENCY = 4
 
 
-class ExcelRAGProcessor:
+def default_folder():
+    # services/rag/search/excel_process/this_file -> repository root
+    return Path(__file__).resolve().parents[4] / "output_excel"
 
-    def __init__(self, excel_file_path: str):
-        self.excel_file_path = Path(excel_file_path)
-        self.df: Optional[pd.DataFrame] = None
-        self.processed_count = 0
-        self.error_count = 0
-        logger.info(f"Initialized ExcelRAGProcessor for: {self.excel_file_path}")
 
-    def load_excel(self):
+def find_workbooks(folder):
+    return sorted(path for path in folder.glob("*")
+                  if path.suffix.lower() in WORKBOOK_SUFFIXES
+                  and not path.name.startswith("~$")
+                  and ".reviewed" not in path.name)
 
-        if not self.excel_file_path.exists():
-            raise FileNotFoundError(f"Excel file not found: {self.excel_file_path}")
 
-        logger.info(f"Loading Excel file: {self.excel_file_path}")
-        self.df = pd.read_excel(
-            self.excel_file_path,
-            header=HEADER_ROW_INDEX,
-            engine="openpyxl",
-        )
-        logger.info(f"Loaded dataframe with {len(self.df)} data rows, columns: {list(self.df.columns)}")
+def saveable(path):
+    """Whether the run will be able to write `path` when it finishes.
 
-        for col in [RECOMMENDATION_COL, RAG_RESPONSE_COL, SOURCE_COL]:
-            self.df[col] = pd.Series([pd.NA] * len(self.df), dtype="object", index=self.df.index)
+    Worth knowing before the model calls rather than after. Excel keeps an
+    exclusive lock on a workbook it has open, and a full CRT is the better part of
+    an hour of Bedrock time before anything reaches the save.
+    """
+    if not path.exists():
+        return True
+    try:
+        with path.open("r+b"):
+            return True
+    except OSError:
+        return False
 
-        return self.df
 
-    async def process_requirement(self, requirement: str, retry_unclear: bool = True) -> dict:
-        try:
-            logger.info(f"Processing: {requirement[:80]}...")
+def sidecar_path(workbook_path):
+    return workbook_path.with_suffix(workbook_path.suffix + ".reviewed.jsonl")
 
-            deps = ChatDeps(acronyms={})
-            agent_response = await search_agent.run(user_prompt=requirement, deps=deps)
 
-            if hasattr(agent_response, 'output'):
-                response_text = agent_response.output
-            else:
-                response_text = str(agent_response)
+def output_path(workbook_path):
+    return workbook_path.with_name(f"{workbook_path.stem}.reviewed{workbook_path.suffix}")
 
-            logger.info(f"Agent raw output (first 200 chars): {response_text[:200]}...")
 
-            parsed = self._parse_agent_response(response_text)
-            recommendation = parsed.get('recommendation', 'UNCLEAR')
+def load_sidecar(path):
+    """Reviews from an earlier run, keyed by sheet and row."""
+    done = {}
+    if not path.exists():
+        return done
 
-            if recommendation == 'UNCLEAR' and retry_unclear:
-                logger.info("Result is UNCLEAR, retrying with more specific prompt...")
-                retry_prompt = (
-                    "Based on the available documentation, please determine if the following "
-                    "requirement is MET or NOT MET. If there is insufficient information, "
-                    "explain what specific information is missing.\n\n"
-                    f"Requirement: {requirement}\n\n"
-                    "Please provide a clear MET or NOT MET determination with specific evidence, "
-                    "or explain exactly what information is needed."
-                )
-
-                retry_response = await search_agent.run(user_prompt=retry_prompt, deps=deps)
-                if hasattr(retry_response, 'output'):
-                    retry_text = retry_response.output
-                else:
-                    retry_text = str(retry_response)
-
-                parsed = self._parse_agent_response(retry_text)
-                recommendation = parsed.get('recommendation', 'UNCLEAR')
-                logger.info(f"Retry result - Recommendation: {recommendation}")
-
-            logger.info(f"[OK] Processed successfully - Recommendation: {recommendation}")
-
-            return {
-                "recommendation": parsed.get('recommendation', 'UNCLEAR'),
-                "response": parsed.get('response', 'No response'),
-                "source": parsed.get('source', 'N/A'),
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing requirement: {str(e)}")
-            self.error_count += 1
-            return {
-                "recommendation": "ERROR",
-                "response": f"Error processing requirement: {str(e)}",
-                "source": "N/A",
-            }
-
-    def _parse_agent_response(self, response_text: str) -> dict:
-        try:
-            response_text = re.sub(r'<thinking>.*?</thinking>', '', response_text, flags=re.DOTALL)
-            response_text = response_text.strip()
-
-            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
-
-            if json_match:
-                json_str = json_match.group()
-                try:
-                    result = json.loads(json_str)
-                except json.JSONDecodeError:
-                    result = {
-                        "Response": response_text[:500],
-                        "Recommendation": "UNCLEAR",
-                        "Source": "N/A",
-                    }
-            else:
-                result = {
-                    "Response": response_text[:500],
-                    "Recommendation": "UNCLEAR",
-                    "Source": "N/A",
-                }
-
-            recommendation = result.get('Recommendation', result.get('Verdict', 'UNCLEAR'))
-            response = result.get('Response', result.get('Reasoning', response_text[:500]))
-            source = result.get('Source', 'N/A')
-            page = result.get('Page', '')
-
-            source_with_page = f"{source}: {page}" if page and page != 'N/A' else source
-
-            return {
-                "recommendation": recommendation.upper() if recommendation else 'UNCLEAR',
-                "response": response if response else 'No response provided',
-                "source": source_with_page,
-            }
-
-        except Exception as e:
-            logger.error(f"Error parsing response: {str(e)}")
-            return {
-                "recommendation": "UNCLEAR",
-                "response": response_text[:500] if response_text else "Error parsing response",
-                "source": "N/A",
-            }
-
-    async def process_all(self, max_rows: Optional[int] = None):
-        if self.df is None:
-            raise RuntimeError("Call load_excel() first")
-
-        requirement_rows = self.df[self.df[REQUIREMENT_COL].notna()].index.tolist()
-
-        if max_rows:
-            requirement_rows = requirement_rows[:max_rows]
-
-        total = len(requirement_rows)
-        logger.info(f"Processing {total} requirements...")
-
-        for i, idx in enumerate(requirement_rows):
-            requirement = str(self.df.at[idx, REQUIREMENT_COL]).strip()
-            if not requirement:
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
                 continue
+            try:
+                review = RequirementReview.model_validate_json(line)
+            except Exception as lclEx:
+                # A run killed mid-write leaves a partial last line. Skip it.
+                log.debug(f"load_sidecar() Ignoring an unreadable sidecar line: {lclEx}")
+                continue
+            done[(review.sheet, review.row)] = review
 
-            logger.info(f"\n[{i+1}/{total}] Row {idx}: {requirement[:100]}...")
-
-            result = await self.process_requirement(requirement)
-
-            self.df.at[idx, RECOMMENDATION_COL] = result['recommendation']
-            self.df.at[idx, RAG_RESPONSE_COL] = result['response']
-            self.df.at[idx, SOURCE_COL] = result['source']
-
-            self.processed_count += 1
-            logger.info(f"Row {idx} updated | Rec='{result['recommendation']}' | Total: {self.processed_count}/{total}")
-
-            if self.processed_count % 5 == 0:
-                self.save_progress()
-
-    def save_progress(self):
-        try:
-            output_file = self.excel_file_path.parent / "rag_results.xlsx"
-            self._save_to_excel(output_file)
-            logger.info(f"[SAVED] Progress saved to: {output_file}")
-        except Exception as e:
-            logger.error(f"Error saving progress: {str(e)}")
-
-    def save_final(self, output_path: Optional[Path] = None):
-        if output_path is None:
-            output_path = self.excel_file_path.parent / "rag_results.xlsx"
-
-        self._save_to_excel(output_path)
-        logger.info(f"\n{'='*80}")
-        logger.info(f"[SUCCESS] FINAL EXCEL SAVED: {output_path}")
-        logger.info(f"{'='*80}")
-        logger.info(f"Total requirements processed: {self.processed_count}")
-        logger.info(f"Errors encountered: {self.error_count}")
-
-    def _save_to_excel(self, output_path: Path):
-        header_df = pd.read_excel(
-            self.excel_file_path,
-            header=None,
-            nrows=HEADER_ROW_INDEX,
-            engine="openpyxl",
-        )
-
-        with pd.ExcelWriter(str(output_path), engine="openpyxl") as writer:
-            header_df.to_excel(writer, index=False, header=False, startrow=0)
-            self.df.to_excel(writer, index=False, startrow=HEADER_ROW_INDEX)
+    log.info(f"load_sidecar() Reusing {len(done)} requirement(s) already reviewed in {path.name}")
+    return done
 
 
-async def main():
-    print("=" * 100)
-    print("EXCEL RAG PROCESSOR (Pandas)")
-    print("Reads requirements, queries RAG agent, writes Recommendation/RAG Response/Source")
-    print("=" * 100)
-    print()
+def append_sidecar(path, review):
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(review.model_dump_json() + "\n")
 
-    data_dir = Path(__file__).parent.parent / "data"
-    excel_file = data_dir / "Summary of Specific MCGCRT Record-2026-03-27-13-12-58.xlsx"
 
-    if not excel_file.exists():
-        print(f"Excel file not found: {excel_file}")
+async def review_workbook(workbook_path, sheets=None, limit=None, concurrency=DEFAULT_CONCURRENCY,
+                          challenge=True, fresh=False, skip_answered=False, rerank=False):
+    workbook = CRTWorkbook(workbook_path)
+    pending = workbook.requirements(sheet_names=sheets, skip_answered=skip_answered)
+    if limit:
+        pending = pending[:limit]
+
+    sidecar = sidecar_path(workbook_path)
+    if fresh and sidecar.exists():
+        sidecar.unlink()
+    done = load_sidecar(sidecar)
+
+    todo = [row for row in pending if (row["sheet"], row["row"]) not in done]
+    print(f"{workbook_path.name}: {len(pending)} requirement(s), {len(done)} already reviewed, "
+          f"{len(todo)} to go")
+
+    deps = build_deps(rerank=rerank)
+    gate = asyncio.Semaphore(concurrency)
+    counter = {"finished": 0}
+
+    async def run_one(entry):
+        async with gate:
+            review = await review_requirement(
+                entry["requirement"],
+                deps=deps,
+                sheet=entry["sheet"],
+                item=entry["item"],
+                legal_cite=entry["legal_cite"],
+                row=entry["row"],
+                challenge=challenge,
+            )
+            append_sidecar(sidecar, review)
+            counter["finished"] += 1
+            print(f"  [{counter['finished']}/{len(todo)}] {entry['sheet']} {entry['item']} "
+                  f"-> {review.status}"
+                  + (f" (confidence {review.combined_confidence:.2f})"
+                     if review.combined_confidence is not None else ""))
+            return review
+
+    for review in await asyncio.gather(*(run_one(entry) for entry in todo)):
+        done[(review.sheet, review.row)] = review
+
+    reviews = [done[(row["sheet"], row["row"])] for row in pending
+               if (row["sheet"], row["row"]) in done]
+    for review in reviews:
+        workbook.write_review(review)
+    workbook.write_analysis(reviews)
+
+    saved = workbook.save(output_path(workbook_path))
+    summarise(workbook_path.name, reviews)
+    return saved, reviews
+
+
+def summarise(name, reviews):
+    counts = {}
+    for review in reviews:
+        counts[review.status] = counts.get(review.status, 0) + 1
+    errors = sum(1 for review in reviews if review.error)
+    unverified = sum(1 for review in reviews if review.evidence and not review.quotes_verified)
+
+    print(f"\n{name}: {len(reviews)} reviewed at {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+    for status in ("MET", "NOT MET", "UNCLEAR"):
+        if counts.get(status):
+            print(f"  {status:<8} {counts[status]}")
+    if unverified:
+        print(f"  {unverified} row(s) cite a quote that could not be matched back to the retrieved text")
+    if errors:
+        print(f"  {errors} row(s) failed and are marked in the General Comments column")
+
+
+async def run(args):
+    folder = Path(args.folder) if args.folder else default_folder()
+    if not folder.is_dir():
+        print(f"Folder not found: {folder}")
         return 1
 
-    print(f"[OK] Excel file: {excel_file.name}")
-    print()
+    workbooks = find_workbooks(folder)
+    if not workbooks:
+        print(f"No .xlsm or .xlsx workbooks in {folder}")
+        return 1
 
-    processor = ExcelRAGProcessor(str(excel_file))
-    processor.load_excel()
+    locked = [output_path(path) for path in workbooks if not saveable(output_path(path))]
+    if locked:
+        print("Close these in Excel first, otherwise the run cannot save its findings:")
+        for path in locked:
+            print(f"  {path}")
+        return 1
 
-    print(f"Requirements to process: {processor.df[REQUIREMENT_COL].notna().sum()}")
-    print("This may take several minutes...")
-    print()
-
-    await processor.process_all(max_rows=None)
-
-    processor.save_final()
-
-    print("\n" + "=" * 100)
-    print("PROCESSING COMPLETE")
-    print("=" * 100)
-    print(f"Processed: {processor.processed_count} | Errors: {processor.error_count}")
-    print("Results written to columns: Recommendation, RAG Response, Source")
-    print(f"Output file: {processor.excel_file_path.parent / 'rag_results.xlsx'}")
-    print()
+    print(f"Reviewing {len(workbooks)} workbook(s) in {folder}\n")
+    try:
+        for workbook_path in workbooks:
+            saved, _ = await review_workbook(
+                workbook_path,
+                sheets=args.sheet or None,
+                limit=args.limit,
+                concurrency=args.concurrency,
+                challenge=not args.no_challenge,
+                fresh=args.fresh,
+                skip_answered=args.skip_answered,
+                rerank=args.rerank,
+            )
+            print(f"  written to {saved}\n")
+    finally:
+        await close_db()
 
     return 0
 
 
+def main():
+    # CRT item ids carry the odd en dash ("I.E.1.07-08"). A console that cannot
+    # encode one makes print() raise, which would take a two-hour run down with it,
+    # so the progress lines degrade instead.
+    sys.stdout.reconfigure(errors="replace")
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--folder", help="Folder holding the workbooks (default: output_excel/)")
+    parser.add_argument("--sheet", action="append",
+                        help="Only this sheet, repeatable. Default is all requirement sheets.")
+    parser.add_argument("--limit", type=int, help="Stop after this many requirements, for a smoke test")
+    parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                        help=f"Requirements in flight at once (default {DEFAULT_CONCURRENCY})")
+    parser.add_argument("--no-challenge", action="store_true",
+                        help="Skip the challenger and adjudicator, one pass only")
+    parser.add_argument("--skip-answered", action="store_true",
+                        help="Leave rows that already have a Status alone")
+    parser.add_argument("--fresh", action="store_true", help="Discard the sidecar and review everything again")
+    parser.add_argument("--rerank", action="store_true",
+                        help="Add the Cohere rerank pass over the hybrid shortlist (off by default)")
+    args = parser.parse_args()
+
+    return asyncio.run(run(args))
+
+
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    sys.exit(main())

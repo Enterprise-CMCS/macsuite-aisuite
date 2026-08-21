@@ -1,13 +1,31 @@
 import os
-import json 
+import json
 import itertools
+import re
 import boto3
 import datetime
 
 from data_preprocessing.bedrock.bda_results import BDAResults
+from data_preprocessing.parsing.parsed_toc import contents_pages
 from common.utils.settings import aws_client,aws_session
 from common.utils.helper import Helper
 from common.utils.logger import log
+
+
+SKIP_SUBTYPES = {"PAGE_NUMBER", "FOOTER", "HEADER"}
+
+MIN_CONTENT_CHARS = 3
+
+
+def element_page(element):
+
+    page_indices = element.get("page_indices") or []
+    if page_indices and page_indices[0] is not None:
+        return page_indices[0]
+    locations = element.get("locations") or []
+    if locations:
+        return locations[0].get("page_index")
+    return None
 
 
 def parsed_text_info(source_data):
@@ -35,22 +53,44 @@ def parsed_text_info(source_data):
     final_docs = [summary_doc]
     
 
+    toc_pages = contents_pages(source_data)
+
     texts = []
+    skipped_furniture = 0
+    skipped_contents = 0
+    skipped_empty = 0
     for element in source_data.get("elements", []):
         if element.get("type") == "TEXT":
+            sub_type = element.get("sub_type") or "PARAGRAPH"
+            if sub_type in SKIP_SUBTYPES:
+                skipped_furniture += 1
+                continue
+
+            page = element_page(element)
+            if page in toc_pages:
+                skipped_contents += 1
+                continue
+
             text_content = element.get("representation", {}).get("markdown", "").strip()
-            
+
             if not text_content or text_content == '[ ]':
+                continue
+            if len(re.sub(r"[^0-9A-Za-z]+", "", text_content)) < MIN_CONTENT_CHARS:
+                skipped_empty += 1
                 continue
             texts.append({
                 "text": text_content,
-                "page": element.get("page_indices", [None])[0],
-                "element_type": "TEXT", 
-                "subtype": "paragraph",
+                "page": page,
+                "element_type": "TEXT",
+                "subtype": sub_type.lower(),
             })
 
+    log.info(f"parsed_text_info() Kept {len(texts)} text element(s), skipped {skipped_furniture} "
+             f"page-furniture, {skipped_contents} printed-contents element(s) on pages "
+             f"{sorted(toc_pages)}, and {skipped_empty} with no retrievable content")
+
     for idx, elem in enumerate(texts):
-        paragraph_id = f"{doc_id}::p{elem['page'] or 0}"
+        paragraph_id = f"{doc_id}::p{elem['page'] or 0}::e{idx}"
         final_docs.append({
             "doc_id": paragraph_id,
             "text": elem['text'],
