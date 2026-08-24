@@ -59,6 +59,7 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
   (environmentName) => {
     it("creates exactly four private S3 buckets", () => {
       const template = synthesize(environmentName);
+      const config = getDeploymentConfig(environmentName);
 
       template.resourceCountIs("AWS::S3::Bucket", 4);
       template.allResourcesProperties("AWS::S3::Bucket", {
@@ -67,6 +68,10 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
           BlockPublicPolicy: true,
           IgnorePublicAcls: true,
           RestrictPublicBuckets: true,
+        },
+        LoggingConfiguration: {
+          DestinationBucketName: config.accessLogsBucketName,
+          LogFilePrefix: Match.anyValue(),
         },
       });
     });

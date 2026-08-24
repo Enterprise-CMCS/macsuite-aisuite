@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   AWS_ACCOUNT_IDS,
+  DEFAULT_REGION,
+  DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN,
   DEPLOYMENT_ENVIRONMENT_NAMES,
   DEPLOYMENT_ENVIRONMENT_VPC_NAME,
   DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID,
@@ -67,6 +69,27 @@ describe("deployment config", () => {
     expect(getDeploymentConfig("qa").vpnSecurityGroupId).toBeUndefined();
     expect(getDeploymentConfig("uat").vpnSecurityGroupId).toBeUndefined();
     expect(getDeploymentConfig("prod").vpnSecurityGroupId).toBeUndefined();
+  });
+
+  it("maps ALB certificate ARNs only where configured", () => {
+    expect(DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN.dev).toMatch(
+      /^arn:aws:acm:/,
+    );
+    expect(getDeploymentConfig("dev").albCertificateArn).toBe(
+      DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN.dev,
+    );
+    expect(getDeploymentConfig("qa").albCertificateArn).toBeUndefined();
+    expect(getDeploymentConfig("uat").albCertificateArn).toBeUndefined();
+    expect(getDeploymentConfig("prod").albCertificateArn).toBeUndefined();
+  });
+
+  it("names the central access-logs bucket per account and region", () => {
+    for (const environmentName of DEPLOYMENT_ENVIRONMENT_NAMES) {
+      const config = getDeploymentConfig(environmentName);
+      expect(config.accessLogsBucketName).toBe(
+        `cms-cloud-${config.awsEnvironment.account}-${DEFAULT_REGION}-access-logs`,
+      );
+    }
   });
 
   it("covers every declared deployment environment name", () => {
