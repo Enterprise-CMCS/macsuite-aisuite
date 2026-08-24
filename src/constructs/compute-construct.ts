@@ -197,7 +197,8 @@ export class ComputeConstruct extends Construct {
         props.deploymentConfig.accessLogsBucketName,
       );
       // Use a prefix based on the ALB/service name so logs are organized per ALB.
-      this.loadBalancer.logAccessLogs(accessLogsBucket, `${serviceName}/`);
+      // Prefix must not start or end with '/'. Use `ALB-Access-Logs/<serviceName>`.
+      this.loadBalancer.logAccessLogs(accessLogsBucket, `ALB-Access-Logs/${serviceName}`);
     } catch {
       // Best-effort: if the method or bucket doesn't resolve during synth, continue.
     }
