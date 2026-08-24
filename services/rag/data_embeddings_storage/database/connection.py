@@ -1,9 +1,11 @@
+import asyncio
 import asyncpg
 from pgvector.asyncpg import register_vector
 from common.utils.settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
 from data_embeddings_storage.database.embeddings_schema import SEARCH_PATH_SQL
 
 postgres_pool = None
+_pool_lock = asyncio.Lock()
 
 
 async def register_vector_init(conn):
@@ -16,19 +18,20 @@ async def register_vector_init(conn):
 
 async def initialization_db():
     global postgres_pool
-    if postgres_pool is None:
-        postgres_pool = await asyncpg.create_pool(
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_NAME,
-            host=DB_HOST,
-            port=DB_PORT,
-            min_size=1,
-            max_size=5,
-            init=register_vector_init,
-            ssl="require",
-        )
-    print("Database connection pool initialized.")
+    async with _pool_lock:
+        if postgres_pool is None:
+            postgres_pool = await asyncpg.create_pool(
+                user=DB_USER,
+                password=DB_PASSWORD,
+                database=DB_NAME,
+                host=DB_HOST,
+                port=DB_PORT,
+                min_size=1,
+                max_size=5,
+                init=register_vector_init,
+                ssl="require",
+            )
+            print("Database connection pool initialized.")
 
     return postgres_pool
 
@@ -56,7 +59,8 @@ async def release_connection(connection):
 
 async def close_db():
     global postgres_pool
-    if postgres_pool is not None:
-        await postgres_pool.close()
-        postgres_pool = None
-        print("Database connection pool closed.")
+    async with _pool_lock:
+        if postgres_pool is not None:
+            await postgres_pool.close()
+            postgres_pool = None
+            print("Database connection pool closed.")
