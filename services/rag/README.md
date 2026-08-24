@@ -170,7 +170,19 @@ Comments — the column exists so a reviewer can turn to the pages, and citation
 order is no help for that. File order rather than alphabetical, because
 roman-numeral front matter and the body's own numbering do not sort together as
 text. Where Found keeps citation order, because it pairs line for line with the
-quotes underneath it.
+quotes underneath it. Each quote is headed with the document name as well as the
+page, so a reviewer knows which file to open before turning to the page.
+
+Chunk ids are never sent to the model. It used to be given them to cite with and
+wrote them into its prose — "the contract text in chunk 3566 states" — which
+means nothing to a reviewer reading the spreadsheet. `format_evidence()` in
+`search/database_searching/agents.py` heads each passage with the page and
+document only, so the model has nothing else to cite by, and `quoted_chunk()`
+matches the quote it returns back to the passage it came from. That match is also
+what `verified` means: the wording really is in the contract rather than
+something the model composed. Reviews recorded before this change still carry
+ids in their prose, so `in_reviewer_terms()` swaps them for the pages they came
+from as the workbook is written.
 
 ## Running the service
 

@@ -51,7 +51,7 @@ search results contain, and federal regulations you happen to know do not tell y
 says.
 
 Method:
-1. Read the retrieved chunks you were given against the exact wording of the requirement.
+1. Read the retrieved contract text you were given against the exact wording of the requirement.
 2. If they do not cover the requirement, call search_contract with the language the contract itself \
 would use - the defined term, the statutory cite, the section name - rather than repeating the \
 requirement verbatim. A requirement about "provider directory update frequency" is more likely to be \
@@ -68,10 +68,12 @@ nothing relevant. UNCLEAR is the honest answer far more often than reviewers lik
 damaging than a wrong MET.
 
 Rules:
-- Every quote must be copied verbatim from a chunk and carry that chunk's id. Do not stitch wording \
-from two chunks into one quote.
+- Every quote must be copied verbatim from the retrieved text. Do not stitch wording from two passages \
+into one quote. The quote is how the passage is identified, so copy it exactly.
 - Cite the operative provision, not a heading, table of contents line, glossary definition, or form.
 - argument explains how the quoted wording satisfies or fails the requirement, in the reviewer's terms.
+- A reviewer reads argument, missing_information and follow_up in a spreadsheet, so refer to the \
+contract by the page or section name shown above each passage.
 - For NOT MET and UNCLEAR, missing_information names the specific provision or language that would \
 settle the question.
 - confidence is calibrated: 0.9+ means the quoted text is unambiguous, around 0.5 means it is arguable, \
@@ -80,8 +82,8 @@ below 0.3 means you are reviewing on evidence too thin to rely on."""
 QUESTION_PROMPT = """You answer questions about a state's Medicaid managed care contract from retrieved \
 contract text only.
 
-Always call search_contract before answering. Ground every claim in the retrieved chunks and quote the \
-contract wording that supports it. Cite the document and page number shown in each chunk's header so the \
+Always call search_contract before answering. Ground every claim in the retrieved text and quote the \
+contract wording that supports it. Cite the document and page number shown above each passage so the \
 reader can find it in the document.
 
 If the retrieved text does not answer the question, say what is missing instead of filling the gap. Do \
@@ -134,6 +136,13 @@ def chunk_provenance(chunk):
 
 
 def format_evidence(chunks):
+    """The retrieved text, each passage headed with where it came from.
+
+    Only the page and the document, never the chunk id. The model used to be given
+    the id to cite with and wrote it into its prose - "the contract text in chunk
+    3566 states" - which means nothing to the reviewer reading the spreadsheet.
+    A quote is enough to find the passage again, so the id is not sent at all.
+    """
     if not chunks:
         return "No contract text was retrieved for this requirement."
 
@@ -141,10 +150,7 @@ def format_evidence(chunks):
     for chunk in chunks:
         where = chunk_provenance(chunk)
 
-        header = [f"[chunk {chunk.get('id')}]"]
-        label = page_label(where["page"], where["printed_page"])
-        if label:
-            header.append(label)
+        header = [page_label(where["page"], where["printed_page"]) or "page not recorded"]
         if where["doc_id"]:
             header.append(f"document: {where['doc_id']}")
 
@@ -183,20 +189,33 @@ def quote_supported(quote, chunk_text):
     return True
 
 
+def quoted_chunk(deps, quote):
+    """The retrieved chunk this quote was copied from, or None if it was not.
+
+    The model is not given chunk ids, so the quote is what ties its evidence back
+    to a passage. Finding it here doubles as the check that the wording is really
+    in the contract rather than something the model composed.
+    """
+    for chunk in deps.chunks.values():
+        if quote_supported(quote, chunk.get("text")):
+            return chunk
+    return None
+
+
 def evidence_records(deps, cited):
     records = []
     for item in cited:
-        chunk = deps.chunks.get(item.chunk_id)
+        quote = item.quote.strip()
+        chunk = quoted_chunk(deps, quote)
         if chunk is None:
-            records.append(EvidenceRecord(quote=item.quote, chunk_id=item.chunk_id, verified=False))
+            records.append(EvidenceRecord(quote=quote, verified=False))
             continue
-        where = chunk_provenance(chunk)
         records.append(EvidenceRecord(
-            quote=item.quote.strip(),
-            chunk_id=item.chunk_id,
+            quote=quote,
+            chunk_id=chunk.get("id"),
             retrieval_confidence=chunk.get("retrieval_confidence"),
-            verified=quote_supported(item.quote, chunk.get("text")),
-            **where,
+            verified=True,
+            **chunk_provenance(chunk),
         ))
     return records
 
@@ -216,8 +235,8 @@ async def search_contract(context: RunContext[ContractDeps], query: str) -> str:
         query: Wording the contract itself would use - a defined term, a statutory
             cite, a section name, or the operative phrase you expect to find.
 
-    Returns the matching chunks, each headed with its id, page number, and source
-    document. Cite chunks by the id in the header.
+    Returns the matching passages, each headed with its page number and source
+    document. Quote a passage verbatim to cite it.
     """
     deps = context.deps
     results = await retrieve(deps, query)
@@ -243,7 +262,7 @@ async def charge_search_budget(context: RunContext[ContractDeps], *, call: ToolC
                   f"the limit is {deps.max_searches}")
         raise ToolFailed(
             f"Search budget for this requirement is used up after {deps.max_searches} searches. "
-            "Decide from the chunks you already have, and return UNCLEAR if they do not settle it.")
+            "Decide from the text you already have, and return UNCLEAR if it does not settle it.")
 
     deps.searches += 1
     return args
@@ -284,12 +303,9 @@ question_agent = Agent(
 
 @analyst_agent.output_validator
 def check_citations(context: RunContext[ContractDeps], assessment: RequirementAssessment):
-    unknown = [item.chunk_id for item in assessment.evidence if item.chunk_id not in context.deps.chunks]
-    if unknown:
-        available = ", ".join(str(chunk_id) for chunk_id in sorted(context.deps.chunks))
-        raise ModelRetry(
-            f"Chunk ids {unknown} were not in the search results. Cite only these ids: {available}.")
-
+    # A quote that cannot be found in the retrieved text is not retried, it is
+    # recorded unverified, so the reviewer sees the row was flagged rather than
+    # losing the review to a failed retry.
     if assessment.status == "MET" and not assessment.evidence:
         raise ModelRetry("MET needs at least one quote from the retrieved text. Quote it or return UNCLEAR.")
 
@@ -332,7 +348,7 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
 
         if challenge:
             pool = format_evidence(list(deps.chunks.values()))
-            unverified = [record.chunk_id for record in review.evidence if not record.verified]
+            unverified = [record.quote for record in review.evidence if not record.verified]
 
             objection = (await challenger_agent.run(
                 challenge_prompt(requirement, pool, assessment), usage=run_usage)).output

@@ -7,7 +7,7 @@ CHALLENGER_PROMPT = """You are the second reviewer on a CMS Medicaid managed car
 Another reviewer has already assessed a requirement against retrieved contract text. Your job is to \
 argue the opposing case as forcefully as the evidence honestly allows.
 
-Work only from the retrieved chunks you are given. You cannot search for more.
+Work only from the retrieved contract text you are given. You cannot search for more.
 
 Attack the assessment on these grounds, in order of how often they turn out to be the real problem:
 1. Scope. The quoted language covers something narrower or broader than the requirement asks for - a \
@@ -15,7 +15,7 @@ different population, service, timeframe, or party.
 2. Strength. The requirement demands the contract "shall" do something and the quote only permits, \
 encourages, or describes it.
 3. Completeness. The requirement has several conditions and the retrieved text satisfies only some of \
-them. Read the chunks together before raising this - conditions spread across two provisions are still \
+them. Read the passages together before raising this - conditions spread across two provisions are still \
 satisfied, and a requirement met in different words is still met.
 4. Provenance. The quote comes from a heading, a table of contents entry, a form, or a glossary \
 definition rather than an operative provision.
@@ -24,9 +24,9 @@ definition rather than an operative provision.
 Rules:
 - Do not manufacture objections. If the evidence genuinely establishes the requirement, say so by \
 returning the same status and a low confidence, and explain what makes it airtight.
-- Never claim the contract says something that is not in the retrieved chunks.
-- Quoting a chunk id in misread_evidence means the quote does not support what the reviewer drew from \
-it. Be specific in counter_argument about which words were stretched.
+- Never claim the contract says something that is not in the retrieved text.
+- misread_evidence holds the exact words the reviewer stretched, copied from their quotes. Be specific \
+in counter_argument about what those words do and do not say.
 - Absence of evidence is NOT MET only when the requirement is about what the contract must contain and \
 the retrieval clearly covered the relevant section. Otherwise it is UNCLEAR.
 - confidence is how strong your opposing case is, not how sure you are of your own cleverness. If the \
@@ -54,6 +54,9 @@ only when the obligation itself is missing, not when the contract imposes it in 
 requirement written as one long sentence is routinely met by two or three separate provisions.
 - argument must explain why this status is correct and must answer the challenge directly rather than \
 ignoring it. If the challenge was right, say so.
+- argument, counter_argument and follow_up land in a spreadsheet read by someone who never sees the \
+chunk ids, so refer to the contract by page or section name. Not "chunk 3566 establishes", but "the \
+contract establishes".
 - counter_argument must preserve the strongest surviving case against your status, in the challenger's \
 own terms. Never leave it empty - if the call really is beyond dispute, say what would have to be true \
 for it to be wrong.
@@ -87,7 +90,7 @@ adjudicator_agent = Agent(
 
 def challenge_prompt(requirement, evidence_block, assessment):
     quotes = "\n".join(
-        f"  - [chunk {item.chunk_id}] \"{item.quote}\"" for item in assessment.evidence
+        f"  - \"{item.quote}\"" for item in assessment.evidence
     ) or "  - (the first reviewer cited nothing)"
 
     return (
@@ -106,8 +109,9 @@ def adjudication_prompt(requirement, evidence_block, assessment, challenge, unve
     notes = ""
     if unverified:
         notes = (
-            "\nQuote check: these quotes could not be found in the chunks they were attributed to, so "
-            f"treat them as unsupported - {', '.join(str(chunk_id) for chunk_id in unverified)}.\n"
+            "\nQuote check: these quotes could not be found anywhere in the retrieved text, so treat "
+            "them as unsupported:\n"
+            + "\n".join(f"  - \"{quote}\"" for quote in unverified) + "\n"
         )
 
     return (
@@ -120,7 +124,7 @@ def adjudication_prompt(requirement, evidence_block, assessment, challenge, unve
         f"Challenger said {challenge.counter_status}:\n"
         f"{challenge.counter_argument}\n"
         f"Evidence gaps they raised: {'; '.join(challenge.evidence_gaps) or '(none)'}\n"
-        f"Quotes they say were misread: "
-        f"{', '.join(str(chunk_id) for chunk_id in challenge.misread_evidence) or '(none)'}\n\n"
+        f"Wording they say was misread: "
+        f"{'; '.join(challenge.misread_evidence) or '(none)'}\n\n"
         "Settle it."
     )

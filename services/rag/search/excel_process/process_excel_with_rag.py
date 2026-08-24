@@ -133,7 +133,10 @@ def fit_quotes(records, budget, elsewhere):
 def _quote_lines(records):
     lines = []
     for record in records:
-        location = page_label(record.page, record.printed_page) or record.doc_id
+        # The file name as well as the page, so a reviewer knows which document to
+        # open before turning to the page.
+        location = ", ".join(part for part in (record.doc_id,
+                                               page_label(record.page, record.printed_page)) if part)
         flag = "" if record.verified else " [unverified]"
         lines.append(f"{location}{flag}\n\"{_squeeze(record.quote)}\"".strip())
     return "\n\n".join(lines)
@@ -210,7 +213,7 @@ class CRTWorkbook:
         options = self.status_options(sheet, row)
         wording = match_status(review.status, options)
 
-        follow_up = review.follow_up or review.missing_information
+        follow_up = review.in_reviewer_terms(review.follow_up or review.missing_information)
         if wording is None:
             follow_up = follow_up or "Automated review could not determine this from the contract text."
             log.debug(f"write_review() {review.sheet} row {row}: {review.status} has no matching option "
@@ -228,7 +231,7 @@ class CRTWorkbook:
         if review.error:
             parts.append(f"Automated review failed: {_summarise_error(review.error)}")
         if review.argument:
-            parts.append(f"AI response: {review.argument}")
+            parts.append(f"AI response: {review.in_reviewer_terms(review.argument)}")
 
         pages = review.page_numbers()
         if pages:
@@ -245,7 +248,7 @@ class CRTWorkbook:
             parts.append("Note: at least one quote could not be matched back to the retrieved text.")
         elif not review.evidence and not review.error:
             parts.append("Note: no contract text was quoted for this status. The confidence above "
-                         "comes from the chunks retrieval returned, not from a cited provision.")
+                         "comes from the passages the search returned, not from a cited provision.")
 
         comment = "\n\n".join(parts)
         quotes = self._quote_block(review, len(comment) + 2)
@@ -285,8 +288,9 @@ class CRTWorkbook:
 
             sheet.append([
                 review.sheet, review.row, review.item, review.legal_cite, _clip(review.requirement),
-                review.status, _clip(review.argument),
-                _clip(review.follow_up), _clip(review.missing_information),
+                review.status, _clip(review.in_reviewer_terms(review.argument)),
+                _clip(review.in_reviewer_terms(review.follow_up)),
+                _clip(review.in_reviewer_terms(review.missing_information)),
                 _clip(review.where_found()), review.page_numbers(),
                 review.llm_confidence, review.retrieval_confidence, review.combined_confidence,
                 quotes_verified,
