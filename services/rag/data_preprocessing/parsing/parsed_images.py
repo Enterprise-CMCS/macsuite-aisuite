@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from botocore.config import Config
 
 from data_preprocessing.bedrock.bda_results import BDAResults
+from data_preprocessing.parsing.parsed_text_data import element_page, printed_page_map
 from common.utils.helper import Helper
 from common.utils.logger import log
 from common.utils.settings import aws_client, aws_session
@@ -143,7 +144,7 @@ def invoke_image_analysis_batch(image_strings):
     return asyncio.run(run_batch())
 
 
-def image_text_organization(data, elements, image_analysis_text, source_key,  doc_id):
+def image_text_organization(data, elements, image_analysis_text, source_key,  doc_id, printed_pages=None):
     log.debug("***************** Parsed_Images.image_text_organization start *****************************")
     log.debug(f"Passed (Decoded)image_analysis_text =  {image_analysis_text}".encode('cp1252', errors='ignore').decode('cp1252'))
     log.debug(f"Passed (Decoded) source_key= {source_key}.encode('cp1252', errors='ignore').decode('cp1252')")
@@ -155,7 +156,7 @@ def image_text_organization(data, elements, image_analysis_text, source_key,  do
     else:
         content = f"## Summary\n{summary}\n## Content\n\n{content_markdown}"
 
-    page_number = elements.get("locations",[])[0].get("page_index")
+    page_number = element_page(elements)
     element_id=elements.get("id")
     image_location = elements.get("crop_images",[None])[0]
     log.debug(f"image_location={image_location}")
@@ -169,6 +170,7 @@ def image_text_organization(data, elements, image_analysis_text, source_key,  do
         "metadata":{
             "doc_name":doc_id,
             "page":page_number,
+            "printed_page": (printed_pages or {}).get(page_number, ""),
             "element_type": "IMAGE",
             "sub_type": image_type,
         }
@@ -187,6 +189,8 @@ def parsed_image_info(source_data):
     log.debug(f"s3_akey from data. source_key={source_key}")
     doc_id = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     log.debug(f"Getting doc_id={doc_id}")
+
+    printed_pages = printed_page_map(source_data.get("elements"))
 
     for elements in source_data.get("elements"):
         element_type = elements.get("type")
@@ -213,7 +217,7 @@ def parsed_image_info(source_data):
                 continue
 
             image_analysis_text = ''
-            other_subtype_document = image_text_organization(source_data,elements,image_analysis_text,source_key,doc_id)
+            other_subtype_document = image_text_organization(source_data,elements,image_analysis_text,source_key,doc_id,printed_pages)
             total_images_analysed = total_images_analysed + 1
             image_data += [other_subtype_document]
 
@@ -223,7 +227,7 @@ def parsed_image_info(source_data):
         image_analysis_texts = image_batch_processing(image_strings)
 
         for (record_index, elements, str_encoded), image_analysis_text in zip(pending_analysis_items, image_analysis_texts):
-            image_data_temp = image_text_organization(source_data, elements, image_analysis_text, source_key, doc_id)
+            image_data_temp = image_text_organization(source_data, elements, image_analysis_text, source_key, doc_id, printed_pages)
             image_data[record_index] = image_data_temp
             total_images_analysed = total_images_analysed + 1
 

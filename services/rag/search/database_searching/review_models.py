@@ -5,8 +5,17 @@ from pydantic import BaseModel, Field
 Status = Literal["MET", "NOT MET", "UNCLEAR"]
 
 
-def page_label(page):
-    return f"page {page + 1}" if page is not None else ""
+def page_number(page, printed_page=""):
+    """The number printed on the page, falling back to its position in the file."""
+    printed_page = (printed_page or "").strip()
+    if printed_page:
+        return printed_page
+    return str(page + 1) if page is not None else ""
+
+
+def page_label(page, printed_page=""):
+    number = page_number(page, printed_page)
+    return f"page {number}" if number else ""
 
 
 def simplify_doc_id(doc_id):
@@ -65,6 +74,7 @@ class EvidenceRecord(BaseModel):
     chunk_id: Optional[int] = None
     doc_id: str = ""
     page: Optional[int] = None
+    printed_page: str = ""
     retrieval_confidence: Optional[float] = None
     verified: bool = False
 
@@ -97,7 +107,7 @@ class RequirementReview(BaseModel):
         documents = {simplify_doc_id(record.doc_id) for record in self.evidence if record.doc_id}
         seen = []
         for record in self.evidence:
-            pointer = page_label(record.page)
+            pointer = page_label(record.page, record.printed_page)
             if len(documents) > 1 and record.doc_id:
                 pointer = f"{pointer} - {record.doc_id}" if pointer else record.doc_id
             pointer = pointer or record.doc_id
@@ -106,5 +116,11 @@ class RequirementReview(BaseModel):
         return " | ".join(seen)
 
     def page_numbers(self):
-        pages = {record.page + 1 for record in self.evidence if record.page is not None}
-        return ", ".join(str(page) for page in sorted(pages))
+        # Ordered by position in the file, because roman-numeral front matter and
+        # the body's own numbering do not sort together as text.
+        ordered = {}
+        for record in self.evidence:
+            number = page_number(record.page, record.printed_page)
+            if number:
+                ordered.setdefault(number, record.page if record.page is not None else 0)
+        return ", ".join(sorted(ordered, key=lambda number: ordered[number]))

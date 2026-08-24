@@ -128,29 +128,49 @@ come back with a contents row — a section title against a page label — inste
 the provision it was asking about. The analyst prompt tells the model not to cite
 one.
 
-Page numbers come from `page_indices` where BDA gives one and from
-`locations[].page_index` where it does not, because a couple of hundred elements
-only carry the latter and would otherwise land with no page — and a chunk with no
-page cannot be cited.
+A chunk's position in the file comes from `page_indices` where BDA gives one and
+from `locations[].page_index` where it does not, because a couple of hundred
+elements only carry the latter and would otherwise land with no page — and a
+chunk with no page cannot be cited.
+
+### Page numbers
+
+On a document with front matter, position in the file is not the number printed
+on the page: this contract opens with 21 roman-numeral pages and then restarts at
+1, so every citation in the body was 21 pages out from what the reviewer sees.
+`printed_page_map()` in `parsed_text_data.py` reads the printed number instead —
+BDA files it as a `PAGE_NUMBER` element, and on the odd page in the footer or
+header, so those are read too but only after every `PAGE_NUMBER` has had its say.
+Away from a `PAGE_NUMBER` element the text has to say what it is (`Page 12`), or
+the `I` in the `RFP Boilerplate I 07012019` footer would read as page one.
+
+`settle_page_numbers()` then fills the pages BDA read no number on and corrects
+the ones it misread. Printed numbers run one to a page, so the step between a
+page's position in the file and the number printed on it holds steady for as long
+as the numbering does; where the numbered pages either side of a page agree on
+that step, the page between them has to follow it. Where they disagree the page
+is left as BDA read it, so the restart from `xxi` to `1` survives. On this
+contract that lands all 204 pages: `i` to `xxi`, then `1` to `183`.
+
+The number rides through pre-processing and embedding as the `printed_page`
+metadata key, so it only reaches citations for documents ingested after this
+change — older rows carry no `printed_page` and fall back to file position.
 
 ### Citations
 
-Chunk metadata carries `doc_id` and BDA's zero-based page index, and that is all
-a citation is built from. `page_label()` in
-`search/database_searching/review_models.py` steps the index forward by one and
-renders it as `page 150` — the PDF's own page number, what a reviewer types into
-the page box. That is what the model sees in each chunk header and what lands in
-Where Found and in the quotes on the RAG Analysis sheet. `page_numbers()` on
-`RequirementReview` returns the same numbers bare and sorted, for the **Page
-number** column and the `Page number:` line in General Comments — the column
-exists so a reviewer can turn to the pages, and citation order is no help for
-that. Where Found keeps citation order, because it pairs line for line with the
+Chunk metadata carries `doc_id`, the zero-based page index, and `printed_page`,
+and that is all a citation is built from. `page_label()` in
+`search/database_searching/review_models.py` renders the printed number as
+`page 85`, falling back to the index stepped forward by one where there is none.
+That is what the model sees in each chunk header and what lands in Where Found
+and in the quotes on the RAG Analysis sheet. `page_numbers()` on
+`RequirementReview` returns the same numbers bare, ordered by position in the
+file, for the **Page number** column and the `Page number:` line in General
+Comments — the column exists so a reviewer can turn to the pages, and citation
+order is no help for that. File order rather than alphabetical, because
+roman-numeral front matter and the body's own numbering do not sort together as
+text. Where Found keeps citation order, because it pairs line for line with the
 quotes underneath it.
-
-On a document with front matter the PDF page number is not the number printed on
-the page — the printed numbering restarts after the roman-numeral pages. Nothing
-in the pipeline reads printed page numbers, so a citation always means position in
-the file.
 
 ## Running the service
 

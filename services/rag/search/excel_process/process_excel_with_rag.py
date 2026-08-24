@@ -133,7 +133,7 @@ def fit_quotes(records, budget, elsewhere):
 def _quote_lines(records):
     lines = []
     for record in records:
-        location = page_label(record.page) or record.doc_id
+        location = page_label(record.page, record.printed_page) or record.doc_id
         flag = "" if record.verified else " [unverified]"
         lines.append(f"{location}{flag}\n\"{_squeeze(record.quote)}\"".strip())
     return "\n\n".join(lines)

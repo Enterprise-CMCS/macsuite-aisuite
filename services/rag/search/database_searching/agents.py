@@ -129,6 +129,7 @@ def chunk_provenance(chunk):
     return {
         "doc_id": metadata.get("doc_id") or metadata.get("doc_name") or "",
         "page": metadata.get("page"),
+        "printed_page": (metadata.get("printed_page") or "").strip(),
     }
 
 
@@ -141,8 +142,9 @@ def format_evidence(chunks):
         where = chunk_provenance(chunk)
 
         header = [f"[chunk {chunk.get('id')}]"]
-        if where["page"] is not None:
-            header.append(page_label(where["page"]))
+        label = page_label(where["page"], where["printed_page"])
+        if label:
+            header.append(label)
         if where["doc_id"]:
             header.append(f"document: {where['doc_id']}")
 
