@@ -8,6 +8,9 @@ Status = Literal["MET", "NOT MET", "UNCLEAR"]
 def page_number(page, printed_page=""):
     """The number printed on the page, falling back to its position in the file."""
     printed_page = (printed_page or "").strip()
+    if printed_page.lower().startswith("page"):
+        printed_page = printed_page[4:].strip()
+
     if printed_page:
         return printed_page
     return str(page + 1) if page is not None else ""
