@@ -4,35 +4,43 @@ from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from typing import Dict
 
-from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext, ToolDefinition, ToolFailed
+from pydantic_ai.capabilities import ValidatedToolArgs
+from pydantic_ai.capabilities.hooks import Hooks
+from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from common.utils.helper import Helper
 from common.utils.logger import log
-from search.database_searching.model_provider import REVIEW_MODEL_SETTINGS, bedrock_model, model_id
-from search.database_searching.review_agents import (adjudication_prompt,adjudicator_agent,challenge_prompt,challenger_agent,)
-from search.database_searching.review_models import (EvidenceRecord,RequirementAssessment,RequirementReview,)
+from search.database_searching.model_provider import (
+    REVIEW_MODEL_SETTINGS,
+    bedrock_hooks,
+    bedrock_model,
+    model_id,
+)
+from search.database_searching.review_agents import (
+    adjudication_prompt,
+    adjudicator_agent,
+    challenge_prompt,
+    challenger_agent,
+)
+from search.database_searching.review_models import (
+    EvidenceRecord,
+    RequirementAssessment,
+    RequirementReview,
+    page_label,
+)
 from search.database_searching.search import SearchEngine
-from search.database_searching.toc_index import TableOfContents, load_table_of_contents
 
-# Chunks are ~1k characters, so eight of them is a comfortable reading window for
-# one requirement without burying the model in near-duplicates.
 TOP_K = 8
 CANDIDATE_LIMIT = 40
 
-# The analyst gets a couple of follow-up searches for requirements that name a
-# provision it has to go and find. More than that and it is usually rephrasing.
 MAX_SEARCHES = 3
 
 MAX_CHUNK_CHARS = 1800
 
-# A quote has to reproduce this much of itself inside the chunk it was attributed
-# to. Below one, because models normalise punctuation and whitespace when quoting.
 QUOTE_MATCH_RATIO = 0.85
 
-# Matching runs shorter than this are thrown away before the ratio is worked out.
-# Without a floor, a fabricated sentence scores well on nothing but "the", "of"
-# and "must" turning up somewhere in the chunk.
 QUOTE_MATCH_MIN_RUN = 8
 
 ANALYST_PROMPT = """You are a CMS reviewer checking whether a state's Medicaid managed care contract \
@@ -73,7 +81,7 @@ QUESTION_PROMPT = """You answer questions about a state's Medicaid managed care 
 contract text only.
 
 Always call search_contract before answering. Ground every claim in the retrieved chunks and quote the \
-contract wording that supports it. Cite the section and printed page shown in each chunk's header so the \
+contract wording that supports it. Cite the document and page number shown in each chunk's header so the \
 reader can find it in the document.
 
 If the retrieved text does not answer the question, say what is missing instead of filling the gap. Do \
@@ -82,35 +90,25 @@ not describe your searching - answer the question."""
 
 @dataclass
 class ContractDeps:
-    """Shared retrieval services plus the evidence pool for the run in progress."""
-
     search_engine: SearchEngine = field(default_factory=SearchEngine)
-    toc: TableOfContents = field(default_factory=load_table_of_contents)
     chunks: Dict[int, dict] = field(default_factory=dict)
     top_k: int = TOP_K
     candidate_limit: int = CANDIDATE_LIMIT
     max_searches: int = MAX_SEARCHES
     searches: int = 0
-    rerank: bool = False
 
 
-def build_deps(table_name=None, rerank=False):
-    return ContractDeps(search_engine=SearchEngine(table_name=table_name), rerank=rerank)
+def build_deps(table_name=None):
+    return ContractDeps(search_engine=SearchEngine(table_name=table_name))
 
 
 async def retrieve(deps, query):
-
-    if deps.rerank:
-        return await deps.search_engine.reranked_search(
-            query, limit=deps.top_k, candidate_limit=deps.candidate_limit)
     return await deps.search_engine.hybrid_search(
         query, limit=deps.top_k,
         dense_limit=deps.candidate_limit, lexical_limit=deps.candidate_limit)
 
 
-
 def record_chunks(deps, results):
-    """Remember every chunk we showed a model, keyed by the id it will cite."""
     kept = []
     for result in results:
         chunk_id = result.get("id")
@@ -120,49 +118,31 @@ def record_chunks(deps, results):
         if existing is None:
             deps.chunks[chunk_id] = result
             kept.append(result)
-        else:
-            # A chunk found twice keeps its best distance from either search.
-            if existing.get("retrieval_confidence") is None:
-                existing["retrieval_confidence"] = result.get("retrieval_confidence")
-                existing["distance"] = result.get("distance")
+        elif existing.get("retrieval_confidence") is None:
+            existing["retrieval_confidence"] = result.get("retrieval_confidence")
+            existing["distance"] = result.get("distance")
     return kept
 
 
-def chunk_provenance(deps, chunk):
+def chunk_provenance(chunk):
     metadata = chunk.get("metadata") or {}
-    # Text and table chunks store doc_id, image chunks store doc_name. Both are the
-    # PDF's file name without its extension, which is what the contents index keys on.
-    doc_id = metadata.get("doc_id") or metadata.get("doc_name") or ""
-    page = metadata.get("page")
-    entry = deps.toc.resolve(doc_id, page) or {}
     return {
-        "doc_id": doc_id,
-        "page": page,
-        "printed_page": entry.get("printed_page") or deps.toc.printed_page(doc_id, page),
-        "toc_path": entry.get("path", ""),
-        "toc_title": entry.get("title", ""),
-        "citation": deps.toc.citation(doc_id, page),
+        "doc_id": metadata.get("doc_id") or metadata.get("doc_name") or "",
+        "page": metadata.get("page"),
     }
 
 
-def format_evidence(deps, chunks):
-    """Lay the chunks out for a model, header first so citations stay grounded."""
+def format_evidence(chunks):
     if not chunks:
         return "No contract text was retrieved for this requirement."
 
     blocks = []
     for chunk in chunks:
-        where = chunk_provenance(deps, chunk)
-        section = " ".join(part for part in (where["toc_path"], where["toc_title"]) if part).strip()
+        where = chunk_provenance(chunk)
 
-        # Deliberately no retrieval confidence here. It is a cosine distance, and a
-        # model shown one tends to hand it straight back as its own confidence,
-        # which leaves the two scores in the workbook saying the same thing twice.
         header = [f"[chunk {chunk.get('id')}]"]
-        if section:
-            header.append(f"section: {section}")
-        if where["printed_page"]:
-            header.append(f"printed page: {where['printed_page']}")
+        if where["page"] is not None:
+            header.append(page_label(where["page"]))
         if where["doc_id"]:
             header.append(f"document: {where['doc_id']}")
 
@@ -179,26 +159,12 @@ def _normalize(text):
 
 
 def _match_ratio(needle, haystack):
-    """How much of the needle turns up in the haystack, in order.
-
-    Summed over every long enough matching run rather than taken from the single
-    longest one, because BDA leaves list markers like "**a.**" sitting in the
-    middle of a sentence and a model quoting that sentence sensibly drops them.
-    One artefact in the middle of an otherwise verbatim quote used to halve the
-    longest run and fail the check.
-    """
     blocks = SequenceMatcher(None, needle, haystack, autojunk=False).get_matching_blocks()
     matched = sum(block.size for block in blocks if block.size >= QUOTE_MATCH_MIN_RUN)
     return matched / len(needle) if needle else 0.0
 
 
 def quote_supported(quote, chunk_text):
-    """Is this quote really in that chunk?
-
-    Compared on normalised text because models tidy up punctuation, hyphenation
-    and line breaks when they quote. Quotes joined by an ellipsis are checked
-    fragment by fragment, since that is a legitimate way to quote a long clause.
-    """
     haystack = _normalize(chunk_text)
     if not haystack:
         return False
@@ -216,14 +182,13 @@ def quote_supported(quote, chunk_text):
 
 
 def evidence_records(deps, cited):
-    """Turn the model's citations into rows with provenance we resolved ourselves."""
     records = []
     for item in cited:
         chunk = deps.chunks.get(item.chunk_id)
         if chunk is None:
             records.append(EvidenceRecord(quote=item.quote, chunk_id=item.chunk_id, verified=False))
             continue
-        where = chunk_provenance(deps, chunk)
+        where = chunk_provenance(chunk)
         records.append(EvidenceRecord(
             quote=item.quote.strip(),
             chunk_id=item.chunk_id,
@@ -235,17 +200,12 @@ def evidence_records(deps, cited):
 
 
 def blend_confidence(llm_confidence, retrieval):
-    """Geometric mean, so a confident reading of weak retrieval cannot score high."""
     if llm_confidence is None:
         return None
     if retrieval is None:
         return round(float(llm_confidence), 4)
     return round(math.sqrt(max(0.0, float(llm_confidence)) * max(0.0, float(retrieval))), 4)
 
-
-# ---------------------------------------------------------------------------
-# Tools and agents
-# ---------------------------------------------------------------------------
 
 async def search_contract(context: RunContext[ContractDeps], query: str) -> str:
     """Search the contract for passages relevant to a query.
@@ -254,27 +214,46 @@ async def search_contract(context: RunContext[ContractDeps], query: str) -> str:
         query: Wording the contract itself would use - a defined term, a statutory
             cite, a section name, or the operative phrase you expect to find.
 
-    Returns the matching chunks, each headed with its id, contents section, and
-    printed page. Cite chunks by the id in the header.
+    Returns the matching chunks, each headed with its id, page number, and source
+    document. Cite chunks by the id in the header.
     """
     deps = context.deps
-    if deps.searches >= deps.max_searches:
-        return ("Search budget for this requirement is used up. Decide from the chunks you already "
-                "have, and return UNCLEAR if they do not settle it.")
-
-    deps.searches += 1
-    try:
-        results = await retrieve(deps, query)
-    except Exception as lclEx:
-        Helper.print_exception("search_contract", lclEx, f"Retrieval failed for query '{query[:120]}'.")
-        raise ModelRetry("The search backend failed. Try once more with a shorter query.")
+    results = await retrieve(deps, query)
 
     log.debug(f"search_contract() call {deps.searches} for '{query[:120]}' returned {len(results)} chunks")
     if not results:
         return f"Nothing in the contract matched '{query}'. Try different wording or a broader phrase."
 
     record_chunks(deps, results)
-    return format_evidence(deps, results)
+    return format_evidence(results)
+
+
+review_hooks = Hooks()
+
+
+@review_hooks.on.before_tool_execute(tools=["search_contract"])
+async def charge_search_budget(context: RunContext[ContractDeps], *, call: ToolCallPart,
+                               tool_def: ToolDefinition,
+                               args: ValidatedToolArgs) -> ValidatedToolArgs:
+    deps = context.deps
+    if deps.searches >= deps.max_searches:
+        log.debug(f"charge_search_budget() refused search {deps.searches + 1}, "
+                  f"the limit is {deps.max_searches}")
+        raise ToolFailed(
+            f"Search budget for this requirement is used up after {deps.max_searches} searches. "
+            "Decide from the chunks you already have, and return UNCLEAR if they do not settle it.")
+
+    deps.searches += 1
+    return args
+
+
+@review_hooks.on.tool_execute_error(tools=["search_contract"])
+async def retry_failed_search(context: RunContext[ContractDeps], *, call: ToolCallPart,
+                              tool_def: ToolDefinition, args: ValidatedToolArgs,
+                              error: Exception):
+    query = str(args.get("query", ""))[:120]
+    Helper.print_exception("search_contract", error, f"Retrieval failed for query '{query}'.")
+    raise ModelRetry("The search backend failed. Try once more with a shorter query.")
 
 
 analyst_agent = Agent(
@@ -284,6 +263,7 @@ analyst_agent = Agent(
     system_prompt=ANALYST_PROMPT,
     model_settings=REVIEW_MODEL_SETTINGS,
     tools=[search_contract],
+    capabilities=[review_hooks, bedrock_hooks],
     retries=3,
     name="analyst",
 )
@@ -294,6 +274,7 @@ question_agent = Agent(
     system_prompt=QUESTION_PROMPT,
     model_settings=REVIEW_MODEL_SETTINGS,
     tools=[search_contract],
+    capabilities=[review_hooks, bedrock_hooks],
     retries=3,
     name="question",
 )
@@ -301,11 +282,6 @@ question_agent = Agent(
 
 @analyst_agent.output_validator
 def check_citations(context: RunContext[ContractDeps], assessment: RequirementAssessment):
-    """Reject citations to chunks that were never retrieved.
-
-    A fabricated chunk id is the tell that the model is reasoning from memory
-    rather than from the document, and it is cheaper to retry than to explain.
-    """
     unknown = [item.chunk_id for item in assessment.evidence if item.chunk_id not in context.deps.chunks]
     if unknown:
         available = ", ".join(str(chunk_id) for chunk_id in sorted(context.deps.chunks))
@@ -318,13 +294,8 @@ def check_citations(context: RunContext[ContractDeps], assessment: RequirementAs
     return assessment
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
 async def review_requirement(requirement, deps=None, sheet="", item="", legal_cite="",
                              row=None, challenge=True, usage=None):
-    """Run one requirement through retrieval, assessment, challenge, and adjudication."""
     review = RequirementReview(
         requirement=requirement, sheet=sheet, item=item, legal_cite=legal_cite,
         row=row, model=model_id(),
@@ -333,8 +304,6 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
         review.error = "Empty requirement text."
         return review
 
-    # A fresh evidence pool per requirement, sharing the search engine and the
-    # contents index so we are not rebuilding boto3 clients 600 times.
     deps = replace(deps or build_deps(), chunks={}, searches=0)
     run_usage = usage if usage is not None else RunUsage()
 
@@ -345,7 +314,7 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
 
         assessment = (await analyst_agent.run(
             f"Requirement to review:\n{requirement}\n\n"
-            f"Retrieved contract text:\n{format_evidence(deps, seed)}\n\n"
+            f"Retrieved contract text:\n{format_evidence(seed)}\n\n"
             "Assess this requirement. Search again first if this text does not cover it.",
             deps=deps,
             usage=run_usage,
@@ -360,9 +329,7 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
         review.llm_confidence = assessment.confidence
 
         if challenge:
-            # Both later agents argue over the whole pool, including anything the
-            # analyst went and found, so neither side has evidence the other lacks.
-            pool = format_evidence(deps, list(deps.chunks.values()))
+            pool = format_evidence(list(deps.chunks.values()))
             unverified = [record.chunk_id for record in review.evidence if not record.verified]
 
             objection = (await challenger_agent.run(
@@ -382,9 +349,6 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
                 log.info(f"review_requirement() {sheet} item {item}: the challenge changed the call from "
                          f"{assessment.status} to {verdict.status}")
 
-        # Normally the strength of the chunks the verdict actually rests on. With
-        # nothing cited - which is the usual shape of an UNCLEAR - it falls back to
-        # the pool, so the column says how close retrieval got rather than nothing.
         cited = [record.retrieval_confidence for record in review.evidence
                  if record.retrieval_confidence is not None]
         if not cited:
@@ -395,11 +359,6 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
         review.quotes_verified = bool(review.evidence) and all(
             record.verified for record in review.evidence)
         review.sources = review.where_found()
-        review.toc_sections = " | ".join(sorted({
-            " ".join(part for part in (record.toc_path, record.toc_title) if part).strip()
-            for record in review.evidence
-            if record.toc_path or record.toc_title
-        }))
 
         log.info(f"review_requirement() {sheet} item {item} = {review.status}, "
                  f"llm confidence {review.llm_confidence}, retrieval confidence {review.retrieval_confidence}, "
@@ -407,8 +366,6 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
         return review
 
     except Exception as lclEx:
-        # One bad row must not end a 600-row run. The error lands in the workbook
-        # so the reviewer can see which requirements still need a pass.
         Helper.print_exception("review_requirement", lclEx,
                                f"Review failed for requirement '{requirement[:120]}'.")
         review.status = "UNCLEAR"
@@ -418,7 +375,6 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
 
 
 async def answer_question(query, deps=None, usage=None):
-    """Free-text question answering for the query API."""
     deps = replace(deps or build_deps(), chunks={}, searches=0)
     result = await question_agent.run(query, deps=deps, usage=usage if usage is not None else RunUsage())
     return result.output

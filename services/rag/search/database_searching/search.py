@@ -7,12 +7,9 @@ from search.database_searching.reranker import CohereReranker
 from common.utils.helper import Helper
 from common.utils.logger import log
 
-# Reciprocal rank fusion constant from the original TREC paper. Keeps a single
-# rank-1 hit from one list from swamping the fused ordering.
 RRF_K = 60
 
-# HNSW only looks at ef_search candidates per probe, so it has to be at least as
-# large as the dense limit or the fused list silently loses recall.
+
 MIN_EF_SEARCH = 64
 
 
@@ -24,18 +21,6 @@ def _parse_metadata(metadata):
         except (json.JSONDecodeError, TypeError):
             return {}
     return metadata if isinstance(metadata, dict) else {}
-
-
-def retrieval_confidence(distance):
-    """Cosine distance from pgvector's <=> operator turned into a 0-1 score.
-
-    Cohere embeddings are unit length, so 1 - distance is the cosine similarity.
-    Anything below zero means the chunk points away from the query and is no
-    evidence at all, so it clamps to 0.
-    """
-    if distance is None:
-        return None
-    return round(max(0.0, min(1.0, 1.0 - float(distance))), 4)
 
 
 class SearchEngine:
@@ -92,13 +77,6 @@ class SearchEngine:
             await release_connection(connection)
 
     async def hybrid_search(self, query_text, limit=12, dense_limit=60, lexical_limit=60):
-        """Dense + full-text retrieval fused with reciprocal rank fusion.
-
-        Vector search alone misses exact contract vocabulary (statute cites, defined
-        terms, "shall not"); full-text alone misses paraphrased requirements. RRF
-        needs no score normalisation between the two, which matters because
-        ts_rank_cd and cosine distance are not on comparable scales.
-        """
         embedding_flattened = await self.embed_query(query_text)
         ef_search = max(MIN_EF_SEARCH, dense_limit)
 
@@ -141,43 +119,34 @@ class SearchEngine:
                         COALESCE(d.text, l.text) AS text,
                         COALESCE(d.metadata, l.metadata) AS metadata,
                         COALESCE(d.distance, l.distance) AS distance,
+                        CASE WHEN COALESCE(d.distance, l.distance) IS NOT NULL
+                             THEN ROUND(GREATEST(0, LEAST(1, 1 - COALESCE(d.distance, l.distance)))::numeric, 4)::float8
+                        END AS retrieval_confidence,
                         l.lexical_rank,
                         d.position AS dense_position,
                         l.position AS lexical_position,
-                        COALESCE(1.0 / ($5 + d.position), 0) + COALESCE(1.0 / ($5 + l.position), 0) AS fused_score
+                        (COALESCE(1.0 / ($5 + d.position), 0)
+                            + COALESCE(1.0 / ($5 + l.position), 0))::float8 AS fused_score
                     FROM dense d
                     FULL OUTER JOIN lexical l ON d.id = l.id
                     ORDER BY fused_score DESC
                     LIMIT $6
                 """, embedding_flattened, query_text, dense_limit, lexical_limit, RRF_K, limit)
 
-            return [self._shape_row(row) for row in results] if results else []
+            return [dict(row, metadata=_parse_metadata(row["metadata"])) for row in results] if results else []
         finally:
             await release_connection(connection)
 
     async def reranked_search(self, query_text, limit=8, candidate_limit=40):
-        """Hybrid recall pass, then Cohere rerank for precision on the shortlist."""
         candidates = await self.hybrid_search(query_text, limit=candidate_limit)
         if not candidates:
             return []
-
         try:
             reranked = await self.reranker.rerank_results(query_text, candidates, top_k=limit)
         except Exception as lclEx:
-            # A rerank outage should degrade the ordering, not fail the review.
             Helper.print_exception("SearchEngine.reranked_search", lclEx,
                                    "Cohere rerank failed, falling back to the fused hybrid order.")
             return candidates[:limit]
 
         log.debug(f"reranked_search() reranked {len(candidates)} candidates down to {len(reranked)}")
         return reranked
-
-    def _shape_row(self, row):
-        record = dict(row)
-        distance = record.get("distance")
-        record["metadata"] = _parse_metadata(record.get("metadata"))
-        record["distance"] = float(distance) if distance is not None else None
-        record["retrieval_confidence"] = retrieval_confidence(distance)
-        record["fused_score"] = float(record.get("fused_score") or 0.0)
-        record["lexical_rank"] = float(record["lexical_rank"]) if record.get("lexical_rank") is not None else None
-        return record

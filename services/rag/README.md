@@ -37,7 +37,7 @@ flowchart LR
 
 1. **Pre-processing** lists source docs under the active contract’s S3 prefix,
    runs Bedrock Data Automation, and writes parsed text/table/image outputs to
-   the post-processing bucket, plus a table-of-contents index (see below).
+   the post-processing bucket.
 2. **RAG process** loads those outputs, chunks text, writes split JSON, embeds
    with Bedrock, and stores vectors in the active contract’s embeddings table.
 3. **API** answers natural-language questions via search over that table and a
@@ -56,13 +56,13 @@ contract’s embeddings table:
 | `semantic_search` | Cosine nearest neighbours via the pgvector HNSW index |
 | `fulltext_search` | Postgres full-text search over the generated `search_tsv` column |
 | `hybrid_search` | Both of the above in one round trip, fused with reciprocal rank fusion |
-| `reranked_search` | `hybrid_search` for recall, then Cohere rerank for precision |
+| `reranked_search` | `hybrid_search` for recall, then Cohere rerank for precision — available but not wired into the agents |
 
-Hybrid is the default for contract review. Vector search alone misses exact
-contract vocabulary (statute cites, defined terms, “shall not”); full-text alone
-misses paraphrased requirements. RRF needs no score normalisation between the
-two, which matters because `ts_rank_cd` and cosine distance are not on
-comparable scales.
+Hybrid is what the agents call, for both contract review and the query API.
+Vector search alone misses exact contract vocabulary (statute cites, defined
+terms, “shall not”); full-text alone misses paraphrased requirements. RRF needs
+no score normalisation between the two, which matters because `ts_rank_cd` and
+cosine distance are not on comparable scales.
 
 Every row carries a **retrieval confidence**, which is the cosine similarity
 (`1 - distance` from pgvector’s `<=>`) clamped to 0–1. `hybrid_search` scores the
@@ -72,6 +72,46 @@ model — a model told a chunk scored 0.47 hands that back as its own confidence
 which would leave the two confidence columns in the workbook saying the same
 thing twice.
 
+### Retrieval policy
+
+`search_contract` only retrieves. What an agent is *allowed* to retrieve lives in
+`review_hooks`, a pydantic-ai `Hooks` capability in
+`search/database_searching/agents.py` that both searching agents register, so a
+limit only has to be right in one place.
+
+| Hook | Policy |
+|------|--------|
+| `charge_search_budget` (`before_tool_execute`) | `MAX_SEARCHES` per requirement, then `ToolFailed`. A model that keeps searching instead of committing to a status is told to decide on what it has. Charged before the search runs, so a backend failure costs a search rather than letting the same error be retried forever. |
+| `retry_failed_search` (`tool_execute_error`) | A psycopg or boto error becomes `ModelRetry("try a shorter query")`. The raw exception is logged, not handed to the model, which can do nothing with it. |
+
+`ToolFailed` rather than returning a string that says the budget is gone: the call
+did not happen, so recording it as a successful tool result misleads both the
+model and the trace. The model still sees the reason and adapts, and it costs
+nothing from the retry budget.
+
+### Model resilience
+
+`bedrock_hooks` in `search/database_searching/model_provider.py` is a second
+capability, registered on **all four** agents — the analyst and the question agent
+alongside `review_hooks`, and the challenger and adjudicator, which have no tools
+and so need nothing else.
+
+Its one hook, `retry_model_error` (`wrap_model_request`), re-sends a request that
+came back as Bedrock's 424 `ModelErrorException` — up to `MODEL_ATTEMPTS` (3) with
+a linear backoff. Nova Pro answers a tool-use turn with a malformed block often
+enough to matter: three requirements out of 667 died on *"Model produced invalid
+sequence as part of ToolUse"* in a full CRT run, each one a row a reviewer then has
+to do by hand. botocore does not retry a 4xx, reasonably — but this particular one
+is not the caller's fault, and the request that failed was fine, so the retry sends
+it again unchanged.
+
+Only that status is retried. A 400, an access denial, or an expired token would
+fail identically three times over, and the run is better off surfacing it at once.
+Throttling is already handled by botocore on the shared `bedrock-runtime` client.
+Nothing changes on the normal path — a request that succeeds is not retried, so
+the hook costs a run nothing until something breaks. Whatever still fails after
+three attempts lands in `RequirementReview.error` and the Error column as before.
+
 ### What gets embedded
 
 `data_preprocessing/parsing/parsed_text_data.py` drops text that would compete
@@ -80,30 +120,37 @@ with real provisions at retrieval time:
 | Filter | Why |
 |--------|-----|
 | `SKIP_SUBTYPES` — `PAGE_NUMBER`, `FOOTER`, `HEADER` | A running footer embeds like any other chunk. This contract had 201 identical `RFP Boilerplate I 07012019` footers and 199 page numbers. |
-| Printed-contents pages | Their text is section titles against page labels, which is answer-shaped enough to out-rank the provision being asked about. `parsed_toc` already turned those pages into the index. BDA lays those pages out as tables too, so `parsed_bda_table` skips the same pages. |
 | `MIN_CONTENT_CHARS` | Empty list scaffolding (`- \n- \n-`), a stray `[X]`, a bare `## J.` — nothing anyone could retrieve. |
 
 Section headers are kept: they are how a requirement about a named section gets
-found. On the Nebraska contract these filters take 2,464 text elements down to
-1,543.
+found. Printed table-of-contents pages are **not** filtered out, so a query can
+come back with a contents row — a section title against a page label — instead of
+the provision it was asking about. The analyst prompt tells the model not to cite
+one.
 
 Page numbers come from `page_indices` where BDA gives one and from
 `locations[].page_index` where it does not, because a couple of hundred elements
 only carry the latter and would otherwise land with no page — and a chunk with no
 page cannot be cited.
 
-### Table-of-contents index
+### Citations
 
-`data_preprocessing/parsing/parsed_toc.py` builds an outline of each source PDF
-from the section headings BDA reports, and reads the printed page labels off the
-`PAGE_NUMBER` elements. The result is written once per pre-processing run to
-`BDAToCOutputFolder` / `BDAToCOutputFilename` in the post-processing bucket.
+Chunk metadata carries `doc_id` and BDA's zero-based page index, and that is all
+a citation is built from. `page_label()` in
+`search/database_searching/review_models.py` steps the index forward by one and
+renders it as `page 150` — the PDF's own page number, what a reviewer types into
+the page box. That is what the model sees in each chunk header and what lands in
+Where Found and in the quotes on the RAG Analysis sheet. `page_numbers()` on
+`RequirementReview` returns the same numbers bare and sorted, for the **Page
+number** column and the `Page number:` line in General Comments — the column
+exists so a reviewer can turn to the pages, and citation order is no help for
+that. Where Found keeps citation order, because it pairs line for line with the
+quotes underneath it.
 
-Chunk metadata only carries `doc_id` and a zero-based page index. At query time
-`search/database_searching/toc_index.py` turns that pair into a citation a
-reviewer can act on — `V.R.11 Contingency Plan, Page 149` — by finding the
-innermost outline entry whose page range covers the chunk. If the index is
-missing, citations fall back to document and page index and nothing else breaks.
+On a document with front matter the PDF page number is not the number printed on
+the page — the printed numbering restarts after the roman-numeral pages. Nothing
+in the pipeline reads printed page numbers, so a citation always means position in
+the file.
 
 ## Running the service
 
@@ -168,10 +215,31 @@ Every requirement row goes through retrieval and three agents — an analyst tha
 commits to a status, a challenger that argues the opposing case over the same
 evidence, and an adjudicator that settles it. Findings are written back into the
 columns a reviewer already works from (Status, Where Found, Follow-up Required,
-General Comments), and everything that does not fit a form field — the
-counter-argument, both confidence scores, the verified quotes with their contents
-section and printed page — goes onto an added **RAG Analysis** sheet keyed by
-sheet and row.
+General Comments), and everything that does not fit a form field — both
+confidence scores, the verified quotes with the page number each came from — goes
+onto an added **RAG Analysis** sheet keyed by sheet and row.
+
+General Comments is ordered finding first, caveats after: `AI recommended
+status:`, the adjudicated reasoning under `AI response:`, `Page number:`, the
+confidence scores, any note about them, then the quotes. The challenger's
+counter-argument is not printed in the workbook — it is the agent's working
+rather than a finding, and a paragraph arguing against the status directly under
+it reads as though the tool is recommending both. It stays on
+`RequirementReview.counter_argument` and in the sidecar for audit.
+
+Two notes can follow the confidence scores. One when a quote could not be matched
+back to the retrieved text, and one when the status has **no** quotes at all —
+`retrieval_confidence` falls back to the best chunk that came back when nothing
+was cited, so an evidence-free row still prints three scores and would otherwise
+read as a supported finding. On a full CRT run 100 of 667 rows cite nothing.
+
+The cell is capped at `MAX_CELL_CHARS` (4000), and quotes are dropped **whole** to
+stay under it, with a line saying how many went missing and where to find them.
+Cutting the text at an arbitrary character left the last citation ending
+mid-sentence, still wrapped in quote marks — indistinguishable from the contract
+saying exactly that. Long exceptions get the same treatment: `Automated review
+failed:` keeps the first 220 characters, which is the message and the code, and
+leaves boto's `ResponseMetadata` to the Error column.
 
 | Flag | Effect |
 |------|--------|
@@ -182,12 +250,23 @@ sheet and row.
 | `--no-challenge` | Analyst only, skip the challenge and adjudication |
 | `--skip-answered` | Leave rows that already have a Status alone |
 | `--fresh` | Discard the sidecar and review everything again |
+| `--render-only` | Rebuild the workbook from the sidecar without reviewing |
 
 A full CRT is 667 requirements at three model calls each, so each finding is
 appended to a `<name>.xlsm.reviewed.jsonl` sidecar as it completes. Re-running
 resumes from that sidecar rather than paying for the same rows twice. The
 reviewed workbook is saved as `<name>.reviewed.xlsm`; the uploaded file is never
 modified.
+
+`--render-only` rebuilds the workbook from that sidecar and reviews nothing, which
+turns a change to how a finding is presented into a four-second check instead of
+an hour of Bedrock time. It needs no Bedrock and no database: the agents and the
+connection pool are imported inside the functions that use them, because
+`common/utils/settings.py` fetches the database secret at import and importing it
+at the top of the module killed a render before `main()` saw the flag. Rows the
+sidecar does not cover are named rather than left silently blank, since a workbook
+rendering 600 of 667 requirements looks finished. It refuses to run with `--fresh`,
+which would delete the sidecar it renders from.
 
 Two things to know about the output. Status is left blank when the verdict has no
 matching dropdown option — `A. Completeness` offers Yes/No and has nowhere to put

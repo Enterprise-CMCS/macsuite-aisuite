@@ -6,7 +6,6 @@ import boto3
 import datetime
 
 from data_preprocessing.bedrock.bda_results import BDAResults
-from data_preprocessing.parsing.parsed_toc import contents_pages
 from common.utils.settings import aws_client,aws_session
 from common.utils.helper import Helper
 from common.utils.logger import log
@@ -51,13 +50,9 @@ def parsed_text_info(source_data):
     }
     
     final_docs = [summary_doc]
-    
-
-    toc_pages = contents_pages(source_data)
 
     texts = []
     skipped_furniture = 0
-    skipped_contents = 0
     skipped_empty = 0
     for element in source_data.get("elements", []):
         if element.get("type") == "TEXT":
@@ -67,9 +62,6 @@ def parsed_text_info(source_data):
                 continue
 
             page = element_page(element)
-            if page in toc_pages:
-                skipped_contents += 1
-                continue
 
             text_content = element.get("representation", {}).get("markdown", "").strip()
 
@@ -86,8 +78,7 @@ def parsed_text_info(source_data):
             })
 
     log.info(f"parsed_text_info() Kept {len(texts)} text element(s), skipped {skipped_furniture} "
-             f"page-furniture, {skipped_contents} printed-contents element(s) on pages "
-             f"{sorted(toc_pages)}, and {skipped_empty} with no retrievable content")
+             f"page-furniture and {skipped_empty} with no retrievable content")
 
     for idx, elem in enumerate(texts):
         paragraph_id = f"{doc_id}::p{elem['page'] or 0}::e{idx}"

@@ -1,20 +1,6 @@
-"""The two agents that argue a requirement out before it reaches the workbook.
-
-A single agent reading its own retrieval is a soft grader: it finds text that is
-adjacent to the requirement, calls it MET, and the reviewer only discovers the
-gap during CMS review. So the assessment gets handed to a challenger whose only
-job is to argue the other side, and an adjudicator settles it. The dissent is
-kept rather than discarded - column H of the review tool is where a reviewer
-needs to see why the call was close.
-
-Neither of these agents can search. They argue over exactly the evidence the
-assessment was based on, which is what keeps the disagreement about the contract
-text instead of about who retrieved more.
-"""
-
 from pydantic_ai import Agent
 
-from search.database_searching.model_provider import bedrock_model, REVIEW_MODEL_SETTINGS
+from search.database_searching.model_provider import bedrock_hooks, bedrock_model, REVIEW_MODEL_SETTINGS
 from search.database_searching.review_models import Adjudication, Challenge
 
 CHALLENGER_PROMPT = """You are the second reviewer on a CMS Medicaid managed care contract review. \
@@ -83,6 +69,7 @@ challenger_agent = Agent(
     output_type=Challenge,
     system_prompt=CHALLENGER_PROMPT,
     model_settings=REVIEW_MODEL_SETTINGS,
+    capabilities=[bedrock_hooks],
     retries=3,
     name="challenger",
 )
@@ -92,6 +79,7 @@ adjudicator_agent = Agent(
     output_type=Adjudication,
     system_prompt=ADJUDICATOR_PROMPT,
     model_settings=REVIEW_MODEL_SETTINGS,
+    capabilities=[bedrock_hooks],
     retries=3,
     name="adjudicator",
 )
@@ -105,8 +93,6 @@ def challenge_prompt(requirement, evidence_block, assessment):
     return (
         f"Requirement under review:\n{requirement}\n\n"
         f"Retrieved contract text:\n{evidence_block}\n\n"
-        # The first reviewer's confidence is withheld on purpose. A challenger told
-        # the other side is 90% sure argues to that number instead of to the text.
         f"First reviewer's assessment\n"
         f"  status: {assessment.status}\n"
         f"  argument: {assessment.argument}\n"
@@ -119,8 +105,6 @@ def challenge_prompt(requirement, evidence_block, assessment):
 def adjudication_prompt(requirement, evidence_block, assessment, challenge, unverified):
     notes = ""
     if unverified:
-        # A quote that is not in the chunk it was attributed to is the clearest
-        # signal we have that an argument is built on something invented.
         notes = (
             "\nQuote check: these quotes could not be found in the chunks they were attributed to, so "
             f"treat them as unsupported - {', '.join(str(chunk_id) for chunk_id in unverified)}.\n"
@@ -130,8 +114,6 @@ def adjudication_prompt(requirement, evidence_block, assessment, challenge, unve
         f"Requirement under review:\n{requirement}\n\n"
         f"Retrieved contract text:\n{evidence_block}\n"
         f"{notes}\n"
-        # Neither side's confidence is passed on either. The adjudicator has to
-        # settle this on the evidence, not by siding with the higher number.
         f"First reviewer said {assessment.status}:\n"
         f"{assessment.argument}\n"
         f"Missing information they flagged: {assessment.missing_information or '(none)'}\n\n"
