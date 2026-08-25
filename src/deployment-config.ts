@@ -54,14 +54,7 @@ export const DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN: Partial<
   dev: "arn:aws:acm:us-east-1:205501819586:certificate/5b20cd15-197a-4efc-b05c-0063a371ff30",
   qa: "arn:aws:acm:us-east-1:205501819586:certificate/cd2183fd-ba83-448c-99a6-521d00b3565f",
   uat: "arn:aws:acm:us-east-1:205501819586:certificate/56dab682-bd09-4873-b03e-db111b11ba51",
-  prod: "arn:aws:acm:us-east-1:609425363642:certificate/89f2ea0b-f92b-473a-adf4-1c1629378868"
-};
-
-/** Per-environment ACM certificate ARNs for the ALB HTTPS listener. */
-export const DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN: Partial<
-  Record<DeploymentEnvironmentName, string>
-> = {
-  dev: "arn:aws:acm:us-east-1:205501819586:certificate/5b20cd15-197a-4efc-b05c-0063a371ff30",
+  prod: "arn:aws:acm:us-east-1:609425363642:certificate/89f2ea0b-f92b-473a-adf4-1c1629378868",
 };
 
 /**

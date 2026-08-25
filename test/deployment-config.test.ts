@@ -59,28 +59,37 @@ describe("deployment config", () => {
     }
   });
 
-  it("attaches CloudTamer VPN access SG only where configured", () => {
+  it("attaches CloudTamer VPN access SG for each environment", () => {
     expect(DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID).toEqual({
       dev: "sg-0964f9710d200b1ac",
+      qa: "sg-0964f9710d200b1ac",
+      uat: "sg-049f5a4447ace5a2b",
+      prod: "sg-0c723aa082515868d",
     });
-    expect(getDeploymentConfig("dev").vpnSecurityGroupId).toBe(
-      "sg-0964f9710d200b1ac",
-    );
-    expect(getDeploymentConfig("qa").vpnSecurityGroupId).toBeUndefined();
-    expect(getDeploymentConfig("uat").vpnSecurityGroupId).toBeUndefined();
-    expect(getDeploymentConfig("prod").vpnSecurityGroupId).toBeUndefined();
+
+    for (const environmentName of DEPLOYMENT_ENVIRONMENT_NAMES) {
+      expect(getDeploymentConfig(environmentName).vpnSecurityGroupId).toBe(
+        DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
+      );
+    }
   });
 
-  it("maps ALB certificate ARNs only where configured", () => {
-    expect(DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN.dev).toMatch(
-      /^arn:aws:acm:/,
-    );
-    expect(getDeploymentConfig("dev").albCertificateArn).toBe(
-      DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN.dev,
-    );
-    expect(getDeploymentConfig("qa").albCertificateArn).toBeUndefined();
-    expect(getDeploymentConfig("uat").albCertificateArn).toBeUndefined();
-    expect(getDeploymentConfig("prod").albCertificateArn).toBeUndefined();
+  it("maps an ACM certificate ARN for every environment", () => {
+    expect(DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN).toEqual({
+      dev: "arn:aws:acm:us-east-1:205501819586:certificate/5b20cd15-197a-4efc-b05c-0063a371ff30",
+      qa: "arn:aws:acm:us-east-1:205501819586:certificate/cd2183fd-ba83-448c-99a6-521d00b3565f",
+      uat: "arn:aws:acm:us-east-1:205501819586:certificate/56dab682-bd09-4873-b03e-db111b11ba51",
+      prod: "arn:aws:acm:us-east-1:609425363642:certificate/89f2ea0b-f92b-473a-adf4-1c1629378868",
+    });
+
+    for (const environmentName of DEPLOYMENT_ENVIRONMENT_NAMES) {
+      const certificateArn =
+        DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN[environmentName];
+      expect(certificateArn).toMatch(/^arn:aws:acm:/);
+      expect(getDeploymentConfig(environmentName).albCertificateArn).toBe(
+        certificateArn,
+      );
+    }
   });
 
   it("names the central access-logs bucket per account and region", () => {

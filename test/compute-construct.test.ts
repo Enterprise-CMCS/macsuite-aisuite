@@ -9,6 +9,7 @@ import {
 } from "../src/constructs/compute-construct";
 import { STUB_VPC_CONTEXT_KEY } from "../src/constructs/networking-construct";
 import {
+  DEPLOYMENT_ENVIRONMENT_NAMES,
   type DeploymentEnvironmentName,
   getDeploymentConfig,
 } from "../src/deployment-config";
@@ -70,7 +71,7 @@ function apiContainerEnvironment(
   );
 }
 
-describe.each(["dev", "prod"] as const)(
+describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
   "AISuite %s RAG API",
   (environmentName) => {
     const serviceName = `aisuite-${environmentName}-rag-api`;
@@ -129,7 +130,8 @@ describe.each(["dev", "prod"] as const)(
           Protocol: "HTTPS",
           Certificates: Match.arrayWith([
             Match.objectLike({
-              CertificateArn: Match.stringLikeRegexp("^arn:aws:acm:"),
+              CertificateArn: getDeploymentConfig(environmentName)
+                .albCertificateArn,
             }),
           ]),
         },
