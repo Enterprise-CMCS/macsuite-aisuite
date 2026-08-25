@@ -34,15 +34,18 @@ WHERE_FOUND_COL = 6
 FOLLOW_UP_COL = 7
 COMMENTS_COL = 8
 
-DEFAULT_STATUS_OPTIONS = ["Met", "Unclear", "Not met", "N/A"]
+DEFAULT_STATUS_OPTIONS = ["Met", "Unclear", "Not met"]
 
+# CRT workbooks' Status dropdowns say "Unsure", not "Unclear" - matching both here
+# lets STANDARD_WORDING below stay "Unsure" for the sheets that actually use it,
+# while still resolving correctly if a workbook happens to spell it "Unclear".
 STATUS_WORDING = {
     "MET": ("met", "yes"),
     "NOT MET": ("not met", "no"),
-    "UNCLEAR": ("unclear", "unclear"),
+    "UNCLEAR": ("unsure", "unclear"),
 }
 
-STANDARD_WORDING = {"MET": "Met", "NOT MET": "Not met", "UNCLEAR": "Unclear"}
+STANDARD_WORDING = {"MET": "Met", "NOT MET": "Not met", "UNCLEAR": "Unsure"}
 
 CONFIDENCE_BANDS = ((0.70, "Strong evidence"), (0.45, "Moderate evidence"))
 LOWEST_BAND = "Limited evidence"
