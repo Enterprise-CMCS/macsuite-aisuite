@@ -109,6 +109,7 @@ def parse_pdf_to_records(pdf_path: Path) -> List[Dict[str, Any]]:
 
 def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[str, Any]]:
     output: List[Dict[str, Any]] = []
+    
     # Ex. sections_by_number["1.21"] -> Information Technology
     sections_by_number: Dict[str, Dict[str, Any]] = {}
  

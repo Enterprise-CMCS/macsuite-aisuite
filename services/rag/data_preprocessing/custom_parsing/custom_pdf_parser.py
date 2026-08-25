@@ -9,7 +9,6 @@ from parser import parse_pdf_to_records
  
 s3 = boto3.client("s3")
  
- 
 def run_custom_pdf_parser(input_bucket: str,input_keys: list[str],output_bucket: str,text_output_key: str,table_output_key: str,) -> None:
 
     text_records = []
@@ -46,3 +45,4 @@ def run_custom_pdf_parser(input_bucket: str,input_keys: list[str],output_bucket:
         Body=json.dumps(table_records, ensure_ascii=False, indent=2).encode("utf-8"),
         ContentType="application/json",
     )
+    
