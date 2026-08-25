@@ -57,6 +57,13 @@ export const DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN: Partial<
   prod: "arn:aws:acm:us-east-1:609425363642:certificate/89f2ea0b-f92b-473a-adf4-1c1629378868"
 };
 
+/** Per-environment ACM certificate ARNs for the ALB HTTPS listener. */
+export const DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN: Partial<
+  Record<DeploymentEnvironmentName, string>
+> = {
+  dev: "arn:aws:acm:us-east-1:205501819586:certificate/5b20cd15-197a-4efc-b05c-0063a371ff30",
+};
+
 /**
  * Explicit AISuite AWS account IDs (CloudTamer aisuite-non-prod / aisuite-prod).
  * Runtime env overrides (`AISUITE_NONPROD_ACCOUNT_ID` /
