@@ -142,7 +142,21 @@ def parsed_image_info(source_data):
                 # image.show()
 
                 str_encoded = base64.b64encode(image_s3_key).decode("utf-8")
-                image_analysis_text = foundational_llm_model_image_analysis(str_encoded)
+                # image_analysis_text = foundational_llm_model_image_analysis(str_encoded)
+                try:
+                    image_analysis_text = foundational_llm_model_image_analysis(str_encoded)
+                except Exception as e:
+                    error_text = str(e)
+            
+                    if "aspect ratio" in error_text.lower():
+                        log.warning(
+                            f"Skipping image because Bedrock rejected aspect ratio. "
+                            f"source_key={source_key}, image={s3_keys}, error={error_text}"
+                        )
+                        image_analysis_text = ""
+                    else:
+                        raise
+
                 image_data_temp = image_text_organization(source_data, elements, image_analysis_text, source_key,doc_id)
                 image_data.extend([image_data_temp])
                 total_images_analysed = total_images_analysed + 1

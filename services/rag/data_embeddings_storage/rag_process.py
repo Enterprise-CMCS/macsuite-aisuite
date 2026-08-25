@@ -96,11 +96,7 @@ async def invoke_rag_process():
         log.info(f"Length of the image_data {len(images_data)}")
         log.info(f"Length of the table_data {len(table_data)}")
 
-
-
-
         # This line to access the pre-process the Excel files
-
         json_files_table = []
         json_files = []
         aws_files_access = AwsFilesAccess(s3_client)

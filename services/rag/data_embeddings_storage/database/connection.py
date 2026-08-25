@@ -26,7 +26,6 @@ async def initialization_db():
             min_size=1,
             max_size=5,
             init=register_vector_init,
-            ssl="require",
         )
     print("Database connection pool initialized.")
 
