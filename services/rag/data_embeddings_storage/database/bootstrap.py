@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import traceback
 
 import asyncpg
 
@@ -77,6 +78,12 @@ async def ensure_app_owner_role(connection) -> None:
     for role_name in APP_ROTATION_ROLES:
         if not await role_exists(connection, role_name):
             continue
+        # Master must be a member of each rotation login to reassign clone-owned objects.
+        await _execute_format(
+            connection,
+            "SELECT format('GRANT %I TO %I', $1::text, current_user::text)",
+            role_name,
+        )
         await _execute_format(
             connection,
             "SELECT format('GRANT %I TO %I', $1::text, $2::text)",
@@ -296,6 +303,7 @@ def main() -> int:
         asyncio.run(bootstrap_database())
     except Exception:
         print("Database bootstrap failed.", file=sys.stderr)
+        traceback.print_exc()
         return 1
 
     print("Database bootstrap completed successfully.")
