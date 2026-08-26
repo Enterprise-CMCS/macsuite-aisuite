@@ -237,11 +237,25 @@ async def migrate_public_embeddings_tables(connection, schema: str) -> None:
         """,
     )
     for row in rows:
+        table_name = row["tablename"]
+        exists_in_target = await connection.fetchval(
+            """
+            SELECT EXISTS(
+                SELECT 1
+                FROM pg_tables
+                WHERE schemaname = $1 AND tablename = $2
+            )
+            """,
+            schema,
+            table_name,
+        )
+        if exists_in_target:
+            continue
         await _execute_format(
             connection,
             "SELECT format("
             "'ALTER TABLE public.%I SET SCHEMA %I', $1::text, $2::text)",
-            row["tablename"],
+            table_name,
             schema,
         )
 

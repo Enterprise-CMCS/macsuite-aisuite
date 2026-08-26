@@ -47,12 +47,29 @@ class BootstrapHelpersTests(unittest.IsolatedAsyncioTestCase):
                 {"tablename": "embeddings_tn_6756_tenncare"},
             ]
         )
-        connection.fetchval = AsyncMock(return_value="ALTER TABLE ...")
+        connection.fetchval = AsyncMock(
+            side_effect=[False, "ALTER TABLE ...", False, "ALTER TABLE ..."],
+        )
         connection.execute = AsyncMock()
 
         await migrate_public_embeddings_tables(connection, APP_SCHEMA)
 
         self.assertEqual(connection.execute.await_count, 2)
+
+    async def test_migrate_public_embeddings_skips_existing_target_tables(self):
+        connection = AsyncMock()
+        connection.fetch = AsyncMock(
+            return_value=[
+                {"tablename": "embeddings"},
+                {"tablename": "embeddings_tn_6756_tenncare"},
+            ]
+        )
+        connection.fetchval = AsyncMock(side_effect=[True, False, "ALTER TABLE ..."])
+        connection.execute = AsyncMock()
+
+        await migrate_public_embeddings_tables(connection, APP_SCHEMA)
+
+        self.assertEqual(connection.execute.await_count, 1)
 
     async def test_grant_app_role_privileges_executes_grants(self):
         connection = AsyncMock()
