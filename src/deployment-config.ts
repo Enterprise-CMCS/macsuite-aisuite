@@ -143,7 +143,8 @@ export function getDeploymentConfig(
   const accountTier = DEPLOYMENT_ENVIRONMENT_ACCOUNT_TIER[environmentName];
   const protectedEnvironment = environmentName !== "dev";
 
-  const deployedAt = process.env.DEPLOYMENT_TIMESTAMP ?? new Date().toISOString();
+  const deployedAt =
+    process.env.DEPLOYMENT_TIMESTAMP?.trim() || new Date().toISOString();
   return {
     accountTier,
     awsEnvironment: {

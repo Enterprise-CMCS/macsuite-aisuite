@@ -12,11 +12,17 @@ DECLARE
   r RECORD;
 BEGIN
   FOR r IN
-    SELECT tablename
-    FROM pg_tables
-    WHERE schemaname = 'public'
-      AND tablename LIKE 'embeddings%'
-    ORDER BY tablename
+    SELECT p.tablename
+    FROM pg_tables p
+    WHERE p.schemaname = 'public'
+      AND p.tablename LIKE 'embeddings%'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_tables t
+        WHERE t.schemaname = 'aisuite_schema'
+          AND t.tablename = p.tablename
+      )
+    ORDER BY p.tablename
   LOOP
     EXECUTE format(
       'ALTER TABLE public.%I SET SCHEMA aisuite_schema',
@@ -30,11 +36,19 @@ END $$;
 DO $$
 DECLARE
   r RECORD;
+  role_name text;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aisuite_app_owner') THEN
     CREATE ROLE aisuite_app_owner NOLOGIN;
   END IF;
   EXECUTE format('GRANT aisuite_app_owner TO %I', current_user);
+
+  FOREACH role_name IN ARRAY ARRAY['aisuite_app', 'aisuite_app_clone']
+  LOOP
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
+      EXECUTE format('GRANT %I TO %I', role_name, current_user);
+    END IF;
+  END LOOP;
 
   EXECUTE 'ALTER SCHEMA aisuite_schema OWNER TO aisuite_app_owner';
 

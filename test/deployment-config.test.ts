@@ -14,6 +14,7 @@ import {
 describe("deployment config", () => {
   afterEach(() => {
     delete process.env.DEPLOYMENT_OWNER;
+    delete process.env.DEPLOYMENT_TIMESTAMP;
     delete process.env.AISUITE_NONPROD_ACCOUNT_ID;
     delete process.env.AISUITE_PROD_ACCOUNT_ID;
     delete process.env.DEFAULT_REGION;
@@ -131,5 +132,20 @@ describe("deployment config", () => {
   it("exposes configured CloudTamer account ids as 12-digit strings", () => {
     expect(AWS_ACCOUNT_IDS.nonprod).toBe("205501819586");
     expect(AWS_ACCOUNT_IDS.prod).toBe("609425363642");
+  });
+
+  it("uses DEPLOYMENT_TIMESTAMP when set", () => {
+    process.env.DEPLOYMENT_TIMESTAMP = "2026-08-24T17:23:17-04:00";
+
+    expect(getDeploymentConfig("dev").tags.DeployedAt).toBe(
+      "2026-08-24T17:23:17-04:00",
+    );
+  });
+
+  it("falls back when DEPLOYMENT_TIMESTAMP is blank", () => {
+    process.env.DEPLOYMENT_TIMESTAMP = "   ";
+
+    const deployedAt = getDeploymentConfig("dev").tags.DeployedAt;
+    expect(deployedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 });
