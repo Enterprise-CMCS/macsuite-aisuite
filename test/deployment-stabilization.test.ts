@@ -346,4 +346,15 @@ describe("deployment workflow contract", () => {
     expect(workflow).not.toMatch(/(?:PGPASSWORD|APP_PASS(?:WORD)?)=/);
     expect(workflow).not.toMatch(/--(?:password|secret)(?:\s|=)/i);
   });
+
+  it("sets DEPLOYMENT_TIMESTAMP for push and workflow_dispatch", () => {
+    expect(workflow).toContain(
+      "DEPLOYMENT_TIMESTAMP: ${{ github.event_name == 'push' && github.event.head_commit.timestamp || github.run_started_at }}",
+    );
+  });
+
+  it("prints bootstrap CloudWatch logs on task failure", () => {
+    expect(workflow).toContain("aws logs get-log-events");
+    expect(workflow).toContain("bootstrap/Container/");
+  });
 });
