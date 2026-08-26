@@ -12,11 +12,17 @@ DECLARE
   r RECORD;
 BEGIN
   FOR r IN
-    SELECT tablename
-    FROM pg_tables
-    WHERE schemaname = 'public'
-      AND tablename LIKE 'embeddings%'
-    ORDER BY tablename
+    SELECT p.tablename
+    FROM pg_tables p
+    WHERE p.schemaname = 'public'
+      AND p.tablename LIKE 'embeddings%'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_tables t
+        WHERE t.schemaname = 'aisuite_schema'
+          AND t.tablename = p.tablename
+      )
+    ORDER BY p.tablename
   LOOP
     EXECUTE format(
       'ALTER TABLE public.%I SET SCHEMA aisuite_schema',
