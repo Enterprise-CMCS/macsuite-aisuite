@@ -25,13 +25,14 @@ export const DEPLOYMENT_ENVIRONMENT_ACCOUNT_TIER = {
 } as const satisfies Record<DeploymentEnvironmentName, AwsAccountTier>;
 
 /**
- * CloudTamer-provisioned VPC Name tags (aisuite-east-*). App stages map 1:1
- * except `uat` → `aisuite-east-test` (CloudTamer has no uat VPC name).
+ * CloudTamer-provisioned VPC Name tags (aisuite-east-*). QA shares the existing
+ * `aisuite-east-dev` Name tag, and UAT uses `aisuite-east-impl`. CloudTamer
+ * VPCs are not renamed.
  */
 export const DEPLOYMENT_ENVIRONMENT_VPC_NAME = {
   dev: "aisuite-east-dev",
-  qa: "aisuite-east-qa",
-  uat: "aisuite-east-test",
+  qa: "aisuite-east-dev",
+  uat: "aisuite-east-impl",
   prod: "aisuite-east-prod",
 } as const satisfies Record<DeploymentEnvironmentName, string>;
 
