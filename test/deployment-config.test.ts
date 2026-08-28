@@ -47,10 +47,13 @@ describe("deployment config", () => {
   it("maps each app stage to the CloudTamer VPC Name tag", () => {
     expect(DEPLOYMENT_ENVIRONMENT_VPC_NAME).toEqual({
       dev: "aisuite-east-dev",
-      qa: "aisuite-east-qa",
-      uat: "aisuite-east-test",
+      qa: "aisuite-east-dev",
+      uat: "aisuite-east-impl",
       prod: "aisuite-east-prod",
     });
+
+    expect(getDeploymentConfig("qa").vpcName).toBe("aisuite-east-dev");
+    expect(getDeploymentConfig("uat").vpcName).toBe("aisuite-east-impl");
 
     for (const environmentName of DEPLOYMENT_ENVIRONMENT_NAMES) {
       const config = getDeploymentConfig(environmentName);
