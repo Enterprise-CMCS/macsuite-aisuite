@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import traceback
 
 import asyncpg
 
@@ -77,6 +78,12 @@ async def ensure_app_owner_role(connection) -> None:
     for role_name in APP_ROTATION_ROLES:
         if not await role_exists(connection, role_name):
             continue
+        # Master must be a member of each rotation login to reassign clone-owned objects.
+        await _execute_format(
+            connection,
+            "SELECT format('GRANT %I TO %I', $1::text, current_user::text)",
+            role_name,
+        )
         await _execute_format(
             connection,
             "SELECT format('GRANT %I TO %I', $1::text, $2::text)",
@@ -230,11 +237,25 @@ async def migrate_public_embeddings_tables(connection, schema: str) -> None:
         """,
     )
     for row in rows:
+        table_name = row["tablename"]
+        exists_in_target = await connection.fetchval(
+            """
+            SELECT EXISTS(
+                SELECT 1
+                FROM pg_tables
+                WHERE schemaname = $1 AND tablename = $2
+            )
+            """,
+            schema,
+            table_name,
+        )
+        if exists_in_target:
+            continue
         await _execute_format(
             connection,
             "SELECT format("
             "'ALTER TABLE public.%I SET SCHEMA %I', $1::text, $2::text)",
-            row["tablename"],
+            table_name,
             schema,
         )
 
@@ -296,6 +317,7 @@ def main() -> int:
         asyncio.run(bootstrap_database())
     except Exception:
         print("Database bootstrap failed.", file=sys.stderr)
+        traceback.print_exc()
         return 1
 
     print("Database bootstrap completed successfully.")

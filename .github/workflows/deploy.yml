@@ -34,7 +34,8 @@ jobs:
       DEPLOYMENT_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
       AISUITE_DEPLOY_REGION: ${{ vars.AISUITE_DEPLOY_REGION || 'us-east-1' }}
       # Stable within a release so DeployedAt tags do not churn every deploy.
-      DEPLOYMENT_TIMESTAMP: ${{ github.event.head_commit.timestamp || github.run_started_at }}
+      # workflow_dispatch has no head_commit; guard push-only access or the value is empty.
+      DEPLOYMENT_TIMESTAMP: ${{ github.event_name == 'push' && github.event.head_commit.timestamp || github.run_started_at }}
 
     steps:
       - name: Checkout
@@ -204,6 +205,16 @@ jobs:
           echo "bootstrap logs=/ecs/aisuite-${DEPLOYMENT_ENV}-rag-db-bootstrap"
           if test "${EXIT_CODE}" != "0"; then
             echo "bootstrap exitCode=${EXIT_CODE:-missing}" >&2
+            TASK_ID="${TASK_ARN##*/}"
+            LOG_GROUP="/ecs/aisuite-${DEPLOYMENT_ENV}-rag-db-bootstrap"
+            LOG_STREAM="bootstrap/Container/${TASK_ID}"
+            echo "bootstrap recent logs (stream=${LOG_STREAM}):" >&2
+            aws logs get-log-events \
+              --log-group-name "${LOG_GROUP}" \
+              --log-stream-name "${LOG_STREAM}" \
+              --limit 50 \
+              --query 'events[].message' \
+              --output text >&2 || true
             exit 1
           fi
           echo "bootstrap exitCode=${EXIT_CODE}"

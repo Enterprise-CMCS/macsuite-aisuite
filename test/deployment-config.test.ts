@@ -14,6 +14,7 @@ import {
 describe("deployment config", () => {
   afterEach(() => {
     delete process.env.DEPLOYMENT_OWNER;
+    delete process.env.DEPLOYMENT_TIMESTAMP;
     delete process.env.AISUITE_NONPROD_ACCOUNT_ID;
     delete process.env.AISUITE_PROD_ACCOUNT_ID;
     delete process.env.DEFAULT_REGION;
@@ -46,10 +47,13 @@ describe("deployment config", () => {
   it("maps each app stage to the CloudTamer VPC Name tag", () => {
     expect(DEPLOYMENT_ENVIRONMENT_VPC_NAME).toEqual({
       dev: "aisuite-east-dev",
-      qa: "aisuite-east-qa",
-      uat: "aisuite-east-test",
+      qa: "aisuite-east-dev",
+      uat: "aisuite-east-impl",
       prod: "aisuite-east-prod",
     });
+
+    expect(getDeploymentConfig("qa").vpcName).toBe("aisuite-east-dev");
+    expect(getDeploymentConfig("uat").vpcName).toBe("aisuite-east-impl");
 
     for (const environmentName of DEPLOYMENT_ENVIRONMENT_NAMES) {
       const config = getDeploymentConfig(environmentName);
@@ -59,28 +63,37 @@ describe("deployment config", () => {
     }
   });
 
-  it("attaches CloudTamer VPN access SG only where configured", () => {
+  it("attaches CloudTamer VPN access SG for each environment", () => {
     expect(DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID).toEqual({
       dev: "sg-0964f9710d200b1ac",
+      qa: "sg-0964f9710d200b1ac",
+      uat: "sg-049f5a4447ace5a2b",
+      prod: "sg-0c723aa082515868d",
     });
-    expect(getDeploymentConfig("dev").vpnSecurityGroupId).toBe(
-      "sg-0964f9710d200b1ac",
-    );
-    expect(getDeploymentConfig("qa").vpnSecurityGroupId).toBeUndefined();
-    expect(getDeploymentConfig("uat").vpnSecurityGroupId).toBeUndefined();
-    expect(getDeploymentConfig("prod").vpnSecurityGroupId).toBeUndefined();
+
+    for (const environmentName of DEPLOYMENT_ENVIRONMENT_NAMES) {
+      expect(getDeploymentConfig(environmentName).vpnSecurityGroupId).toBe(
+        DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
+      );
+    }
   });
 
-  it("maps ALB certificate ARNs only where configured", () => {
-    expect(DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN.dev).toMatch(
-      /^arn:aws:acm:/,
-    );
-    expect(getDeploymentConfig("dev").albCertificateArn).toBe(
-      DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN.dev,
-    );
-    expect(getDeploymentConfig("qa").albCertificateArn).toBeUndefined();
-    expect(getDeploymentConfig("uat").albCertificateArn).toBeUndefined();
-    expect(getDeploymentConfig("prod").albCertificateArn).toBeUndefined();
+  it("maps an ACM certificate ARN for every environment", () => {
+    expect(DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN).toEqual({
+      dev: "arn:aws:acm:us-east-1:205501819586:certificate/5b20cd15-197a-4efc-b05c-0063a371ff30",
+      qa: "arn:aws:acm:us-east-1:205501819586:certificate/cd2183fd-ba83-448c-99a6-521d00b3565f",
+      uat: "arn:aws:acm:us-east-1:205501819586:certificate/56dab682-bd09-4873-b03e-db111b11ba51",
+      prod: "arn:aws:acm:us-east-1:609425363642:certificate/89f2ea0b-f92b-473a-adf4-1c1629378868",
+    });
+
+    for (const environmentName of DEPLOYMENT_ENVIRONMENT_NAMES) {
+      const certificateArn =
+        DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN[environmentName];
+      expect(certificateArn).toMatch(/^arn:aws:acm:/);
+      expect(getDeploymentConfig(environmentName).albCertificateArn).toBe(
+        certificateArn,
+      );
+    }
   });
 
   it("names the central access-logs bucket per account and region", () => {
@@ -122,5 +135,20 @@ describe("deployment config", () => {
   it("exposes configured CloudTamer account ids as 12-digit strings", () => {
     expect(AWS_ACCOUNT_IDS.nonprod).toBe("205501819586");
     expect(AWS_ACCOUNT_IDS.prod).toBe("609425363642");
+  });
+
+  it("uses DEPLOYMENT_TIMESTAMP when set", () => {
+    process.env.DEPLOYMENT_TIMESTAMP = "2026-08-24T17:23:17-04:00";
+
+    expect(getDeploymentConfig("dev").tags.DeployedAt).toBe(
+      "2026-08-24T17:23:17-04:00",
+    );
+  });
+
+  it("falls back when DEPLOYMENT_TIMESTAMP is blank", () => {
+    process.env.DEPLOYMENT_TIMESTAMP = "   ";
+
+    const deployedAt = getDeploymentConfig("dev").tags.DeployedAt;
+    expect(deployedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 });
