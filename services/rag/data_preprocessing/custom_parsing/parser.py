@@ -2,12 +2,13 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict, List
+from docx import Document
  
 import pdfplumber
  
 from helpers import (clean_text, collect_repeated_lines, ends_sentence, find_appendix_heading, find_heading,
     flush_flat_buffer, is_appendix_list_line, is_page_number, is_simple_heading, is_toc_line, make_section_record, make_subsection_record, make_table_element, make_table_record,
-    make_text_element, remove_table_words, should_skip_page, table_to_markdown_safe, words_to_lines,remove_nested_tables, is_page_footer)
+    make_text_element, remove_table_words, should_skip_page, table_to_markdown_safe, words_to_lines,remove_nested_tables, is_page_footer, extract_printed_page)
  
 "*****PDF page extraction*****"
 # Extract text and tables from each page of the PDF, while filtering repeated lines and page numbers.
@@ -21,12 +22,11 @@ def extract_pdf_pages(pdf_path: Path) -> List[Dict[str, Any]]:
  
     with pdfplumber.open(pdf_path) as pdf:
         for page_index, page in enumerate(pdf.pages, start=1):
-            width = page.width
-            height = page.height
- 
-            # Crop 8% to 93 % from top-bottom for common header/footer 
-            # and keep main body of text
-            cropped = page.crop((0, height * 0.08, width, height * 0.93))
+            printed_page = extract_printed_page(page)
+            
+            x0, top, x1, bottom = page.bbox
+            height = bottom - top
+            cropped = page.crop((x0, top + height * 0.08, x1, top + height * 0.93))
 
             raw_words = cropped.extract_words() or []
             raw_lines = words_to_lines(raw_words)
@@ -48,8 +48,7 @@ def extract_pdf_pages(pdf_path: Path) -> List[Dict[str, Any]]:
                 if not table_md:
                     continue
                 table_elements.append(make_table_element(page_no=page_index, table_index=table_index, markdown=table_md,bbox=table_object.bbox,))
-                # print(table_elements)
-
+                
             # 2. Extract page words.
             words = cropped.extract_words() or []
  
@@ -90,7 +89,7 @@ def extract_pdf_pages(pdf_path: Path) -> List[Dict[str, Any]]:
                 elements.append(make_text_element(page_no=page_index, lines=lines))
  
             elements.extend(table_elements)
-            pages.append({"page": page_index, "elements": elements})
+            pages.append({"page": page_index, "printed_page": printed_page,"elements": elements})
  
     return pages
  
@@ -101,11 +100,6 @@ def extract_pdf_pages(pdf_path: Path) -> List[Dict[str, Any]]:
 # 3. Unspecified text outside any known Section/Subsection becomes flat TEXT.
 # 4. TABLE elements are stored independently in Markdown.
 # 5. TABLE contents are never sent to find_heading().
-
-def parse_pdf_to_records(pdf_path: Path) -> List[Dict[str, Any]]:
-    pages = extract_pdf_pages(pdf_path)
-    doc_id = pdf_path.stem
-    return build_section_json(pages, doc_id)
 
 def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[str, Any]]:
     output: List[Dict[str, Any]] = []
@@ -124,13 +118,14 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
     current_appendix_title = None
  
     # Creates a Section once and returns the existing Section on later references
-    def ensure_section(section_no: str, name: str, page_no: int) -> Dict[str, Any]:
+    def ensure_section(section_no: str, name: str, page_no: int, printed_page:int) -> Dict[str, Any]:
         if section_no not in sections_by_number:
             section_record = make_section_record(
                 doc_id=doc_id,
                 section_no=section_no,
                 name=name,
                 page_no=page_no,
+                printed_page=printed_page,
                 appendix=current_appendix,
                 appendix_title=current_appendix_title,
             )
@@ -142,7 +137,8 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
     # Process all PDF pages
     for page in pages:
         page_no = page["page"] #page number
- 
+        printed_page = page.get("printed_page") #original page number
+
         # Process TEXT and TABLE independently.
         for element in page.get("elements", []):
             element_type = element.get("element_type")
@@ -151,13 +147,13 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
             if element_type == "TABLE":
                 # Flush pending flat text before storing table.
                 if flat_buffer:
-                    flush_flat_buffer(output=output,buffer=flat_buffer,doc_id=doc_id, page_no=flat_buffer_page or page_no,
+                    flush_flat_buffer(output=output,buffer=flat_buffer,doc_id=doc_id, page_no=flat_buffer_page or page_no, printed_page = printed_page, 
                         is_heading=flat_buffer_is_heading,appendix=current_appendix,appendix_title=current_appendix_title,)
                     flat_buffer_page = None
                     flat_buffer_is_heading = False
  
-                table_record = make_table_record(doc_id=doc_id,markdown=element.get("markdown", ""), page_no=page_no, 
-                                                 table_index=element.get("table_index", 1),appendix=current_appendix, appendix_title=current_appendix_title,)
+                table_record = make_table_record(doc_id=doc_id,markdown=element.get("markdown", ""), page_no=page_no, table_index=element.get("table_index", 1),
+                                                printed_page = printed_page, appendix=current_appendix, appendix_title=current_appendix_title,)
                 output.append(table_record)
                 continue
  
@@ -179,7 +175,7 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
                 if appendix_heading:
  
                     if flat_buffer:
-                        flush_flat_buffer(output=output,buffer=flat_buffer,doc_id=doc_id,page_no=flat_buffer_page or page_no,
+                        flush_flat_buffer(output=output,buffer=flat_buffer,doc_id=doc_id,page_no=flat_buffer_page or page_no, printed_page=printed_page,
                             is_heading=flat_buffer_is_heading,appendix=current_appendix,appendix_title=current_appendix_title,)
 
                     flat_buffer_page = None
@@ -197,6 +193,7 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
                         "metadata": {
                             "doc_id": doc_id,
                             "page": page_no,
+                            "printed_page": printed_page,
                             "element_type": "TEXT",
                             "appendix": current_appendix,
                             "appendix_title": current_appendix_title,
@@ -209,7 +206,7 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
  
                 if heading:
                     if flat_buffer:
-                        flush_flat_buffer(output=output,buffer=flat_buffer, doc_id=doc_id, page_no=flat_buffer_page or page_no,
+                        flush_flat_buffer(output=output,buffer=flat_buffer, doc_id=doc_id, page_no=flat_buffer_page or page_no, printed_page=printed_page,
                                          is_heading=flat_buffer_is_heading, appendix=current_appendix, appendix_title=current_appendix_title,)
                         flat_buffer_page = None
                         flat_buffer_is_heading = False
@@ -223,6 +220,7 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
                             section_no=number,
                             name=name,
                             page_no=page_no,
+                            printed_page=printed_page,
                         )
                         current_subsection = None
                         continue
@@ -245,6 +243,7 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
                             section_no=number,
                             name=name,
                             page_no=page_no,
+                            printed_page=printed_page,
                         )
                         current_subsection = None
                         continue
@@ -256,6 +255,7 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
                         # If parent Section was not previously use its number as temporary name.
                         name=section_no,
                         page_no=page_no,
+                        printed_page=printed_page,
                     )
  
                     current_subsection = make_subsection_record(
@@ -263,6 +263,9 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
                         subsection_no=number,
                         name=name,
                         page_no=page_no,
+                        printed_page=printed_page,
+                        section_no=current_section["Section"],
+                        section_name=current_section["Name"],
                         appendix=current_appendix,
                         appendix_title=current_appendix_title,
                     )
@@ -293,7 +296,7 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
                         # OKLAHOMA COMPLETE HEALTH,
                         # INC.
                         if ends_sentence(line) or not line.endswith(","):
-                            flush_flat_buffer(output=output, buffer=flat_buffer, doc_id=doc_id, page_no=flat_buffer_page,
+                            flush_flat_buffer(output=output, buffer=flat_buffer, doc_id=doc_id, page_no=flat_buffer_page,printed_page=printed_page,
                                 is_heading=True,appendix=current_appendix,appendix_title=current_appendix_title,)
                             flat_buffer_page = None
                             flat_buffer_is_heading = False
@@ -302,14 +305,14 @@ def build_section_json(pages: List[Dict[str, Any]], doc_id: str) -> List[Dict[st
                     else:
                         # Keep paragraph lines together until a sentence ends.
                         if ends_sentence(line):
-                            flush_flat_buffer(output=output,buffer=flat_buffer,doc_id=doc_id,page_no=flat_buffer_page,
+                            flush_flat_buffer(output=output,buffer=flat_buffer,doc_id=doc_id,page_no=flat_buffer_page, printed_page=printed_page,
                                 is_heading=False,appendix=current_appendix,appendix_title=current_appendix_title,)
                             flat_buffer_page = None
                             flat_buffer_is_heading = False
 
     # Flush text remaining at the end of the PDF
     if flat_buffer:
-        flush_flat_buffer(output=output,buffer=flat_buffer,doc_id=doc_id,page_no=flat_buffer_page or 1,
+        flush_flat_buffer(output=output,buffer=flat_buffer,doc_id=doc_id,page_no=flat_buffer_page or 1,printed_page=printed_page,
             is_heading=flat_buffer_is_heading,appendix=current_appendix,appendix_title=current_appendix_title,)
  
     return output
@@ -320,6 +323,59 @@ def parse_pdf_to_records(pdf_path: Path) -> List[Dict[str, Any]]:
     pages = extract_pdf_pages(pdf_path)
     doc_id = pdf_path.stem
     return build_section_json(pages, doc_id)
+
+def parse_docx_to_records(docx_path: Path) -> List[Dict[str, Any]]:
+    doc = Document(docx_path)
+    doc_id = docx_path.stem
+    records = []
+ 
+    for idx, paragraph in enumerate(doc.paragraphs, start=1):
+        text = paragraph.text.strip()
+        if not text:
+            continue
+ 
+        records.append({
+            "doc_id": f"{doc_id}::p{idx}",
+            "text": text,
+            "metadata": {
+                "doc_id": doc_id,
+                "page": None,
+                "element_type": "TEXT",
+                "subtype": "paragraph",
+                "paragraph_index": idx,
+                "source_file_type": "docx",
+            },
+        })
+ 
+    for table_idx, table in enumerate(doc.tables, start=1):
+        rows = []
+        for row in table.rows:
+            cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            rows.append("| " + " | ".join(cells) + " |")
+ 
+        if not rows:
+            continue
+ 
+        if len(rows) > 1:
+            separator = "| " + " | ".join(["---"] * len(table.rows[0].cells)) + " |"
+            table_text = "\n".join([rows[0], separator] + rows[1:])
+        else:
+            table_text = rows[0]
+ 
+        records.append({
+            "doc_id": f"{doc_id}::table{table_idx}",
+            "text": table_text,
+            "metadata": {
+                "doc_id": doc_id,
+                "page": None,
+                "element_type": "TABLE",
+                "subtype": "table",
+                "table_index": table_idx,
+                "source_file_type": "docx",
+            },
+        })
+ 
+    return records
 
 def parse_pdf_to_json(pdf_path: Path, output_json: Path) -> None:
     parsed = parse_pdf_to_records(pdf_path)
@@ -340,10 +396,16 @@ def main():
     input_file = Path(args.pdf_path)
     output_json = Path(args.output_json)
  
-    if input_file.suffix.lower() != ".pdf":
-        raise ValueError("This version supports PDF only. Convert DOC/DOCX to PDF first.")
- 
-    parse_pdf_to_json(input_file, output_json)
- 
+    if input_file.suffix.lower() == ".pdf":
+        parsed = parse_pdf_to_records(input_file)
+    elif input_file.suffix.lower() == ".docx":
+        parsed = parse_docx_to_records(input_file)
+    else:
+        raise ValueError("Only .pdf and .docx files are supported.")
+    
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    with output_json.open("w", encoding="utf-8") as f:
+        json.dump(parsed, f, indent=2, ensure_ascii=False)
+
 if __name__ == "__main__":
     main()

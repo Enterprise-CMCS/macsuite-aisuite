@@ -5,7 +5,8 @@ import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
-import type * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3 from "aws-cdk-lib/aws-s3";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import type * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
 
@@ -14,8 +15,13 @@ import {
   type DeploymentConfig,
   type DeploymentEnvironmentName,
 } from "../deployment-config";
+import { STUB_VPC_CONTEXT_KEY } from "./networking-construct";
 
 export const API_CONTAINER_PORT = 8001;
+
+/** Placeholder ACM ARN used only when synthesizing with `aisuite:stubVpc`. */
+const STUB_ALB_CERTIFICATE_ARN =
+  "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000";
 
 export const API_HEALTH_CHECK_PATH = "/health";
 
@@ -166,24 +172,61 @@ export class ComputeConstruct extends Construct {
       },
     );
 
+    // Allow HTTPS from the CMS Cloud VPN Prefix List (custom source)
+    loadBalancerSecurityGroup.addIngressRule(
+      ec2.Peer.prefixList("pl-006315be223e9c9a7"),
+      ec2.Port.tcp(443),
+      "Allow Traffic from CMS Cloud VPN Prefix List",
+    );
+
     this.loadBalancer = new elbv2.ApplicationLoadBalancer(this, "Alb", {
       internetFacing: false,
       loadBalancerName: serviceName,
       securityGroup: loadBalancerSecurityGroup,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      deletionProtection: protectedEnvironment,
     });
 
+    // Configure ALB access logging to the central access-logs bucket under
+    // the `ALB-Access-Logs` prefix. We reference the existing bucket by name.
+    try {
+      const accessLogsBucket = s3.Bucket.fromBucketName(
+        this,
+        "CentralAccessLogsBucket",
+        props.deploymentConfig.accessLogsBucketName,
+      );
+      // Use a prefix based on the ALB/service name so logs are organized per ALB.
+      // Prefix must not start or end with '/'. Use `ALB-Access-Logs/<serviceName>`.
+      this.loadBalancer.logAccessLogs(accessLogsBucket, `ALB-Access-Logs/${serviceName}`);
+    } catch {
+      // Best-effort: if the method or bucket doesn't resolve during synth, continue.
+    }
+
+    // Require an ACM certificate ARN for HTTPS (443). When synthesizing with
+    // stub VPC (unit tests / PR CI), fall back to a placeholder ARN so qa/uat/prod
+    // templates can still synth before real certs are configured.
+    const configuredCertArn = props.deploymentConfig.albCertificateArn;
+    const stubVpcContext = this.node.tryGetContext(STUB_VPC_CONTEXT_KEY);
+    const usingStubVpc = stubVpcContext === true || stubVpcContext === "true";
+    const albCertArn = configuredCertArn ?? (usingStubVpc ? STUB_ALB_CERTIFICATE_ARN : undefined);
+    if (!albCertArn) {
+      throw new Error(
+        "ALB certificate ARN is required in deploymentConfig.albCertificateArn to create an HTTPS listener",
+      );
+    }
+    const cert = acm.Certificate.fromCertificateArn(this, "AlbCertificate", albCertArn);
     const listener = this.loadBalancer.addListener("Listener", {
       open: false,
-      port: 80,
-      protocol: elbv2.ApplicationProtocol.HTTP,
+      port: 443,
+      protocol: elbv2.ApplicationProtocol.HTTPS,
+      certificates: [cert],
     });
 
     listener.connections.allowFrom(
       ec2.Peer.ipv4(props.vpc.vpcCidrBlock),
-      ec2.Port.tcp(80),
-      "RAG API HTTP from inside the VPC",
+      ec2.Port.tcp(443),
+      "RAG API HTTPS (443) from inside the VPC",
     );
 
     listener.addTargets("Targets", {

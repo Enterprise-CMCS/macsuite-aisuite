@@ -2,8 +2,7 @@ import re
  
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
- 
+from typing import Any, Dict, List, Optional 
 import pdfplumber
  
  
@@ -24,7 +23,31 @@ APPENDIX_LIST_RE = re.compile(r"^appendix\s+[A-Za-z0-9]+[:\s].*\.{3,}\s*\d+\s*$"
 # Detect possible Appendix headings.
 # Ex.Appendix 1C: "Quality Performance Withhold Program of this Contract...are not automatically treated as Appendix headings.
 APPENDIX_HEADER_RE = re.compile(r"^Appendix\s+([A-Za-z0-9]+)\s*[:.]\s*(.+?)\s*$",re.I,)
+
  
+PRINTED_PAGE_PATTERNS = [
+    r"\bPage\s+(\d+)\b",
+    r"\bPage\s+(\d+)\s+of\s+\d+\b",
+    r"^\s*(\d+)\s*$",
+    r"^\s*-\s*(\d+)\s*-\s*$",
+    r"\b([A-Z]-\d+)\b",
+]
+
+def extract_printed_page(page) -> Optional[str]:
+    x0, top, x1, bottom = page.bbox
+    height = bottom - top
+ 
+    footer = page.crop((x0, top + height * 0.88, x1, bottom)).extract_text() or ""
+    header = page.crop((x0, top, x1, top + height * 0.12)).extract_text() or ""
+ 
+    for text in [footer, header]:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in lines:
+            for pattern in PRINTED_PAGE_PATTERNS:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    return match.group(1)
+    return None
 
 "**Text cleaning **"
 # normalizing text by removing extra spaces, tabs, and newlines
@@ -109,7 +132,7 @@ def should_skip_page(lines: List[str],) -> bool:
         return True
     
     return False
-  
+
 "**Table bboxs extraction to remove smaller tables from larger one **"
 def bbox_area(bbox) -> float:
     x0, top, x1, bottom = bbox
@@ -232,7 +255,6 @@ def table_to_markdown_safe(table: List[List[Optional[str]]],) -> str:
 "**Header/footer helpers**"
 # collect repeated lines coming from top/bottom margins.
 def collect_repeated_lines(pdf_path: Path,) -> set:
- 
     repeated = Counter()
     with pdfplumber.open(pdf_path) as pdf:
  
@@ -455,11 +477,12 @@ def make_text_element(page_no: int, lines: List[str]) -> Dict[str, Any]:
  
 "**Final JSON record helpers**"
 # creating a single json for unspecified texts/paragraphs
-def make_flat_text_record(doc_id: str, text: str, page_no: int, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> Dict[str, Any]:
+def make_flat_text_record(doc_id: str, text: str, page_no: int, printed_page: Optional[str] = None, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> Dict[str, Any]:
  
     metadata = {
         "doc_id": doc_id,
         "page": page_no,
+        "printed_page" : printed_page,
         "element_type": "TEXT",
     }
     if appendix:
@@ -471,15 +494,18 @@ def make_flat_text_record(doc_id: str, text: str, page_no: int, appendix: Option
         "text": text,
         "metadata": metadata,
     }
-  
-# Create a Section record. Existing Section, Name, Text and Subsections fields are preserved.
-def make_section_record(doc_id: str, section_no: str, name: str, page_no: int, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> Dict[str, Any]:
+
+def make_section_record(doc_id: str, section_no: str, name: str, page_no: int, printed_page: Optional[str]= None, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> Dict[str, Any]:
  
     metadata = {
         "doc_id": doc_id,
         "page": page_no,
+        "printed_page": printed_page,
         "element_type": "TEXT",
+        "section": section_no,
+        "section_name": name,
     }
+
     if appendix:
         metadata["appendix"] = appendix
     if appendix_title:
@@ -493,12 +519,17 @@ def make_section_record(doc_id: str, section_no: str, name: str, page_no: int, a
         "metadata": metadata,
     }
  
-# Create a Subsection record.
-def make_subsection_record(doc_id: str, subsection_no: str, name: str, page_no: int, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> Dict[str, Any]:
+
+def make_subsection_record(doc_id: str, subsection_no: str, name: str, page_no: int, printed_page: Optional[str]= None, section_no: Optional[str] = None, section_name: Optional[str] = None, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> Dict[str, Any]:
     metadata = {
         "doc_id": doc_id,
         "page": page_no,
+        "printed_page":printed_page,
         "element_type": "TEXT",
+        "section": section_no,
+        "section_name": section_name,
+        "subsection": subsection_no,
+        "subsection_name":name,
     }
     if appendix:
         metadata["appendix"] = appendix
@@ -510,12 +541,13 @@ def make_subsection_record(doc_id: str, subsection_no: str, name: str, page_no: 
         "Text": "",
         "metadata": metadata,
     }
- 
+
 # Create the final JSON record for a detected table. The table content is stored as Markdown in "text".
-def make_table_record(doc_id: str, markdown: str, page_no: int, table_index: int, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> Dict[str, Any]:
+def make_table_record(doc_id: str, markdown: str, page_no: int,  table_index: int, printed_page: Optional[str] = None, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> Dict[str, Any]:
     metadata = {
         "doc_id": doc_id,
         "page": page_no,
+        "printed_page": printed_page,
         "element_type": "TABLE",
         "table_index": table_index,
     }
@@ -530,7 +562,7 @@ def make_table_record(doc_id: str, markdown: str, page_no: int, table_index: int
     }
  
 # Flush flats text to the output. Flat text is used for normal content that does not belong to a recognized Section or Subsection.
-def flush_flat_buffer(output: List[Dict[str, Any]], buffer: List[str], doc_id: str, page_no: int, is_heading: bool = False, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> None:
+def flush_flat_buffer(output: List[Dict[str, Any]], buffer: List[str], doc_id: str, page_no: int, printed_page: Optional[str] = None, is_heading: bool = False, appendix: Optional[str] = None, appendix_title: Optional[str] = None) -> None:
     if not buffer:
         return
     text = clean_text(" ".join(buffer))
@@ -545,6 +577,7 @@ def flush_flat_buffer(output: List[Dict[str, Any]], buffer: List[str], doc_id: s
             doc_id=doc_id,
             text=text,
             page_no=page_no,
+            printed_page=printed_page,
             appendix=appendix,
             appendix_title=appendix_title,
         )

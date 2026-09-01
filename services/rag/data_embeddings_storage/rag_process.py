@@ -72,25 +72,15 @@ async def invoke_rag_process():
         str_bda_text_json_filename = os.path.join(bda_text_output_folder, str_bda_text_json_filename)
         texts_data = Helper.get_json_from_s3(output_bucket, str_bda_text_json_filename)
 
-        #with open(str_bda_text_json_file_name, "r", encoding='utf-8') as f:
-        #    texts_data = json.load(f)
-
-        # str_bda_images_json_file_name = "output-BDA-texts.json"
-
         # get BDA Images Data
         log.info(f"Opening Output BDA Images Json File to access the BDA pre-processed data={str_bda_images_json_filename}")
         str_bda_images_json_filename = os.path.join(bda_image_output_folder, str_bda_images_json_filename)
         images_data = Helper.get_json_from_s3(output_bucket, str_bda_images_json_filename)
-        #with open(str_bda_images_json_file_name, "r", encoding='utf-8') as f:
-        #    images_data = json.load(f)
-
 
         # get Table Images Data
         log.info(f"Opening Output BDA Table Json File to access the BDA pre-processed data={str_bda_tables_json_filename}")
         str_bda_tables_json_filename = os.path.join(bda_table_output_folder, str_bda_tables_json_filename)
         table_data = Helper.get_json_from_s3(output_bucket, str_bda_tables_json_filename)
-        #with open(str_bda_images_json_file_name, "r", encoding='utf-8') as f:
-        #    images_data = json.load(f)
 
         log.info(f"Length of the text_data {len(texts_data)}")
         log.info(f"Length of the image_data {len(images_data)}")
@@ -119,33 +109,12 @@ async def invoke_rag_process():
                 log.info(f"Processed: {filename}")
 
         # Write Data to temp file
-
         log.info(f"Total valid JSON entries: {len(json_files_table)}")
 
 
         # Combine all JSON data (texts, images, table, and excel files)
         all_json_data = texts_data + images_data + table_data + json_files_table
         log.info(f"Total number of documents before splitting: {len(all_json_data)}")
-
-        '''
-        for filename in os.listdir(strOutPutExcelJsonFolderPreProcess):
-            if filename.endswith(".json"):
-                file_path = os.path.join(strOutPutExcelJsonFolderPreProcess, filename)
-                log.info("Processing file Excel Json Files " + file_path)
-                with open(file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if data:
-                        flat_data = flatten_json(data)
-                        valid_items = [item for item in flat_data if isinstance(item, dict) and item.get("text")]
-                        json_files_table.extend(valid_items)
-                log.info(f"Processed: {filename}")
-        
-        log.info(f"Total valid JSON entries: {len(json_files_table)}")
-        
-        # Combine all JSON data (texts, images, and excel files)
-        all_json_data = texts_data + images_data + json_files_table
-        log.info(f"Total number of documents before splitting: {len(all_json_data)}")
-        '''
 
         # Initialize text splitter
         text_splitter = RecursiveCharacterTextSplitter(
@@ -184,8 +153,6 @@ async def invoke_rag_process():
         # Save split documents to JSON file
         log.info("Save split documents to JSON file")
 
-        # strRagSplitOutPutFile = "split_final_document_data.json"
-        # strRagSplitOutPutFile= os.getenv("RagSplitOutPutFile")
         str_rag_split_out_put_file = Helper.get_property("RagSplitOutPutFile")
         rag_split_out_put_bucket = Helper.get_property("RagSplitOutPutBucket")
         rag_split_out_put_folder = Helper.get_property("RagSplitOutPutFolder")
@@ -198,8 +165,6 @@ async def invoke_rag_process():
 
         s3_client.put_object(Bucket=rag_split_out_put_bucket, Key=str_rag_split_out_put_file, Body=json.dumps(split_docs, indent=4), ContentType='application/json; charset=utf-8')
 
-        #with open(strRagSplitOutPutFile, "w", encoding="utf-8") as f:
-        #    json.dump(split_docs, f, ensure_ascii=False, indent=4)
 
         log.info(f"Split documents saved to: {str_rag_split_out_put_file}")
         """ Moving this the following code to generating embeddings"""

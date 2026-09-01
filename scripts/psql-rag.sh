@@ -19,6 +19,7 @@ set -euo pipefail
 
 ENVIRONMENT="${ENVIRONMENT:-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
+export AWS_PROFILE="${AWS_PROFILE:-aisuite-dev}"
 USE_MASTER=0
 PROBE=0
 PSQL_ARGS=()
