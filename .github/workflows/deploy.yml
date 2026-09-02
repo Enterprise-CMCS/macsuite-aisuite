@@ -264,12 +264,12 @@ jobs:
             '[.TargetHealthDescriptions[]? | select(.TargetHealth.State == "healthy")] | length > 0' \
             <<<"${TARGET_HEALTH}" >/dev/null
 
-      - name: Deploy infrastructure only (API inactive)
+      - name: Deploy infrastructure only (API active)
         if: env.DEPLOYMENT_ENV != 'dev'
         run: |
           set -euo pipefail
 
-          echo "Runtime activation is supported only for dev; deploying ${DEPLOYMENT_ENV} with the API inactive."
+          echo "Deploying ${DEPLOYMENT_ENV} with the API active."
           pnpm run cdk:deploy \
             --context environment=${DEPLOYMENT_ENV} \
             --context aisuite:activateApi=true \
