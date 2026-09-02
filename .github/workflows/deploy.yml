@@ -89,7 +89,7 @@ jobs:
 
           pnpm run cdk:deploy \
             --context environment=${DEPLOYMENT_ENV} \
-            --context aisuite:activateApi=false \
+            --context aisuite:activateApi=true \
             --context aisuite:apiImageTag=${{ github.sha }} \
             --context aisuite:batchImageTag=${{ github.sha }}
 
@@ -272,6 +272,6 @@ jobs:
           echo "Runtime activation is supported only for dev; deploying ${DEPLOYMENT_ENV} with the API inactive."
           pnpm run cdk:deploy \
             --context environment=${DEPLOYMENT_ENV} \
-            --context aisuite:activateApi=false \
+            --context aisuite:activateApi=true \
             --context aisuite:apiImageTag=${{ github.sha }} \
             --context aisuite:batchImageTag=${{ github.sha }}
