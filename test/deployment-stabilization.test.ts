@@ -301,7 +301,7 @@ describe("deployment workflow contract", () => {
 
   it("orders infrastructure, images, bootstrap, activation, and health checks", () => {
     const orderedMarkerAlternatives = [
-      [`--context ${ACTIVATE_API_CONTEXT_KEY}=false`],
+      [`--context ${ACTIVATE_API_CONTEXT_KEY}=false`, `--context ${ACTIVATE_API_CONTEXT_KEY}=true`],
       ["amazon-ecr-login", "aws ecr get-login-password"],
       ["docker buildx build"],
       ["aws ecs run-task"],
