@@ -89,7 +89,7 @@ jobs:
 
           pnpm run cdk:deploy \
             --context environment=${DEPLOYMENT_ENV} \
-            --context aisuite:activateApi=true \
+            --context aisuite:activateApi=false \
             --context aisuite:apiImageTag=${{ github.sha }} \
             --context aisuite:batchImageTag=${{ github.sha }}
 
@@ -264,12 +264,12 @@ jobs:
             '[.TargetHealthDescriptions[]? | select(.TargetHealth.State == "healthy")] | length > 0' \
             <<<"${TARGET_HEALTH}" >/dev/null
 
-      - name: Deploy infrastructure only (API active)
+      - name: Deploy infrastructure and activate API
         if: env.DEPLOYMENT_ENV != 'dev'
         run: |
           set -euo pipefail
 
-          echo "Deploying ${DEPLOYMENT_ENV} with the API active."
+          echo "Deploying ${DEPLOYMENT_ENV} with the API activated (desired count > 0)."
           pnpm run cdk:deploy \
             --context environment=${DEPLOYMENT_ENV} \
             --context aisuite:activateApi=true \
