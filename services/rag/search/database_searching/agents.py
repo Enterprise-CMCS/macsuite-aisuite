@@ -98,6 +98,7 @@ class ContractDeps:
     candidate_limit: int = CANDIDATE_LIMIT
     max_searches: int = MAX_SEARCHES
     searches: int = 0
+    query_cache: Dict[str, list] = field(default_factory=dict)
 
 
 def build_deps(table_name=None):
@@ -105,9 +106,21 @@ def build_deps(table_name=None):
 
 
 async def retrieve(deps, query):
-    return await deps.search_engine.hybrid_search(
+    # A requirement review issues up to MAX_SEARCHES tool calls plus the seed
+    # retrieval; the model sometimes repeats a query verbatim (e.g. the analyst
+    # re-searching the requirement text it was already seeded with). Cache by
+    # normalized query for the lifetime of one review so a repeat doesn't pay a
+    # second Bedrock embedding call and DB round trip.
+    cache_key = _normalize(query)
+    cached = deps.query_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    results = await deps.search_engine.hybrid_search(
         query, limit=deps.top_k,
         dense_limit=deps.candidate_limit, lexical_limit=deps.candidate_limit)
+    deps.query_cache[cache_key] = results
+    return results
 
 
 def record_chunks(deps, results):
@@ -322,7 +335,7 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
         review.error = "Empty requirement text."
         return review
 
-    deps = replace(deps or build_deps(), chunks={}, searches=0)
+    deps = replace(deps or build_deps(), chunks={}, searches=0, query_cache={})
     run_usage = usage if usage is not None else RunUsage()
 
     try:
@@ -393,6 +406,6 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
 
 
 async def answer_question(query, deps=None, usage=None):
-    deps = replace(deps or build_deps(), chunks={}, searches=0)
+    deps = replace(deps or build_deps(), chunks={}, searches=0, query_cache={})
     result = await question_agent.run(query, deps=deps, usage=usage if usage is not None else RunUsage())
     return result.output
