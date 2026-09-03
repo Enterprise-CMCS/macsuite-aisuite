@@ -45,7 +45,7 @@ def aws_client(aws_service_name, config=None):
     #log.info(f"settings.aws_client(): Method entered: aws_service_name= {aws_service_name}")
     session = aws_session()
     client = session.client(aws_service_name, config=config)
-    log.debug(f"settings.aws_client(): Method exiting: Setting session.client({ aws_service_name}), Return Client=  { client}")
+    #log.debug(f"settings.aws_client(): Method exiting: Setting session.client({ aws_service_name}), Return Client=  { client}")
     return client
 
 
