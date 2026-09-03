@@ -11,6 +11,9 @@ dist/
 
 data/*
 
+# Contract Review Tool workbooks and the reviewed copies the run job writes.
+output_excel/
+
 pnpm-debug.log*
 .vscode/
 .cursor/
