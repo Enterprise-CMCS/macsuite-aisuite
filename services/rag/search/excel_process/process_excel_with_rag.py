@@ -44,7 +44,7 @@ STATUS_WORDING = {
 
 STANDARD_WORDING = {"MET": "Met", "NOT MET": "Not met", "UNCLEAR": "Unsure"}
 
-CONFIDENCE_BANDS = ((0.80, "Strong evidence"), (0.60, "Moderate evidence"))
+CONFIDENCE_BANDS = ((0.70, "Strong evidence"), (0.45, "Moderate evidence"))
 LOWEST_BAND = "Limited evidence"
 
 MAX_CELL_CHARS = 4000
