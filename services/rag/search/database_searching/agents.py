@@ -33,7 +33,10 @@ from search.database_searching.review_models import (
 from search.database_searching.search import SearchEngine
 
 TOP_K = 8
-CANDIDATE_LIMIT = 40
+# hybrid_search() clamps HNSW's ef_search to at least MIN_EF_SEARCH (64) regardless
+# of dense_limit, so anything below 64 here buys no extra recall from the dense leg -
+# it only shrinks how many candidates come back for fusion.
+CANDIDATE_LIMIT = 64
 
 MAX_SEARCHES = 3
 
