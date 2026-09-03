@@ -8,3 +8,5 @@ awswrangler==3.13.0
 uvicorn>=0.39.0
 structlog==25.5.0
 openpyxl==3.1.5
+python-docx==1.2.0
+pymupdf==1.28.2
