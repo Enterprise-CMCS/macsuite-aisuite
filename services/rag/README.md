@@ -180,9 +180,13 @@ means nothing to a reviewer reading the spreadsheet. `format_evidence()` in
 document only, so the model has nothing else to cite by, and `quoted_chunk()`
 matches the quote it returns back to the passage it came from. That match is also
 what `verified` means: the wording really is in the contract rather than
-something the model composed. Reviews recorded before this change still carry
-ids in their prose, so `in_reviewer_terms()` swaps them for the pages they came
-from as the workbook is written.
+something the model composed. When no chunk reaches the match threshold —
+often a quote that legitimately spans two adjacent chunks, or drifted from the
+source through OCR/table extraction — `quoted_chunk()` still returns the
+closest-scoring chunk so the row gets a page to check by hand instead of no
+location at all; `verified` stays `False` either way. Reviews recorded before
+this change still carry ids in their prose, so `in_reviewer_terms()` swaps them
+for the pages they came from as the workbook is written.
 
 ## Running the service
 
