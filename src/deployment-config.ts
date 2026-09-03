@@ -25,13 +25,14 @@ export const DEPLOYMENT_ENVIRONMENT_ACCOUNT_TIER = {
 } as const satisfies Record<DeploymentEnvironmentName, AwsAccountTier>;
 
 /**
- * CloudTamer-provisioned VPC Name tags (aisuite-east-*). App stages map 1:1
- * except `uat` → `aisuite-east-test` (CloudTamer has no uat VPC name).
+ * CloudTamer-provisioned VPC Name tags (aisuite-east-*). QA shares the existing
+ * `aisuite-east-dev` Name tag, and UAT uses `aisuite-east-impl`. CloudTamer
+ * VPCs are not renamed.
  */
 export const DEPLOYMENT_ENVIRONMENT_VPC_NAME = {
   dev: "aisuite-east-dev",
-  qa: "aisuite-east-qa",
-  uat: "aisuite-east-test",
+  qa: "aisuite-east-dev",
+  uat: "aisuite-east-impl",
   prod: "aisuite-east-prod",
 } as const satisfies Record<DeploymentEnvironmentName, string>;
 
@@ -42,6 +43,19 @@ export const DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID: Partial<
   Record<DeploymentEnvironmentName, string>
 > = {
   dev: "sg-0964f9710d200b1ac",
+  qa: "sg-0964f9710d200b1ac",
+  uat: "sg-049f5a4447ace5a2b",
+  prod: "sg-0c723aa082515868d"
+};
+
+/** Per-environment ACM certificate ARNs for the ALB HTTPS listener. */
+export const DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN: Partial<
+  Record<DeploymentEnvironmentName, string>
+> = {
+  dev: "arn:aws:acm:us-east-1:205501819586:certificate/5b20cd15-197a-4efc-b05c-0063a371ff30",
+  qa: "arn:aws:acm:us-east-1:205501819586:certificate/cd2183fd-ba83-448c-99a6-521d00b3565f",
+  uat: "arn:aws:acm:us-east-1:205501819586:certificate/56dab682-bd09-4873-b03e-db111b11ba51",
+  prod: "arn:aws:acm:us-east-1:609425363642:certificate/89f2ea0b-f92b-473a-adf4-1c1629378868",
 };
 
 /**
@@ -97,6 +111,10 @@ export interface DeploymentConfig {
   vpcName: (typeof DEPLOYMENT_ENVIRONMENT_VPC_NAME)[DeploymentEnvironmentName];
   /** CloudTamer cmscloud-vpn SG id when this stage allows VPN access to RDS. */
   vpnSecurityGroupId?: string;
+  /** Optional ARN of an ACM certificate to use for the ALB HTTPS listener. */
+  albCertificateArn?: string;
+  /** Name of the central S3 bucket that receives server access logs (managed externally). */
+  accessLogsBucketName: string;
 }
 
 const ACCOUNT_ID_PATTERN = /^\d{12}$/;
@@ -126,7 +144,8 @@ export function getDeploymentConfig(
   const accountTier = DEPLOYMENT_ENVIRONMENT_ACCOUNT_TIER[environmentName];
   const protectedEnvironment = environmentName !== "dev";
 
-  const deployedAt = process.env.DEPLOYMENT_TIMESTAMP ?? new Date().toISOString();
+  const deployedAt =
+    process.env.DEPLOYMENT_TIMESTAMP?.trim() || new Date().toISOString();
   return {
     accountTier,
     awsEnvironment: {
@@ -146,8 +165,9 @@ export function getDeploymentConfig(
       DeployedAt: deployedAt
     },
     vpcName: DEPLOYMENT_ENVIRONMENT_VPC_NAME[environmentName],
-    vpnSecurityGroupId:
-      DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
+    vpnSecurityGroupId: DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
+    albCertificateArn: DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN[environmentName],
+    accessLogsBucketName: `cms-cloud-${resolveAccountId(accountTier)}-${DEFAULT_REGION}-access-logs`,
   };
 }
 

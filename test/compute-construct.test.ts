@@ -9,6 +9,7 @@ import {
 } from "../src/constructs/compute-construct";
 import { STUB_VPC_CONTEXT_KEY } from "../src/constructs/networking-construct";
 import {
+  DEPLOYMENT_ENVIRONMENT_NAMES,
   type DeploymentEnvironmentName,
   getDeploymentConfig,
 } from "../src/deployment-config";
@@ -70,7 +71,7 @@ function apiContainerEnvironment(
   );
 }
 
-describe.each(["dev", "prod"] as const)(
+describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
   "AISuite %s RAG API",
   (environmentName) => {
     const serviceName = `aisuite-${environmentName}-rag-api`;
@@ -107,10 +108,33 @@ describe.each(["dev", "prod"] as const)(
 
     it("fronts the service with an internal ALB targeting the health endpoint", () => {
       const template = synthesize(environmentName);
+      const protectedEnvironment = environmentName !== "dev";
 
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::LoadBalancer",
-        { Scheme: "internal", Type: "application" },
+        {
+          Scheme: "internal",
+          Type: "application",
+          LoadBalancerAttributes: Match.arrayWith([
+            {
+              Key: "deletion_protection.enabled",
+              Value: String(protectedEnvironment),
+            },
+          ]),
+        },
+      );
+      template.hasResourceProperties(
+        "AWS::ElasticLoadBalancingV2::Listener",
+        {
+          Port: 443,
+          Protocol: "HTTPS",
+          Certificates: Match.arrayWith([
+            Match.objectLike({
+              CertificateArn: getDeploymentConfig(environmentName)
+                .albCertificateArn,
+            }),
+          ]),
+        },
       );
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::TargetGroup",

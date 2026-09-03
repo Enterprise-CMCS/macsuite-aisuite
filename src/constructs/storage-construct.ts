@@ -14,6 +14,8 @@ export class StorageConstruct extends Construct {
   public readonly postProcessingBucket: s3.Bucket;
   public readonly pipelineCodeBucket: s3.Bucket;
   public readonly pipelineTempBucket: s3.Bucket;
+  private readonly deploymentConfig: DeploymentConfig;
+  private readonly accessLogsBucket: s3.IBucket;
 
   public constructor(
     scope: Construct,
@@ -22,7 +24,16 @@ export class StorageConstruct extends Construct {
   ) {
     super(scope, id);
 
+    this.deploymentConfig = props.deploymentConfig;
     const { name, protectedEnvironment } = props.deploymentConfig;
+
+    // Import the central access-logs bucket once and reuse it for all buckets
+    this.accessLogsBucket = s3.Bucket.fromBucketName(
+      this,
+      `CentralAccessLogsBucket`,
+      this.deploymentConfig.accessLogsBucketName,
+    );
+    // Note: access-logs bucket is managed externally; do not modify its policy here.
 
     this.documentsBucket = this.createBucket(
       "DocumentsBucket",
@@ -58,6 +69,9 @@ export class StorageConstruct extends Construct {
     bucketName: string,
     protectedEnvironment: boolean,
   ): s3.Bucket {
+    // Reference the central access-logs bucket (assumed to already exist).
+    const accessLogsBucket = this.accessLogsBucket;
+
     return new s3.Bucket(this, id, {
       autoDeleteObjects: !protectedEnvironment,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -68,6 +82,8 @@ export class StorageConstruct extends Construct {
         ? cdk.RemovalPolicy.RETAIN
         : cdk.RemovalPolicy.DESTROY,
       versioned: true,
+      serverAccessLogsBucket: accessLogsBucket,
+      serverAccessLogsPrefix: `${bucketName}/`,
     });
   }
 }

@@ -47,12 +47,29 @@ class BootstrapHelpersTests(unittest.IsolatedAsyncioTestCase):
                 {"tablename": "embeddings_tn_6756_tenncare"},
             ]
         )
-        connection.fetchval = AsyncMock(return_value="ALTER TABLE ...")
+        connection.fetchval = AsyncMock(
+            side_effect=[False, "ALTER TABLE ...", False, "ALTER TABLE ..."],
+        )
         connection.execute = AsyncMock()
 
         await migrate_public_embeddings_tables(connection, APP_SCHEMA)
 
         self.assertEqual(connection.execute.await_count, 2)
+
+    async def test_migrate_public_embeddings_skips_existing_target_tables(self):
+        connection = AsyncMock()
+        connection.fetch = AsyncMock(
+            return_value=[
+                {"tablename": "embeddings"},
+                {"tablename": "embeddings_tn_6756_tenncare"},
+            ]
+        )
+        connection.fetchval = AsyncMock(side_effect=[True, False, "ALTER TABLE ..."])
+        connection.execute = AsyncMock()
+
+        await migrate_public_embeddings_tables(connection, APP_SCHEMA)
+
+        self.assertEqual(connection.execute.await_count, 1)
 
     async def test_grant_app_role_privileges_executes_grants(self):
         connection = AsyncMock()
@@ -76,6 +93,7 @@ class BootstrapHelpersTests(unittest.IsolatedAsyncioTestCase):
                 "CREATE ROLE aisuite_app_owner NOLOGIN",
                 "GRANT aisuite_app_owner TO aisuite_admin",
                 True,  # aisuite_app exists
+                "GRANT aisuite_app TO aisuite_admin",
                 "GRANT aisuite_app_owner TO aisuite_app",
                 "ALTER ROLE aisuite_app INHERIT",
                 False,  # aisuite_app_clone missing
@@ -88,11 +106,37 @@ class BootstrapHelpersTests(unittest.IsolatedAsyncioTestCase):
         executed = [c.args[0] for c in connection.execute.await_args_list]
         self.assertIn("CREATE ROLE aisuite_app_owner NOLOGIN", executed)
         self.assertIn("GRANT aisuite_app_owner TO aisuite_admin", executed)
+        self.assertIn("GRANT aisuite_app TO aisuite_admin", executed)
         self.assertIn("GRANT aisuite_app_owner TO aisuite_app", executed)
         self.assertIn("ALTER ROLE aisuite_app INHERIT", executed)
         self.assertFalse(
             any("aisuite_app_clone" in str(stmt) for stmt in executed),
         )
+
+    async def test_ensure_app_owner_role_grants_clone_to_current_user(self):
+        connection = AsyncMock()
+        connection.fetchval = AsyncMock(
+            side_effect=[
+                True,  # owner exists
+                "GRANT aisuite_app_owner TO aisuite_admin",
+                True,  # aisuite_app exists
+                "GRANT aisuite_app TO aisuite_admin",
+                "GRANT aisuite_app_owner TO aisuite_app",
+                "ALTER ROLE aisuite_app INHERIT",
+                True,  # aisuite_app_clone exists
+                "GRANT aisuite_app_clone TO aisuite_admin",
+                "GRANT aisuite_app_owner TO aisuite_app_clone",
+                "ALTER ROLE aisuite_app_clone INHERIT",
+            ]
+        )
+        connection.execute = AsyncMock()
+
+        await ensure_app_owner_role(connection)
+
+        executed = [c.args[0] for c in connection.execute.await_args_list]
+        self.assertIn("GRANT aisuite_app_clone TO aisuite_admin", executed)
+        self.assertIn("GRANT aisuite_app_owner TO aisuite_app_clone", executed)
+        self.assertIn("ALTER ROLE aisuite_app_clone INHERIT", executed)
 
     async def test_reassign_schema_objects_alters_tables_and_sequences(self):
         connection = AsyncMock()
