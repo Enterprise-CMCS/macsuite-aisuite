@@ -44,7 +44,7 @@ STATUS_WORDING = {
 
 STANDARD_WORDING = {"MET": "Met", "NOT MET": "Not met", "UNCLEAR": "Unsure"}
 
-CONFIDENCE_BANDS = ((0.80, "Strong evidence"), (0.60, "Moderate evidence"))
+CONFIDENCE_BANDS = ((0.70, "Strong evidence"), (0.45, "Moderate evidence"))
 LOWEST_BAND = "Limited evidence"
 
 MAX_CELL_CHARS = 4000
@@ -134,11 +134,12 @@ def _quote_lines(records):
     lines = []
     for record in records:
         # The file name as well as the page, so a reviewer knows which document to
-        # open before turning to the page.
+        # open before turning to the page. Verification status is left out of this
+        # text - it still drives the Quotes Verified column on the RAG Analysis
+        # sheet, but flagging it here on every quote read as noise more than signal.
         location = ", ".join(part for part in (record.doc_id,
                                                page_label(record.page, record.printed_page)) if part)
-        flag = "" if record.verified else " [unverified]"
-        lines.append(f"{location}{flag}\n\"{_squeeze(record.quote)}\"".strip())
+        lines.append(f"{location}\n\"{_squeeze(record.quote)}\"".strip())
     return "\n\n".join(lines)
 
 
@@ -244,9 +245,7 @@ class CRTWorkbook:
         if band:
             parts.append(f"Confidence: {band}")
 
-        if review.evidence and not review.quotes_verified:
-            parts.append("Note: at least one quote could not be matched back to the retrieved text.")
-        elif not review.evidence and not review.error:
+        if not review.evidence and not review.error:
             parts.append("Note: no contract text was quoted for this status. The confidence above "
                          "comes from the passages the search returned, not from a cited provision.")
 

@@ -76,7 +76,7 @@ class SearchEngine:
         finally:
             await release_connection(connection)
 
-    async def hybrid_search(self, query_text, limit=12, dense_limit=60, lexical_limit=60):
+    async def hybrid_search(self, query_text, limit=12, dense_limit=MIN_EF_SEARCH, lexical_limit=MIN_EF_SEARCH):
         embedding_flattened = await self.embed_query(query_text)
         ef_search = max(MIN_EF_SEARCH, dense_limit)
 

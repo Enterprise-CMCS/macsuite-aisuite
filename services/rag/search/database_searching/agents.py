@@ -33,7 +33,10 @@ from search.database_searching.review_models import (
 from search.database_searching.search import SearchEngine
 
 TOP_K = 8
-CANDIDATE_LIMIT = 40
+# hybrid_search() clamps HNSW's ef_search to at least MIN_EF_SEARCH (64) regardless
+# of dense_limit, so anything below 64 here buys no extra recall from the dense leg -
+# it only shrinks how many candidates come back for fusion.
+CANDIDATE_LIMIT = 64
 
 MAX_SEARCHES = 3
 
@@ -98,6 +101,7 @@ class ContractDeps:
     candidate_limit: int = CANDIDATE_LIMIT
     max_searches: int = MAX_SEARCHES
     searches: int = 0
+    query_cache: Dict[str, list] = field(default_factory=dict)
 
 
 def build_deps(table_name=None):
@@ -105,9 +109,21 @@ def build_deps(table_name=None):
 
 
 async def retrieve(deps, query):
-    return await deps.search_engine.hybrid_search(
+    # A requirement review issues up to MAX_SEARCHES tool calls plus the seed
+    # retrieval; the model sometimes repeats a query verbatim (e.g. the analyst
+    # re-searching the requirement text it was already seeded with). Cache by
+    # normalized query for the lifetime of one review so a repeat doesn't pay a
+    # second Bedrock embedding call and DB round trip.
+    cache_key = _normalize(query)
+    cached = deps.query_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    results = await deps.search_engine.hybrid_search(
         query, limit=deps.top_k,
         dense_limit=deps.candidate_limit, lexical_limit=deps.candidate_limit)
+    deps.query_cache[cache_key] = results
+    return results
 
 
 def record_chunks(deps, results):
@@ -172,41 +188,59 @@ def _match_ratio(needle, haystack):
     return matched / len(needle) if needle else 0.0
 
 
-def quote_supported(quote, chunk_text):
+def _quote_match_score(quote, chunk_text):
+    """How much of quote is covered by chunk_text, worst fragment first.
+
+    A quote spanning "..." is checked fragment by fragment, since each side of
+    the ellipsis has to come from the same passage - the weakest fragment sets
+    the score so a partial match cannot hide behind a strong one.
+    """
     haystack = _normalize(chunk_text)
     if not haystack:
-        return False
+        return 0.0
 
     fragments = [part for part in re.split(r"\.{3}|…", quote or "") if len(_normalize(part)) >= 20]
+    scores = []
     for fragment in fragments or [quote]:
         needle = _normalize(fragment)
         if not needle:
-            return False
-        if needle in haystack:
-            continue
-        if _match_ratio(needle, haystack) < QUOTE_MATCH_RATIO:
-            return False
-    return True
+            return 0.0
+        scores.append(1.0 if needle in haystack else _match_ratio(needle, haystack))
+    return min(scores) if scores else 0.0
+
+
+def quote_supported(quote, chunk_text):
+    return _quote_match_score(quote, chunk_text) >= QUOTE_MATCH_RATIO
 
 
 def quoted_chunk(deps, quote):
-    """The retrieved chunk this quote was copied from, or None if it was not.
+    """The retrieved chunk this quote was copied from, and whether it verified.
 
     The model is not given chunk ids, so the quote is what ties its evidence back
     to a passage. Finding it here doubles as the check that the wording is really
     in the contract rather than something the model composed.
+
+    When no chunk reaches the verification threshold, the closest-scoring chunk
+    is still returned (unverified) rather than nothing - a quote that legitimately
+    spans two adjacent chunks, or that drifted from the source through OCR/table
+    extraction, should still point the reviewer at a page to check by hand instead
+    of vanishing from Where Found and the page number entirely.
     """
+    best_chunk, best_score = None, 0.0
     for chunk in deps.chunks.values():
-        if quote_supported(quote, chunk.get("text")):
-            return chunk
-    return None
+        score = _quote_match_score(quote, chunk.get("text"))
+        if score >= QUOTE_MATCH_RATIO:
+            return chunk, True
+        if score > best_score:
+            best_chunk, best_score = chunk, score
+    return best_chunk, False
 
 
 def evidence_records(deps, cited):
     records = []
     for item in cited:
         quote = item.quote.strip()
-        chunk = quoted_chunk(deps, quote)
+        chunk, verified = quoted_chunk(deps, quote)
         if chunk is None:
             records.append(EvidenceRecord(quote=quote, verified=False))
             continue
@@ -214,7 +248,7 @@ def evidence_records(deps, cited):
             quote=quote,
             chunk_id=chunk.get("id"),
             retrieval_confidence=chunk.get("retrieval_confidence"),
-            verified=True,
+            verified=verified,
             **chunk_provenance(chunk),
         ))
     return records
@@ -322,7 +356,7 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
         review.error = "Empty requirement text."
         return review
 
-    deps = replace(deps or build_deps(), chunks={}, searches=0)
+    deps = replace(deps or build_deps(), chunks={}, searches=0, query_cache={})
     run_usage = usage if usage is not None else RunUsage()
 
     try:
@@ -393,6 +427,6 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
 
 
 async def answer_question(query, deps=None, usage=None):
-    deps = replace(deps or build_deps(), chunks={}, searches=0)
+    deps = replace(deps or build_deps(), chunks={}, searches=0, query_cache={})
     result = await question_agent.run(query, deps=deps, usage=usage if usage is not None else RunUsage())
     return result.output
