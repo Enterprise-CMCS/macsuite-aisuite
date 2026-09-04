@@ -82,8 +82,8 @@ jobs:
       - name: Review CDK diff
         run: pnpm run cdk:diff --context environment=${DEPLOYMENT_ENV}
 
-      - name: Deploy infrastructure phase (desired count 0)
-        if: env.DEPLOYMENT_ENV == 'dev'
+      - name: Deploy infrastructure phase only (desired count 0)
+        #if: env.DEPLOYMENT_ENV == 'dev'
         run: |
           set -euo pipefail
 
@@ -121,7 +121,7 @@ jobs:
           } >>"${GITHUB_ENV}"
 
       - name: Authenticate to Amazon ECR
-        if: env.DEPLOYMENT_ENV == 'dev'
+        #if: env.DEPLOYMENT_ENV == 'dev'
         run: |
           set -euo pipefail
 
@@ -131,7 +131,7 @@ jobs:
             | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
 
       - name: Build and push API image (linux/amd64)
-        if: env.DEPLOYMENT_ENV == 'dev'
+        #if: env.DEPLOYMENT_ENV == 'dev'
         run: |
           set -euo pipefail
 
@@ -146,8 +146,25 @@ jobs:
             --format '{{json .Image}}' \
             | jq -e '.os == "linux" and .architecture == "amd64"'
 
+          # Verify image appears in ECR; wait until available or fail
+          REPO_NAME="${API_REPOSITORY_URI##*/}"
+          IMAGE_TAG="${{ github.sha }}"
+          MAX_ATTEMPTS=30
+          SLEEP_SECONDS=10
+          attempt=1
+          while ! aws ecr describe-images --repository-name "${REPO_NAME}" --image-ids imageTag="${IMAGE_TAG}" >/dev/null 2>&1; do
+            if [ "${attempt}" -ge "${MAX_ATTEMPTS}" ]; then
+              echo "ERROR: image ${REPO_NAME}:${IMAGE_TAG} not found in ECR after $((MAX_ATTEMPTS*SLEEP_SECONDS))s"
+              exit 1
+            fi
+            echo "Image not yet in ECR, waiting ${SLEEP_SECONDS}s (attempt ${attempt}/${MAX_ATTEMPTS})"
+            sleep "${SLEEP_SECONDS}"
+            attempt=$((attempt+1))
+          done
+          echo "Image ${REPO_NAME}:${IMAGE_TAG} exists in ECR."
+
       - name: Build and push batch image (linux/amd64)
-        if: env.DEPLOYMENT_ENV == 'dev'
+        #if: env.DEPLOYMENT_ENV == 'dev'
         run: |
           set -euo pipefail
 
@@ -162,8 +179,25 @@ jobs:
             --format '{{json .Image}}' \
             | jq -e '.os == "linux" and .architecture == "amd64"'
 
+          # Verify image appears in ECR; wait until available or fail
+          REPO_NAME="${BATCH_REPOSITORY_URI##*/}"
+          IMAGE_TAG="${{ github.sha }}"
+          MAX_ATTEMPTS=30
+          SLEEP_SECONDS=10
+          attempt=1
+          while ! aws ecr describe-images --repository-name "${REPO_NAME}" --image-ids imageTag="${IMAGE_TAG}" >/dev/null 2>&1; do
+            if [ "${attempt}" -ge "${MAX_ATTEMPTS}" ]; then
+              echo "ERROR: image ${REPO_NAME}:${IMAGE_TAG} not found in ECR after $((MAX_ATTEMPTS*SLEEP_SECONDS))s"
+              exit 1
+            fi
+            echo "Image not yet in ECR, waiting ${SLEEP_SECONDS}s (attempt ${attempt}/${MAX_ATTEMPTS})"
+            sleep "${SLEEP_SECONDS}"
+            attempt=$((attempt+1))
+          done
+          echo "Image ${REPO_NAME}:${IMAGE_TAG} exists in ECR."
+
       - name: Run database bootstrap task
-        if: env.DEPLOYMENT_ENV == 'dev'
+        #if: env.DEPLOYMENT_ENV == 'dev'
         run: |
           set -euo pipefail
 
@@ -220,7 +254,7 @@ jobs:
           echo "bootstrap exitCode=${EXIT_CODE}"
 
       - name: Deploy activation phase (desired count 1)
-        if: env.DEPLOYMENT_ENV == 'dev'
+        #if: env.DEPLOYMENT_ENV == 'dev'
         run: |
           set -euo pipefail
 
@@ -231,7 +265,7 @@ jobs:
             --context aisuite:batchImageTag=${{ github.sha }}
 
       - name: Wait for ECS service stability
-        if: env.DEPLOYMENT_ENV == 'dev'
+        #if: env.DEPLOYMENT_ENV == 'dev'
         run: |
           set -euo pipefail
 
@@ -241,7 +275,7 @@ jobs:
             --services "${API_SERVICE_NAME}"
 
       - name: Verify ALB target health
-        if: env.DEPLOYMENT_ENV == 'dev'
+        #if: env.DEPLOYMENT_ENV == 'dev'
         run: |
           set -euo pipefail
 
@@ -263,15 +297,4 @@ jobs:
           jq -e \
             '[.TargetHealthDescriptions[]? | select(.TargetHealth.State == "healthy")] | length > 0' \
             <<<"${TARGET_HEALTH}" >/dev/null
-
-      - name: Deploy infrastructure and activate API
-        if: env.DEPLOYMENT_ENV != 'dev'
-        run: |
-          set -euo pipefail
-
-          echo "Deploying ${DEPLOYMENT_ENV} with the API activated (desired count > 0)."
-          pnpm run cdk:deploy \
-            --context environment=${DEPLOYMENT_ENV} \
-            --context aisuite:activateApi=true \
-            --context aisuite:apiImageTag=${{ github.sha }} \
-            --context aisuite:batchImageTag=${{ github.sha }}
+            
