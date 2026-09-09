@@ -33,7 +33,7 @@ from search.database_searching.review_models import (
 from search.database_searching.search import SearchEngine
 
 TOP_K = 8
-CANDIDATE_LIMIT = 40
+CANDIDATE_LIMIT = 64
 
 MAX_SEARCHES = 3
 
@@ -129,7 +129,7 @@ def record_chunks(deps, results):
 def chunk_provenance(chunk):
     metadata = chunk.get("metadata") or {}
     return {
-        "doc_id": metadata.get("doc_id") or metadata.get("doc_name") or "",
+        "doc_id": metadata.get("doc_id") or "",
         "page": metadata.get("page"),
         "printed_page": (metadata.get("printed_page") or "").strip(),
     }

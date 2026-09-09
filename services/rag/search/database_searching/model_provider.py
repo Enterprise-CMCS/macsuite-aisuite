@@ -13,7 +13,7 @@ from common.utils.logger import log
 REVIEW_MODEL_SETTINGS = BedrockModelSettings(
     temperature=0.0,
     top_p=1.0,
-    max_tokens=4096,
+    max_tokens=8192,
 )
 
 # Bedrock reports a model that failed on its own terms as a 424 ModelErrorException.
