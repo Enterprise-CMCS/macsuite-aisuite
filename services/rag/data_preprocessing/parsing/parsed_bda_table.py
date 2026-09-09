@@ -81,7 +81,7 @@ def parse_table_elements_simple(source_data):
 
     results = []
     source_key = source_data.get("metadata", {}).get("s3_key")
-    doc_name = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0] if source_key else "unknown"
+    doc_id = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0] if source_key else "unknown"
     log.info(f"parse_table_elements_simple() source_key={source_key}")
 
     printed_pages = printed_page_map(source_data.get("elements"))
@@ -110,10 +110,10 @@ def parse_table_elements_simple(source_data):
             data_rows = [(r + [""] * (len(hdrs) - len(r)))[:len(hdrs)] for r in data_rows]
 
         results.append({
-            "doc_id": f"{doc_name}::{table_id}",
+            "doc_id": f"{doc_id}::{table_id}",
             "text": text.strip(),
             "metadata": {
-                "doc_id": doc_name,
+                "doc_id": doc_id,
                 "element_type": "TABLE",
                 "page": page_index,
                 "printed_page": printed_pages.get(page_index, ""),

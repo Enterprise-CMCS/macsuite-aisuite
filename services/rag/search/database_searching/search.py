@@ -76,9 +76,14 @@ class SearchEngine:
         finally:
             await release_connection(connection)
 
-    async def hybrid_search(self, query_text, limit=12, dense_limit=MIN_EF_SEARCH, lexical_limit=MIN_EF_SEARCH):
+    async def hybrid_search(self, query_text, limit=12, dense_limit=MIN_EF_SEARCH, lexical_limit=MIN_EF_SEARCH,
+                             dense_weight=0.8):
+        if not 0.0 <= dense_weight <= 1.0:
+            raise ValueError(f"dense_weight must be between 0 and 1, got {dense_weight}")
+
         embedding_flattened = await self.embed_query(query_text)
         ef_search = max(MIN_EF_SEARCH, dense_limit)
+        lexical_weight = 1.0 - dense_weight
 
         connection = await get_connection()
         try:
@@ -125,20 +130,21 @@ class SearchEngine:
                         l.lexical_rank,
                         d.position AS dense_position,
                         l.position AS lexical_position,
-                        (COALESCE(1.0 / ($5 + d.position), 0)
-                            + COALESCE(1.0 / ($5 + l.position), 0))::float8 AS fused_score
+                        (COALESCE($7::float8 / ($5 + d.position), 0)
+                            + COALESCE($8::float8 / ($5 + l.position), 0))::float8 AS fused_score
                     FROM dense d
                     FULL OUTER JOIN lexical l ON d.id = l.id
                     ORDER BY fused_score DESC
                     LIMIT $6
-                """, embedding_flattened, query_text, dense_limit, lexical_limit, RRF_K, limit)
+                """, embedding_flattened, query_text, dense_limit, lexical_limit, RRF_K, limit,
+                    dense_weight, lexical_weight)
 
             return [dict(row, metadata=_parse_metadata(row["metadata"])) for row in results] if results else []
         finally:
             await release_connection(connection)
 
-    async def reranked_search(self, query_text, limit=8, candidate_limit=40):
-        candidates = await self.hybrid_search(query_text, limit=candidate_limit)
+    async def reranked_search(self, query_text, limit=8, candidate_limit=MIN_EF_SEARCH, dense_weight=0.8):
+        candidates = await self.hybrid_search(query_text, limit=candidate_limit, dense_weight=dense_weight)
         if not candidates:
             return []
         try:

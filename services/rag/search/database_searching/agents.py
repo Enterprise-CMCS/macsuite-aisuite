@@ -145,7 +145,7 @@ def record_chunks(deps, results):
 def chunk_provenance(chunk):
     metadata = chunk.get("metadata") or {}
     return {
-        "doc_id": metadata.get("doc_id") or metadata.get("doc_name") or "",
+        "doc_id": metadata.get("doc_id") or "",
         "page": metadata.get("page"),
         "printed_page": (metadata.get("printed_page") or "").strip(),
     }
