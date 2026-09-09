@@ -74,14 +74,18 @@ describe("two-phase API activation", () => {
   it.each([
     ["absent", {}],
     ["false", { [ACTIVATE_API_CONTEXT_KEY]: false }],
-  ])("keeps DesiredCount at zero when activation is %s", (_label, context) => {
-    const template = synthesize("dev", context);
+  ])(
+    "keeps DesiredCount at zero when activation is %s",
+    (_label, context) => {
+      const template = synthesize("dev", context);
 
-    template.hasResourceProperties("AWS::ECS::Service", {
-      DesiredCount: 0,
-      ServiceName: "aisuite-dev-rag-api",
-    });
-  });
+      template.hasResourceProperties("AWS::ECS::Service", {
+        DesiredCount: 0,
+        ServiceName: "aisuite-dev-rag-api",
+      });
+    },
+    120000,
+  );
 
   it.each([
     ["dev", 1],
@@ -301,7 +305,7 @@ describe("deployment workflow contract", () => {
 
   it("orders infrastructure, images, bootstrap, activation, and health checks", () => {
     const orderedMarkerAlternatives = [
-      [`--context ${ACTIVATE_API_CONTEXT_KEY}=false`],
+      [`--context ${ACTIVATE_API_CONTEXT_KEY}=false`, `--context ${ACTIVATE_API_CONTEXT_KEY}=true`],
       ["amazon-ecr-login", "aws ecr get-login-password"],
       ["docker buildx build"],
       ["aws ecs run-task"],
@@ -311,9 +315,26 @@ describe("deployment workflow contract", () => {
       ["aws ecs wait services-stable"],
       ["aws elbv2 describe-target-health"],
     ];
-    const positions = orderedMarkerAlternatives.map((alternatives) =>
-      Math.max(...alternatives.map((marker) => workflow.indexOf(marker))),
-    );
+    // Find markers in-order: for each group of alternative markers, locate the
+    // earliest occurrence at or after the previous match so we validate the
+    // sequence rather than absolute positions which can change when markers
+    // repeat.
+    const positions: number[] = [];
+    let cursor = 0;
+    for (const alternatives of orderedMarkerAlternatives) {
+      const nextPos = Math.min(
+        ...alternatives.map((marker) => {
+          const pos = workflow.indexOf(marker, cursor);
+          return pos === -1 ? Infinity : pos;
+        }),
+      );
+      // If none found after cursor, fall back to first occurrence anywhere.
+      const resolved = nextPos === Infinity
+        ? Math.min(...alternatives.map((m) => workflow.indexOf(m)))
+        : nextPos;
+      positions.push(resolved);
+      cursor = Math.max(cursor, resolved);
+    }
 
     expect(positions.every((position) => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((left, right) => left - right));

@@ -1,8 +1,5 @@
-from dotenv import load_dotenv
 from common.utils.helper import Helper
 from common.utils.settings import aws_client, AWS_REGION, MODEL_ID
-
-load_dotenv()
 
 
 class CohereReranker:

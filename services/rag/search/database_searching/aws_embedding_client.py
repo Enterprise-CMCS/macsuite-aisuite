@@ -14,23 +14,22 @@ class BedrockEmbeddingClient:
         self.model_id = MODEL_ID
         self.dimension = EMBEDDING_DIMENSION
 
-    async def get_embedding(self, text):
+    async def get_embedding(self, text, input_type="search_document"):
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
             self.invoke_model_sync,
-            text
+            text,
+            input_type
             )
         return response
-    
-    def invoke_model_sync(self, text):
-        
 
+    def invoke_model_sync(self, text, input_type="search_document"):
         request_body = {
                 "texts": [text],
-                "input_type": "search_document"
+                "input_type": input_type
             }
-        
+
         try:
             response = self.client.invoke_model(
                 modelId=self.model_id,

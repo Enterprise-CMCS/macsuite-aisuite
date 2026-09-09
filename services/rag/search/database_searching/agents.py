@@ -1,406 +1,398 @@
-import json
-from dataclasses import dataclass, field
-import os
+import math
 import re
-from typing import List, Dict, Any, Optional
-import hashlib
+from dataclasses import dataclass, field, replace
+from difflib import SequenceMatcher
+from typing import Dict
 
-from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.bedrock import BedrockConverseModel
+from pydantic_ai import Agent, ModelRetry, RunContext, ToolDefinition, ToolFailed
+from pydantic_ai.capabilities import ValidatedToolArgs
+from pydantic_ai.capabilities.hooks import Hooks
+from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.usage import RunUsage, UsageLimits
 
+from common.utils.helper import Helper
+from common.utils.logger import log
+from search.database_searching.model_provider import (
+    REVIEW_MODEL_SETTINGS,
+    bedrock_hooks,
+    bedrock_model,
+    model_id,
+)
+from search.database_searching.review_agents import (
+    adjudication_prompt,
+    adjudicator_agent,
+    challenge_prompt,
+    challenger_agent,
+)
+from search.database_searching.review_models import (
+    EvidenceRecord,
+    RequirementAssessment,
+    RequirementReview,
+    page_label,
+)
 from search.database_searching.search import SearchEngine
-from common.utils.logger import get_logger
 
-logger = get_logger(__name__)
+TOP_K = 8
+CANDIDATE_LIMIT = 40
 
-# ---------------- Constants ----------------
+MAX_SEARCHES = 3
 
-MAX_CACHE_SIZE = 1000
-MAX_TEXT_LENGTH = 2000          
-SEARCH_LIMIT = 32               
-FINAL_RESULTS = 8               
+MAX_CHUNK_CHARS = 1800
 
+QUOTE_MATCH_RATIO = 0.85
 
-CLAUSE_HINTS = {
-    "termination": [
-        "termination",
-        "term and termination",
-        "termination for convenience",
-        "termination for cause",
-    ],
-    "indemnity": ["indemnity", "indemnification"],
-    "liability": ["limitation of liability", "liability cap"],
-    "confidentiality": ["confidentiality", "non-disclosure", "NDA"],
-    "governing law": ["governing law", "jurisdiction"],
-}  
+QUOTE_MATCH_MIN_RUN = 8
 
+ANALYST_PROMPT = """You are a CMS reviewer checking whether a state's Medicaid managed care contract \
+satisfies one specific requirement from the Contract Review Tool.
 
-# ---------------- Dependencies ----------------
+You work only from retrieved contract text. You have no knowledge of this contract beyond what the \
+search results contain, and federal regulations you happen to know do not tell you what this contract \
+says.
+
+Method:
+1. Read the retrieved contract text you were given against the exact wording of the requirement.
+2. If they do not cover the requirement, call search_contract with the language the contract itself \
+would use - the defined term, the statutory cite, the section name - rather than repeating the \
+requirement verbatim. A requirement about "provider directory update frequency" is more likely to be \
+found by searching "provider directory shall be updated" than by searching the requirement text.
+3. Commit to a status and quote the wording that decides it.
+
+Status definitions:
+- MET: the retrieved text explicitly establishes what the requirement demands, at the strength it \
+demands. A requirement that the contract "must require" something is not met by text that permits it.
+- NOT MET: the retrieved text covers this subject and shows the requirement is not satisfied, or \
+contradicts it.
+- UNCLEAR: the retrieved text does not settle it either way. This includes retrieval coming back with \
+nothing relevant. UNCLEAR is the honest answer far more often than reviewers like, and it is much less \
+damaging than a wrong MET.
+
+Rules:
+- Every quote must be copied verbatim from the retrieved text. Do not stitch wording from two passages \
+into one quote. The quote is how the passage is identified, so copy it exactly.
+- Cite the operative provision, not a heading, table of contents line, glossary definition, or form.
+- argument explains how the quoted wording satisfies or fails the requirement, in the reviewer's terms.
+- A reviewer reads argument, missing_information and follow_up in a spreadsheet, so refer to the \
+contract by the page or section name shown above each passage.
+- For NOT MET and UNCLEAR, missing_information names the specific provision or language that would \
+settle the question.
+- confidence is calibrated: 0.9+ means the quoted text is unambiguous, around 0.5 means it is arguable, \
+below 0.3 means you are reviewing on evidence too thin to rely on."""
+
+QUESTION_PROMPT = """You answer questions about a state's Medicaid managed care contract from retrieved \
+contract text only.
+
+Always call search_contract before answering. Ground every claim in the retrieved text and quote the \
+contract wording that supports it. Cite the document and page number shown above each passage so the \
+reader can find it in the document.
+
+If the retrieved text does not answer the question, say what is missing instead of filling the gap. Do \
+not describe your searching - answer the question."""
 
 
 @dataclass
-class ChatDeps:
-    """Dependencies for chat agent with optimized caching."""
-    acronyms: dict
-    timing: dict = field(default_factory=dict)
+class ContractDeps:
     search_engine: SearchEngine = field(default_factory=SearchEngine)
-    _result_cache: dict = field(default_factory=dict)  # Cache for search results
-    _cache_hits: int = 0
-    _cache_misses: int = 0
+    chunks: Dict[int, dict] = field(default_factory=dict)
+    top_k: int = TOP_K
+    candidate_limit: int = CANDIDATE_LIMIT
+    max_searches: int = MAX_SEARCHES
+    searches: int = 0
 
 
-# BASE_SYSTEM_PROMPT = """
-# You are an expert RAG assistant specialized in providing accurate, evidence-based answers. Your responses must always be grounded in retrieved information from the knowledge base.
-#
-# CORE PRINCIPLES:
-# - Always ground answers in retrieved information. Never speculate or make up information.
-# - Choose the right search strategy based on query complexity and importance.
-# - Synthesize information from multiple results when available.
-# - Be transparent about limitations and confidence levels.
-#
-# SEARCH STRATEGY SELECTION:
-#
-# Use semantic_search for:
-# - Conceptual or theoretical questions
-# - Exploratory queries
-# - When speed is prioritized
-# - Simple, straightforward questions
-#
-# Use hybrid_search for:
-# - Specific factual queries requiring exact terms
-# - Queries mixing concepts and specific terminology
-# - General purpose searches (default choice)
-# - Balanced speed and accuracy needs
-#
-# Use reranked_search for:
-# - Critical business decisions
-# - Complex multi-faceted questions
-# - When highest accuracy is essential
-# - Queries requiring deep context understanding
-#
-# RESPONSE GUIDELINES:
-# 1. Always search first - Never answer without retrieving information
-# 2. Cite evidence - Reference specific results when making claims
-# 3. Acknowledge gaps - If information is incomplete or missing, state it clearly
-# 4. Synthesize clearly - Combine multiple sources into coherent answers
-# 5. Be concise - Provide direct answers without unnecessary elaboration
-# 6. Handle errors gracefully - If search fails, explain and suggest alternatives
-#
-# QUALITY STANDARDS:
-# - Prioritize accuracy over speed
-# - Use complete sentences and proper formatting
-# - Avoid hedging language when evidence is clear
-# - Be specific with facts, numbers, and details from retrieved results
-# """
-
-#ask for output in a list or JSON
-BASE_SYSTEM_PROMPT = """You are an expert contract analysis assistant. Your task is to verify whether specific contractual requirements are supported by the provided retrieved text.
-
-You must base all conclusions ONLY on the retrieved context. Do not use outside knowledge or assumptions.
-
-IMPORTANT RULES:
-- Never describe the search process or retrieval steps.
-- Do not explain how the information was found.
-- Only present the conclusion and supporting evidence.
-- Return all relevant pages
-- Everytime explict evidence in the form of a quote is returned, always have page number with it
-- Always include specific sources and page. Never return "Hybrid Search Results" for source. 
-- Do NOT return a header or footer as source, always refer to the citation or metadata 
-- Always return the document name as source
-
-ANALYSIS TASK:
-For each requirement provided by the user, analyze whether the contract text explicitly supports the requirement and provide a recommendation.
-
-RECOMMENDATION DEFINITIONS:
-MET:
-The retrieved text explicitly states the requirement is met.
-NOT MET:
-The retrieved text shows that the requirement is not met.
-UNCLEAR:
-The retrieved text does not provide enough explicit evidence to determine whether the requirement is met.
-
-Return output in the following JSON format exactly:
-
-{
-    "Requirement": "<repeat the requirement text>",
-    "Recommendation": "MET | NOT MET | UNCLEAR",
-    "Response": "<detailed explanation with evidence and reasoning. Include quotes if helpful>",
-    "Source": "<Document name: pages | Document name: pages>",
-    "Page": "<Page number(s) in source where answer is found>"
-}
+def build_deps(table_name=None):
+    return ContractDeps(search_engine=SearchEngine(table_name=table_name))
 
 
-ADDITIONAL GUIDELINES:
-- Prefer direct quotes from the contract when possible in your Response.
-- Keep evidence excerpts focused and precise.
-- If multiple relevant excerpts exist, include them in your Response.
-- If no evidence exists, state that clearly in your Response and return UNCLEAR as Recommendation.
-- Provide detailed reasoning in the Response field, explaining why you made this Recommendation.
-
-CITATION FORMAT:
-- Reference results as [1], [2], [3] matching the [result 1], [result 2], [result 3], etc. in search results
-- Format Source field as: "Document name: page1, page2 | Another document: page3, page4"
-- Example: "Core Contract Provisions: 10, 15, 23 | CN-680000-FP122: 45, 67"
-- Pair each document name with its page numbers, separated by commas and pipes (|) between documents
+async def retrieve(deps, query):
+    return await deps.search_engine.hybrid_search(
+        query, limit=deps.top_k,
+        dense_limit=deps.candidate_limit, lexical_limit=deps.candidate_limit)
 
 
-"""
+def record_chunks(deps, results):
+    kept = []
+    for result in results:
+        chunk_id = result.get("id")
+        if chunk_id is None:
+            continue
+        existing = deps.chunks.get(chunk_id)
+        if existing is None:
+            deps.chunks[chunk_id] = result
+            kept.append(result)
+        elif existing.get("retrieval_confidence") is None:
+            existing["retrieval_confidence"] = result.get("retrieval_confidence")
+            existing["distance"] = result.get("distance")
+    return kept
 
 
-model_id = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-pro-v1:0")
-model = BedrockConverseModel(model_id)
+def chunk_provenance(chunk):
+    metadata = chunk.get("metadata") or {}
+    return {
+        "doc_id": metadata.get("doc_id") or metadata.get("doc_name") or "",
+        "page": metadata.get("page"),
+        "printed_page": (metadata.get("printed_page") or "").strip(),
+    }
 
-search_agent = Agent(
-    model,
-    deps_type=ChatDeps,
-    system_prompt=BASE_SYSTEM_PROMPT,
-    retries=5,
-    model_settings={"temperature": 0.0, "top_p": 1.0},
+
+def format_evidence(chunks):
+    """The retrieved text, each passage headed with where it came from.
+
+    Only the page and the document, never the chunk id. The model used to be given
+    the id to cite with and wrote it into its prose - "the contract text in chunk
+    3566 states" - which means nothing to the reviewer reading the spreadsheet.
+    A quote is enough to find the passage again, so the id is not sent at all.
+    """
+    if not chunks:
+        return "No contract text was retrieved for this requirement."
+
+    blocks = []
+    for chunk in chunks:
+        where = chunk_provenance(chunk)
+
+        header = [page_label(where["page"], where["printed_page"]) or "page not recorded"]
+        if where["doc_id"]:
+            header.append(f"document: {where['doc_id']}")
+
+        text = (chunk.get("text") or "").strip()
+        if len(text) > MAX_CHUNK_CHARS:
+            text = text[:MAX_CHUNK_CHARS].rsplit(" ", 1)[0] + " ..."
+        blocks.append(f"{' | '.join(header)}\n{text}")
+
+    return "\n\n".join(blocks)
+
+
+def _normalize(text):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())).strip()
+
+
+def _match_ratio(needle, haystack):
+    blocks = SequenceMatcher(None, needle, haystack, autojunk=False).get_matching_blocks()
+    matched = sum(block.size for block in blocks if block.size >= QUOTE_MATCH_MIN_RUN)
+    return matched / len(needle) if needle else 0.0
+
+
+def quote_supported(quote, chunk_text):
+    haystack = _normalize(chunk_text)
+    if not haystack:
+        return False
+
+    fragments = [part for part in re.split(r"\.{3}|…", quote or "") if len(_normalize(part)) >= 20]
+    for fragment in fragments or [quote]:
+        needle = _normalize(fragment)
+        if not needle:
+            return False
+        if needle in haystack:
+            continue
+        if _match_ratio(needle, haystack) < QUOTE_MATCH_RATIO:
+            return False
+    return True
+
+
+def quoted_chunk(deps, quote):
+    """The retrieved chunk this quote was copied from, or None if it was not.
+
+    The model is not given chunk ids, so the quote is what ties its evidence back
+    to a passage. Finding it here doubles as the check that the wording is really
+    in the contract rather than something the model composed.
+    """
+    for chunk in deps.chunks.values():
+        if quote_supported(quote, chunk.get("text")):
+            return chunk
+    return None
+
+
+def evidence_records(deps, cited):
+    records = []
+    for item in cited:
+        quote = item.quote.strip()
+        chunk = quoted_chunk(deps, quote)
+        if chunk is None:
+            records.append(EvidenceRecord(quote=quote, verified=False))
+            continue
+        records.append(EvidenceRecord(
+            quote=quote,
+            chunk_id=chunk.get("id"),
+            retrieval_confidence=chunk.get("retrieval_confidence"),
+            verified=True,
+            **chunk_provenance(chunk),
+        ))
+    return records
+
+
+def blend_confidence(llm_confidence, retrieval):
+    if llm_confidence is None:
+        return None
+    if retrieval is None:
+        return round(float(llm_confidence), 4)
+    return round(math.sqrt(max(0.0, float(llm_confidence)) * max(0.0, float(retrieval))), 4)
+
+
+async def search_contract(context: RunContext[ContractDeps], query: str) -> str:
+    """Search the contract for passages relevant to a query.
+
+    Args:
+        query: Wording the contract itself would use - a defined term, a statutory
+            cite, a section name, or the operative phrase you expect to find.
+
+    Returns the matching passages, each headed with its page number and source
+    document. Quote a passage verbatim to cite it.
+    """
+    deps = context.deps
+    results = await retrieve(deps, query)
+
+    log.debug(f"search_contract() call {deps.searches} for '{query[:120]}' returned {len(results)} chunks")
+    if not results:
+        return f"Nothing in the contract matched '{query}'. Try different wording or a broader phrase."
+
+    record_chunks(deps, results)
+    return format_evidence(results)
+
+
+review_hooks = Hooks()
+
+
+@review_hooks.on.before_tool_execute(tools=["search_contract"])
+async def charge_search_budget(context: RunContext[ContractDeps], *, call: ToolCallPart,
+                               tool_def: ToolDefinition,
+                               args: ValidatedToolArgs) -> ValidatedToolArgs:
+    deps = context.deps
+    if deps.searches >= deps.max_searches:
+        log.debug(f"charge_search_budget() refused search {deps.searches + 1}, "
+                  f"the limit is {deps.max_searches}")
+        raise ToolFailed(
+            f"Search budget for this requirement is used up after {deps.max_searches} searches. "
+            "Decide from the text you already have, and return UNCLEAR if it does not settle it.")
+
+    deps.searches += 1
+    return args
+
+
+@review_hooks.on.tool_execute_error(tools=["search_contract"])
+async def retry_failed_search(context: RunContext[ContractDeps], *, call: ToolCallPart,
+                              tool_def: ToolDefinition, args: ValidatedToolArgs,
+                              error: Exception):
+    query = str(args.get("query", ""))[:120]
+    Helper.print_exception("search_contract", error, f"Retrieval failed for query '{query}'.")
+    raise ModelRetry("The search backend failed. Try once more with a shorter query.")
+
+
+analyst_agent = Agent(
+    bedrock_model(),
+    output_type=RequirementAssessment,
+    deps_type=ContractDeps,
+    system_prompt=ANALYST_PROMPT,
+    model_settings=REVIEW_MODEL_SETTINGS,
+    tools=[search_contract],
+    capabilities=[review_hooks, bedrock_hooks],
+    retries=3,
+    name="analyst",
+)
+
+question_agent = Agent(
+    bedrock_model(),
+    deps_type=ContractDeps,
+    system_prompt=QUESTION_PROMPT,
+    model_settings=REVIEW_MODEL_SETTINGS,
+    tools=[search_contract],
+    capabilities=[review_hooks, bedrock_hooks],
+    retries=3,
+    name="question",
 )
 
 
+@analyst_agent.output_validator
+def check_citations(context: RunContext[ContractDeps], assessment: RequirementAssessment):
+    # A quote that cannot be found in the retrieved text is not retried, it is
+    # recorded unverified, so the reviewer sees the row was flagged rather than
+    # losing the review to a failed retry.
+    if assessment.status == "MET" and not assessment.evidence:
+        raise ModelRetry("MET needs at least one quote from the retrieved text. Quote it or return UNCLEAR.")
 
-def _normalize_query(query: str) -> str:
-    query = query.lower().strip()
-    query = re.sub(r"\s+", " ", query)
-    query = re.sub(r"[^\w\s.,?!-]", "", query)
-    return query
-
-
-def _expand_query(query: str) -> str:
-
-    q = query.lower()
-    expansions = []
-    for key, hints in CLAUSE_HINTS.items():
-        if key in q:
-            expansions.extend(hints)
-    if not expansions:
-        return query
-    return query + " " + " ".join(sorted(set(expansions)))
+    return assessment
 
 
+async def review_requirement(requirement, deps=None, sheet="", item="", legal_cite="",
+                             row=None, challenge=True, usage=None):
+    review = RequirementReview(
+        requirement=requirement, sheet=sheet, item=item, legal_cite=legal_cite,
+        row=row, model=model_id(),
+    )
+    if not (requirement or "").strip():
+        review.error = "Empty requirement text."
+        return review
 
-def generate_cache_key(query: str, search_type: str) -> str:
-    normalized = _normalize_query(query)
-    return hashlib.md5(f"{search_type}:{normalized}".encode()).hexdigest()
-
-
-
-def _manage_cache_size(cache: dict, max_size: int = MAX_CACHE_SIZE) -> None:
-    if len(cache) > max_size:
-        remove_count = max_size // 5
-        for _ in range(remove_count):
-            cache.popitem()
-        logger.info(f"Cache pruned: removed {remove_count} old entries")
-
-
-
-def _calculate_relevance_score(result: Dict[str, Any], query: str) -> float:
-
-    text = (result.get("text") or "").lower()
-    query_lower = query.lower()
-
-    # Base similarity from pgvector distance
-    distance = float(result.get("distance", 1.0))
-    # Clamp to [0, 2] then map to [0,1]; if your setup guarantees [0,1], this still works.
-    distance = max(0.0, min(distance, 2.0))
-    similarity = 1.0 - (distance / 2.0)
-    score = similarity
-
-    query_terms = [t for t in query_lower.split() if len(t) > 2]
-    term_matches = sum(1 for term in query_terms if term in text)
-    if query_terms:
-        score += (term_matches / len(query_terms)) * 0.2
-
-    if query_lower in text:
-        score += 0.1
-
-    return max(0.0, min(score, 1.0))  
-
-
-
-def deduplicate_results(
-    results: List[Dict[str, Any]], query: str = ""
-) -> List[Dict[str, Any]]:
-    if not results:
-        return results
-
-    seen = set()
-    deduplicated = []
-
-    for result in results:
-        text = (result.get("text") or "").strip()
-        metadata = result.get("metadata", {})
-
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except Exception:
-                metadata = {}
-
-        doc_id = metadata.get("doc_id") or metadata.get("doc_name") or ""
-        page = metadata.get("page", "none")
-
-        unique_key = hashlib.md5(f"{doc_id}:{page}:{text[:200]}".encode()).hexdigest()
-
-        if unique_key not in seen:
-            seen.add(unique_key)
-            if query:
-                result["_relevance_score"] = _calculate_relevance_score(result, query)
-            deduplicated.append(result)
-
-    if query and deduplicated:
-        deduplicated.sort(key=lambda x: x.get("_relevance_score", 0.0), reverse=True)
-
-    removed = len(results) - len(deduplicated)
-    if removed > 0:
-        logger.info(f"Removed {removed} duplicates, ranked by relevance")
-
-    return deduplicated
-
-
-
-def _parse_metadata(metadata: Any) -> Dict[str, Any]:
-    if isinstance(metadata, str):
-        try:
-            return json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return metadata if isinstance(metadata, dict) else {}
-
-
-
-def _truncate_text(text: str, max_length: int = MAX_TEXT_LENGTH) -> str:
-    if len(text) <= max_length:
-        return text
-
-    cutoff = max_length
-    candidates = []
-    for sep in ["\n\n", "\n", ". "]:
-        idx = text.rfind(sep, 0, cutoff)
-        if idx != -1 and idx > max_length * 0.6:
-            candidates.append(idx + len(sep))
-
-    if candidates:
-        return text[: max(candidates)].strip() + "..."
-
-    return text[:max_length].rsplit(" ", 1)[0] + "..."
-
-
-@search_agent.tool
-async def semantic_search(context: RunContext[ChatDeps], query: str) -> List[Dict[str, Any]]:
+    deps = replace(deps or build_deps(), chunks={}, searches=0)
+    run_usage = usage if usage is not None else RunUsage()
 
     try:
-        normalized_query = _normalize_query(query)
-        expanded_query = _expand_query(normalized_query)
-        cache_key = generate_cache_key(expanded_query, "semantic_raw")
+        seed = await retrieve(deps, requirement)
+        record_chunks(deps, seed)
+        review.chunks_retrieved = len(deps.chunks)
 
-        if cache_key in context.deps._result_cache:
-            context.deps._cache_hits += 1
-            hits = context.deps._cache_hits
-            misses = context.deps._cache_misses
-            cache_ratio = hits / (hits + misses)
-            logger.info(f"[SEMANTIC] Cache hit (ratio: {cache_ratio:.2%})")
-            return context.deps._result_cache[cache_key]
+        assessment = (await analyst_agent.run(
+            f"Requirement to review:\n{requirement}\n\n"
+            f"Retrieved contract text:\n{format_evidence(seed)}\n\n"
+            "Assess this requirement. Search again first if this text does not cover it.",
+            deps=deps,
+            usage=run_usage,
+            usage_limits=UsageLimits(request_limit=4 + deps.max_searches),
+        )).output
 
-        context.deps._cache_misses += 1
-        logger.info(f"[SEMANTIC] Query: {query}")
-        logger.debug(f"[SEMANTIC] Expanded query: {expanded_query}")
+        review.chunks_retrieved = len(deps.chunks)
+        review.evidence = evidence_records(deps, assessment.evidence)
+        review.missing_information = assessment.missing_information
+        review.status = assessment.status
+        review.argument = assessment.argument
+        review.llm_confidence = assessment.confidence
 
+        if challenge:
+            pool = format_evidence(list(deps.chunks.values()))
+            unverified = [record.quote for record in review.evidence if not record.verified]
 
-        results = await context.deps.search_engine.semantic_search(
-            expanded_query,
-            limit=SEARCH_LIMIT,
-        )
+            objection = (await challenger_agent.run(
+                challenge_prompt(requirement, pool, assessment), usage=run_usage)).output
 
-        if not results:
-            logger.warning("[SEMANTIC] No results found")
-            response: List[Dict[str, Any]] = []
-            context.deps._result_cache[cache_key] = response
-            return response
+            verdict = (await adjudicator_agent.run(
+                adjudication_prompt(requirement, pool, assessment, objection, unverified),
+                usage=run_usage)).output
 
+            review.status = verdict.status
+            review.argument = verdict.argument
+            review.counter_argument = verdict.counter_argument
+            review.follow_up = verdict.follow_up
+            review.llm_confidence = verdict.confidence
 
-        results = deduplicate_results(results, query=expanded_query)
-        results = results[:FINAL_RESULTS]
+            if verdict.status != assessment.status:
+                log.info(f"review_requirement() {sheet} item {item}: the challenge changed the call from "
+                         f"{assessment.status} to {verdict.status}")
 
-        cleaned: List[Dict[str, Any]] = []
-        for r in results:
-            text = _truncate_text((r.get("text") or "").strip())
-            metadata = _parse_metadata(r.get("metadata", {}))
-            cleaned.append(
-                {
-                    "text": text,
-                    "metadata": metadata,
-                    "_relevance_score": float(r.get("_relevance_score", 0.0)),
-                }
-            )
+        cited = [record.retrieval_confidence for record in review.evidence
+                 if record.retrieval_confidence is not None]
+        if not cited:
+            cited = [chunk.get("retrieval_confidence") for chunk in deps.chunks.values()
+                     if chunk.get("retrieval_confidence") is not None]
+        review.retrieval_confidence = max(cited) if cited else None
+        review.combined_confidence = blend_confidence(review.llm_confidence, review.retrieval_confidence)
+        review.quotes_verified = bool(review.evidence) and all(
+            record.verified for record in review.evidence)
+        review.sources = review.where_found()
 
-        context.deps._result_cache[cache_key] = cleaned
-        _manage_cache_size(context.deps._result_cache)
+        log.info(f"review_requirement() {sheet} item {item} = {review.status}, "
+                 f"llm confidence {review.llm_confidence}, retrieval confidence {review.retrieval_confidence}, "
+                 f"quotes verified {review.quotes_verified}, chunks {review.chunks_retrieved}")
+        return review
 
-        logger.info(f"[SEMANTIC] Retrieved {len(cleaned)} ranked results")
-        return cleaned
-
-    except Exception as e:
-        error_msg = f"Semantic search failed: {str(e)}"
-        logger.error(f"[SEMANTIC] {error_msg}", exc_info=True)
-        
-        return []
-
-
-async def analyze_requirement_with_rag(
-    requirement: str,
-    deps: Optional[ChatDeps] = None,
-) -> Dict[str, Any]:
-
-    deps = deps or ChatDeps(acronyms={})
-
-    # 1. Retrieve context
-    context_results = await semantic_search(
-        RunContext(deps=deps, state={}, tools=search_agent.tools),
-        query=requirement,
-    )
-
-    formatted_results = []
-    for i, r in enumerate(context_results, 1):
-        md = r.get("metadata", {})
-        doc_name = md.get("doc_name") or md.get("doc_id") or "Unknown document"
-        page = md.get("page", "unknown")
-        clause_label = md.get("clause_label") or md.get("section_title") or ""
-        header = f"[result {i}] Document: {doc_name} | Page: {page}"
-        if clause_label:
-            header += f" | Clause: {clause_label}"
-        chunk_text = r.get("text", "")
-        formatted_results.append(f"{header}\n{chunk_text}")
-
-    retrieval_block = (
-        "\n\n".join(formatted_results) if formatted_results else "No relevant text found."
-    )
-
-    user_message = (
-        "Requirement to verify:\n"
-        f"{requirement}\n\n"
-        "Retrieved contract context (each [result i] includes text and metadata):\n"
-        f"{retrieval_block}\n\n"
-        "Now perform the analysis as specified in the system prompt and return a single JSON object."
-    )
-
-    result = await search_agent.run(user_message, deps=deps)
-
-    try:
-        parsed = json.loads(result.output_text)
-        return parsed
-    except Exception:
-    
-        return {
-            "Requirement": requirement,
-            "Recommendation": "UNCLEAR",
-            "Response": (
-                "The model output could not be parsed as JSON. "
-                "Raw output was:\n" + result.output_text
-            ),
-            "Source": "",
-            "Page": "",
-        }
+    except Exception as lclEx:
+        Helper.print_exception("review_requirement", lclEx,
+                               f"Review failed for requirement '{requirement[:120]}'.")
+        review.status = "UNCLEAR"
+        review.error = f"{type(lclEx).__name__}: {lclEx}"
+        review.argument = review.argument or "The automated review did not complete for this requirement."
+        return review
 
 
+async def answer_question(query, deps=None, usage=None):
+    deps = replace(deps or build_deps(), chunks={}, searches=0)
+    result = await question_agent.run(query, deps=deps, usage=usage if usage is not None else RunUsage())
+    return result.output
