@@ -168,7 +168,7 @@ def image_text_organization(data, elements, image_analysis_text, source_key,  do
         "text" : content,
         "doc_id": f"{doc_id}::Order{reading_order}",
         "metadata":{
-            "doc_name":doc_id,
+            "doc_id":doc_id,
             "page":page_number,
             "printed_page": (printed_pages or {}).get(page_number, ""),
             "element_type": "IMAGE",
