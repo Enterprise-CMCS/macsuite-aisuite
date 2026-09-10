@@ -8,7 +8,8 @@ from common.utils.helper import Helper
 from common.utils.logger import log
 
 RRF_K = 60
-
+DENSE_WEIGHT = 0.8
+LEXICAL_WEIGHT = 0.2
 
 MIN_EF_SEARCH = 64
 
@@ -36,47 +37,49 @@ class SearchEngine:
             return np.array(embedding).flatten()
         return np.array(embedding.get('float', [])).flatten()
 
-    async def fulltext_search(self, query: str, limit: int = 30):
-        connection = await get_connection()
-        try:
-            results = await connection.fetch(f"""
-                SELECT
-                    id,
-                    text,
-                    metadata,
-                    ts_rank_cd(search_tsv, query, 32) AS rank
-                FROM {self.table_name},
-                     to_tsquery('english',NULLIF(replace(plainto_tsquery('english', $1)::text,' & ',' | '),'')) AS query
-                WHERE search_tsv @@ query
-                ORDER BY rank DESC
-                LIMIT $2
-            """, query, limit)
+    # Unused — no callers in the codebase (only hybrid_search is called).  
+    # async def fulltext_search(self, query: str, limit: int = 30):
+    #     connection = await get_connection()
+    #     try:
+    #         results = await connection.fetch(f"""
+    #             SELECT
+    #                 id,
+    #                 text,
+    #                 metadata,
+    #                 ts_rank_cd(search_tsv, query, 32) AS rank
+    #             FROM {self.table_name},
+    #                  to_tsquery('english',NULLIF(replace(plainto_tsquery('english', $1)::text,' & ',' | '),'')) AS query
+    #             WHERE search_tsv @@ query
+    #             ORDER BY rank DESC
+    #             LIMIT $2
+    #         """, query, limit)
+    #
+    #         return [dict(row) for row in results] if results else []
+    #     finally:
+    #         await release_connection(connection)
 
-            return [dict(row) for row in results] if results else []
-        finally:
-            await release_connection(connection)
+    # Unused — no callers in the codebase (only hybrid_search is called).  
+    # async def semantic_search(self, query_text, limit=100):
+    #     embedding_flattened = await self.embed_query(query_text)
+    #
+    #     connection = await get_connection()
+    #     try:
+    #         results = await connection.fetch(f"""
+    #             SELECT
+    #                 id,
+    #                 text,
+    #                 metadata,
+    #                 embedding <=> $1::vector AS distance
+    #             FROM {self.table_name}
+    #             ORDER BY embedding <=> $1::vector
+    #             LIMIT $2
+    #         """, embedding_flattened, limit)
+    #
+    #         return [dict(row) for row in results] if results else []
+    #     finally:
+    #         await release_connection(connection)
 
-    async def semantic_search(self, query_text, limit=100):
-        embedding_flattened = await self.embed_query(query_text)
-
-        connection = await get_connection()
-        try:
-            results = await connection.fetch(f"""
-                SELECT
-                    id,
-                    text,
-                    metadata,
-                    embedding <=> $1::vector AS distance
-                FROM {self.table_name}
-                ORDER BY embedding <=> $1::vector
-                LIMIT $2
-            """, embedding_flattened, limit)
-
-            return [dict(row) for row in results] if results else []
-        finally:
-            await release_connection(connection)
-
-    async def hybrid_search(self, query_text, limit=12, dense_limit=60, lexical_limit=60):
+    async def hybrid_search(self, query_text, limit=12, dense_limit=MIN_EF_SEARCH, lexical_limit=MIN_EF_SEARCH):
         embedding_flattened = await self.embed_query(query_text)
         ef_search = max(MIN_EF_SEARCH, dense_limit)
 
@@ -91,11 +94,18 @@ class SearchEngine:
                             id,
                             text,
                             metadata,
-                            embedding <=> $1::vector AS distance,
-                            ROW_NUMBER() OVER (ORDER BY embedding <=> $1::vector) AS position
-                        FROM {self.table_name}
-                        ORDER BY embedding <=> $1::vector
-                        LIMIT $3
+                            distance,
+                            ROW_NUMBER() OVER (ORDER BY distance) AS position
+                        FROM (
+                            SELECT
+                                id,
+                                text,
+                                metadata,
+                                embedding <=> $1::vector AS distance
+                            FROM {self.table_name}
+                            ORDER BY embedding <=> $1::vector
+                            LIMIT $3
+                        ) AS top_dense
                     ),
                     lexical AS (
                         SELECT
@@ -106,13 +116,20 @@ class SearchEngine:
                             -- shortlisted still carries a cosine distance. Otherwise
                             -- its retrieval confidence lands in the workbook blank.
                             embedding <=> $1::vector AS distance,
-                            ts_rank_cd(search_tsv, query, 32) AS lexical_rank,
-                            ROW_NUMBER() OVER (ORDER BY ts_rank_cd(search_tsv, query, 32) DESC) AS position
-                        FROM {self.table_name},
-                             to_tsquery('english',NULLIF(replace(plainto_tsquery('english', $2)::text,' & ',' | '),'')) AS query
-                        WHERE search_tsv @@ query
-                        ORDER BY lexical_rank DESC
-                        LIMIT $4
+                            ROW_NUMBER() OVER (ORDER BY lexical_rank DESC) AS position
+                        FROM (
+                            SELECT
+                                id,
+                                text,
+                                metadata,
+                                embedding,
+                                ts_rank_cd(search_tsv, query, 32) AS lexical_rank
+                            FROM {self.table_name},
+                                 to_tsquery('english',NULLIF(replace(plainto_tsquery('english', $2)::text,' & ',' | '),'')) AS query
+                            WHERE search_tsv @@ query
+                            ORDER BY lexical_rank DESC
+                            LIMIT $4
+                        ) AS top_lexical
                     )
                     SELECT
                         COALESCE(d.id, l.id) AS id,
@@ -122,11 +139,8 @@ class SearchEngine:
                         CASE WHEN COALESCE(d.distance, l.distance) IS NOT NULL
                              THEN ROUND(GREATEST(0, LEAST(1, 1 - COALESCE(d.distance, l.distance)))::numeric, 4)::float8
                         END AS retrieval_confidence,
-                        l.lexical_rank,
-                        d.position AS dense_position,
-                        l.position AS lexical_position,
-                        (COALESCE(1.0 / ($5 + d.position), 0)
-                            + COALESCE(1.0 / ($5 + l.position), 0))::float8 AS fused_score
+                        (COALESCE({DENSE_WEIGHT} / ($5 + d.position), 0)
+                            + COALESCE({LEXICAL_WEIGHT} / ($5 + l.position), 0))::float8 AS fused_score
                     FROM dense d
                     FULL OUTER JOIN lexical l ON d.id = l.id
                     ORDER BY fused_score DESC
@@ -137,16 +151,17 @@ class SearchEngine:
         finally:
             await release_connection(connection)
 
-    async def reranked_search(self, query_text, limit=8, candidate_limit=40):
-        candidates = await self.hybrid_search(query_text, limit=candidate_limit)
-        if not candidates:
-            return []
-        try:
-            reranked = await self.reranker.rerank_results(query_text, candidates, top_k=limit)
-        except Exception as lclEx:
-            Helper.print_exception("SearchEngine.reranked_search", lclEx,
-                                   "Cohere rerank failed, falling back to the fused hybrid order.")
-            return candidates[:limit]
-
-        log.debug(f"reranked_search() reranked {len(candidates)} candidates down to {len(reranked)}")
-        return reranked
+    # Unused — no callers in the codebase.  
+    # async def reranked_search(self, query_text, limit=8, candidate_limit=40):
+    #     candidates = await self.hybrid_search(query_text, limit=candidate_limit)
+    #     if not candidates:
+    #         return []
+    #     try:
+    #         reranked = await self.reranker.rerank_results(query_text, candidates, top_k=limit)
+    #     except Exception as lclEx:
+    #         Helper.print_exception("SearchEngine.reranked_search", lclEx,
+    #                                "Cohere rerank failed, falling back to the fused hybrid order.")
+    #         return candidates[:limit]
+    #
+    #     log.debug(f"reranked_search() reranked {len(candidates)} candidates down to {len(reranked)}")
+    #     return reranked
