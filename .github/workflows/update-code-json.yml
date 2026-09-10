@@ -1,0 +1,64 @@
+name: Update code.json
+
+on:
+  schedule:
+    - cron: "0 0 1 * *" # monthly
+  workflow_dispatch:
+
+permissions:
+  contents: write # Required for code.json generation and PR creation
+  pull-requests: write # Required to create a PR
+  issues: write # Required to apply labels to the PR
+
+concurrency:
+  group: update-code-json
+  cancel-in-progress: false
+
+jobs:
+  update-code-json:
+    name: Update code.json
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Update code.json
+        id: update
+        uses: DSACMS/automated-codejson-generator@v1.3.0
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: main
+          SKIP_PR: "false"
+
+      - name: Keep a single open code.json PR
+        if: steps.update.outputs.method_used == 'pull_request' && steps.update.outputs.pr_url != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEWEST_PR_URL: ${{ steps.update.outputs.pr_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$NEWEST_PR_URL" =~ /pull/([0-9]+)$ ]]; then
+            echo "Unable to parse PR number from: $NEWEST_PR_URL"
+            exit 1
+          fi
+          NEWEST_PR_NUMBER="${BASH_REMATCH[1]}"
+          echo "Keeping open PR #${NEWEST_PR_NUMBER}"
+
+          # Close any older open PRs with the same title so only one remains.
+          while IFS=$'\t' read -r number title; do
+            if [[ -z "${number:-}" ]]; then
+              continue
+            fi
+            if [[ "$number" == "$NEWEST_PR_NUMBER" ]]; then
+              continue
+            fi
+            if [[ "$title" != "Update code.json" ]]; then
+              continue
+            fi
+            echo "Closing older code.json PR #${number}"
+            gh pr close "$number" --comment "Superseded by #${NEWEST_PR_NUMBER}. Only one open code.json update PR is kept."
+          done < <(gh pr list --state open --search 'in:title "Update code.json"' --json number,title --jq '.[] | [.number, .title] | @tsv')
