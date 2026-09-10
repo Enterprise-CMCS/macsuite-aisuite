@@ -50,3 +50,10 @@ Non-prod is bootstrapped. Prod still needs bootstrap before the first prod
 deploy. Details: [`.github/oidc/README.md`](.github/oidc/README.md#cdk-bootstrap).
 
 Agent/contributor working rules: see [`AGENTS.md`](AGENTS.md).
+
+## License
+
+This project is in the public domain within the United States. Copyright and
+related rights worldwide are waived through the
+[CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/)
+public domain dedication; see [`LICENSE`](LICENSE).
