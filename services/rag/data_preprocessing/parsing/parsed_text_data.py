@@ -1,5 +1,6 @@
 import json
 import itertools
+import os
 import re
 import boto3
 import datetime
@@ -260,6 +261,9 @@ def invoke_parsed_text_data():
         for data in parsed_data:
             docs = parsed_text_info(data)
             text_data.extend(docs)
+
+        bda_text_output_filename = os.path.join(bda_text_output_folder, bda_text_output_filename)
+        log.debug(f"Output Text File Name={bda_text_output_filename}")
 
         log.debug(
             f"invoke_parsed_text_data() Creating One file for {len(text_data)} Parsed document. Name of Output Text File Name={bda_text_output_filename}")
