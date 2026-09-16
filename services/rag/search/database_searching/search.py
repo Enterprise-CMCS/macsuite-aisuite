@@ -1,16 +1,10 @@
 import json
-
 import numpy as np
 from data_embeddings_storage.database.connection import get_connection, release_connection
 from search.database_searching.aws_embedding_client import BedrockEmbeddingClient
 from search.database_searching.reranker import CohereReranker
 from common.utils.helper import Helper
 from common.utils.logger import log
-
-RRF_K = 60
-
-
-MIN_EF_SEARCH = 64
 
 
 def _parse_metadata(metadata):
@@ -76,14 +70,13 @@ class SearchEngine:
         finally:
             await release_connection(connection)
 
-    async def hybrid_search(self, query_text, limit=12, dense_limit=60, lexical_limit=60):
+    async def hybrid_search(self, query_text, limit=20, dense_limit=60, lexical_limit=60,
+                             dense_weight=0.7, lexical_weight=0.3, rrf_k=60):
         embedding_flattened = await self.embed_query(query_text)
-        ef_search = max(MIN_EF_SEARCH, dense_limit)
 
         connection = await get_connection()
         try:
             async with connection.transaction():
-                await connection.execute(f"SET LOCAL hnsw.ef_search = {int(ef_search)}")
 
                 results = await connection.fetch(f"""
                     WITH dense AS (
@@ -102,9 +95,6 @@ class SearchEngine:
                             id,
                             text,
                             metadata,
-                            -- Scored here as well so a chunk the vector arm never
-                            -- shortlisted still carries a cosine distance. Otherwise
-                            -- its retrieval confidence lands in the workbook blank.
                             embedding <=> $1::vector AS distance,
                             ts_rank_cd(search_tsv, query, 32) AS lexical_rank,
                             ROW_NUMBER() OVER (ORDER BY ts_rank_cd(search_tsv, query, 32) DESC) AS position
@@ -125,28 +115,14 @@ class SearchEngine:
                         l.lexical_rank,
                         d.position AS dense_position,
                         l.position AS lexical_position,
-                        (COALESCE(1.0 / ($5 + d.position), 0)
-                            + COALESCE(1.0 / ($5 + l.position), 0))::float8 AS fused_score
+                        (COALESCE({dense_weight} / ($5 + d.position), 0)
+                            + COALESCE({lexical_weight} / ($5 + l.position), 0))::float8 AS fused_score
                     FROM dense d
                     FULL OUTER JOIN lexical l ON d.id = l.id
                     ORDER BY fused_score DESC
                     LIMIT $6
-                """, embedding_flattened, query_text, dense_limit, lexical_limit, RRF_K, limit)
+                """, embedding_flattened, query_text, dense_limit, lexical_limit, rrf_k, limit)
 
             return [dict(row, metadata=_parse_metadata(row["metadata"])) for row in results] if results else []
         finally:
             await release_connection(connection)
-
-    async def reranked_search(self, query_text, limit=8, candidate_limit=40):
-        candidates = await self.hybrid_search(query_text, limit=candidate_limit)
-        if not candidates:
-            return []
-        try:
-            reranked = await self.reranker.rerank_results(query_text, candidates, top_k=limit)
-        except Exception as lclEx:
-            Helper.print_exception("SearchEngine.reranked_search", lclEx,
-                                   "Cohere rerank failed, falling back to the fused hybrid order.")
-            return candidates[:limit]
-
-        log.debug(f"reranked_search() reranked {len(candidates)} candidates down to {len(reranked)}")
-        return reranked

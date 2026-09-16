@@ -1,10 +1,11 @@
 import os
+import time
 import structlog
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from search.database_searching.agents import answer_question, build_deps
+from search.database_searching.agents import answer_question_formatted, build_deps
 
 logger = structlog.get_logger(__name__)
 _deps = None
@@ -17,6 +18,7 @@ class AgentResponse(BaseModel):
     """Response model for agent endpoint."""
     query: str = Field(..., description="Original query")
     response: str = Field(..., description="Agent-generated response")
+    processing_time: float = Field(..., description="Time taken to process the request, in seconds")
     success: bool = Field(default=True, description="Whether request was successful")
 
 
@@ -69,14 +71,16 @@ async def process_agent_query(query: str) -> AgentResponse:
     logger.info("agent_request", query=query[:100])
 
     global _deps
+    start = time.perf_counter()
     try:
         if _deps is None:
             _deps = build_deps()
 
-        answer = await answer_question(query, deps=_deps)
+        answer = await answer_question_formatted(query, deps=_deps)
+        elapsed = time.perf_counter() - start
 
-        logger.info("agent_success", query=query[:100], length=len(answer))
-        return AgentResponse(query=query, response=answer, success=True)
+        logger.info("agent_success", query=query[:100], length=len(answer), processing_time=elapsed)
+        return AgentResponse(query=query, response=answer, processing_time=elapsed, success=True)
 
     except ImportError as e:
         error_msg = f"Module import failed: {str(e)}"
@@ -87,10 +91,12 @@ async def process_agent_query(query: str) -> AgentResponse:
         )
 
     except Exception as e:
+        elapsed = time.perf_counter() - start
         logger.error("agent_error", error=str(e), query=query[:100], exc_info=True)
         return AgentResponse(
             query=query,
             response=f"Error: {str(e)}. Please try rephrasing or contact support.",
+            processing_time=elapsed,
             success=False
         )
 

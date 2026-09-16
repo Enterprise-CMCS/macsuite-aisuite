@@ -76,7 +76,7 @@ def parse_table_elements_simple(source_data):
 
     results = []
     source_key = source_data.get("metadata", {}).get("s3_key")
-    doc_name = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0] if source_key else "unknown"
+    doc_name = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0].replace(" ", "_")
     log.info(f"parse_table_elements_simple() source_key={source_key}")
 
     printed_pages = printed_page_map(source_data.get("elements"))
