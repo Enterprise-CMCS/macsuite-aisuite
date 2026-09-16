@@ -263,7 +263,7 @@ contract_agent = Agent(
 
 
 async def review_requirement(requirement, deps=None, sheet="", item="", legal_cite="",
-                             row=None, challenge=True, usage=None):
+                             row=None, usage=None):
 
     review = RequirementReview(
         requirement=requirement, sheet=sheet, item=item, legal_cite=legal_cite,
