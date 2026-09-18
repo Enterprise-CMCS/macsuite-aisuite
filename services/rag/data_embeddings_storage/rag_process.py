@@ -69,7 +69,7 @@ async def invoke_rag_process():
 
         #get BDA Text Data
         log.info(f"Opening Output BDA Texts Json File to access the BDA pre-processed data={ str_bda_text_json_filename}")
-        str_bda_text_json_filename = os.path.join(bda_text_output_folder, str_bda_text_json_filename)
+        str_bda_text_json_filename = f"{bda_text_output_folder}{str_bda_text_json_filename}"
         texts_data = Helper.get_json_from_s3(output_bucket, str_bda_text_json_filename)
 
         #with open(str_bda_text_json_file_name, "r", encoding='utf-8') as f:
@@ -79,7 +79,7 @@ async def invoke_rag_process():
 
         # get BDA Images Data
         log.info(f"Opening Output BDA Images Json File to access the BDA pre-processed data={str_bda_images_json_filename}")
-        str_bda_images_json_filename = os.path.join(bda_image_output_folder, str_bda_images_json_filename)
+        str_bda_images_json_filename = f"{bda_image_output_folder}{str_bda_images_json_filename}"
         images_data = Helper.get_json_from_s3(output_bucket, str_bda_images_json_filename)
         #with open(str_bda_images_json_file_name, "r", encoding='utf-8') as f:
         #    images_data = json.load(f)
@@ -87,7 +87,7 @@ async def invoke_rag_process():
 
         # get Table Images Data
         log.info(f"Opening Output BDA Table Json File to access the BDA pre-processed data={str_bda_tables_json_filename}")
-        str_bda_tables_json_filename = os.path.join(bda_table_output_folder, str_bda_tables_json_filename)
+        str_bda_tables_json_filename = f"{bda_table_output_folder}{str_bda_tables_json_filename}"
         table_data = Helper.get_json_from_s3(output_bucket, str_bda_tables_json_filename)
         #with open(str_bda_images_json_file_name, "r", encoding='utf-8') as f:
         #    images_data = json.load(f)
@@ -196,7 +196,7 @@ async def invoke_rag_process():
 
         if not rag_split_out_put_folder.endswith('/'):
             rag_split_out_put_folder += '/'
-        str_rag_split_out_put_file = os.path.join(rag_split_out_put_folder, str_rag_split_out_put_file)
+        str_rag_split_out_put_file = f"{rag_split_out_put_folder}{str_rag_split_out_put_file}"
 
         log.info(f"invoke_rag_process() Split OutPut File name str_rag_split_out_put_file={ str_rag_split_out_put_file}")
 

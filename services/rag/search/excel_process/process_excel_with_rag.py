@@ -392,7 +392,7 @@ async def review_all(todo, sidecar, concurrency, challenge):
                 item=entry["item"],
                 legal_cite=entry["legal_cite"],
                 row=entry["row"],
-                challenge=challenge,
+                # challenge=challenge, 
             )
             append_sidecar(sidecar, review)
             counter["finished"] += 1

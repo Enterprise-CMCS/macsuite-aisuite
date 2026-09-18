@@ -10,6 +10,23 @@ from common.utils.logger import log
 from data_preprocessing.bedrock.bda_results import BDAResults
 from data_preprocessing.parsing.parsed_text_data import element_page, printed_page_map
 
+def _compact_markdown(md):
+    """Strip BDA's column padding out of a markdown table.
+    BDA pads every cell with spaces to the width of its column and draws separators as long dash
+    runs, which together are about two thirds of the characters in a typical table. None of it
+    carries meaning, so cells are trimmed and separators shortened to a single "---"."""
+    lines = []
+    for raw in (md or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "|" in line:
+            cells = [re.sub(r"\s+", " ", c).strip() for c in line.strip("|").split("|")]
+            cells = ["---" if re.fullmatch(r":?-+:?", c) else c for c in cells]
+            line = "| " + " | ".join(cells) + " |"
+        lines.append(line)
+    return "\n".join(lines)
+
 def _parse_markdown_table(md):
 
     rows = []
@@ -60,14 +77,14 @@ def _infer_headers(rows, provided):
         return first, 1
     return [f"Column_{i+1}" for i in range(len(first))], 0
 
+# Unused function, commenting out.
+# def _has_row_headers(data):
 
-def _has_row_headers(data):
-
-    if not data or not data[0]:
-        return False
-    first_col = [r[0] for r in data if r]
-    texty = sum((not _is_num(v)) and v != "" for v in first_col)
-    return texty >= max(2, len(first_col) // 3)
+#     if not data or not data[0]:
+#         return False
+#     first_col = [r[0] for r in data if r]
+#     texty = sum((not _is_num(v)) and v != "" for v in first_col)
+#     return texty >= max(2, len(first_col) // 3)
 
 
 
@@ -76,7 +93,7 @@ def parse_table_elements_simple(source_data):
 
     results = []
     source_key = source_data.get("metadata", {}).get("s3_key")
-    doc_name = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0] if source_key else "unknown"
+    doc_name = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0].replace(" ", "_")
     log.info(f"parse_table_elements_simple() source_key={source_key}")
 
     printed_pages = printed_page_map(source_data.get("elements"))
@@ -86,10 +103,10 @@ def parse_table_elements_simple(source_data):
         if element_type != "TABLE":
             continue
         title = elements.get("title") or ""
-        text    = (elements.get("representation") or {}).get("markdown","")
+        text = _compact_markdown((elements.get("representation") or {}).get("markdown",""))
         table_id= elements.get("id") or str(uuid.uuid4())
         page_index = element_page(elements)
-        csv_uri = elements.get("csv_s3_uri", None)
+        #csv_uri = elements.get("csv_s3_uri", None)
         log.debug(f"parse_table_elements_simple() element_type={element_type}, title={title}, table_id={table_id} text={text}")
         each_table_rows = _parse_markdown_table(text)
         
