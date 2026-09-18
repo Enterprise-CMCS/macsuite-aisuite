@@ -1,7 +1,6 @@
 import json
 import re
 from dataclasses import dataclass, field, replace
-from types import SimpleNamespace
 from typing import Dict
 
 from pydantic_ai import Agent, ModelRetry, RunContext, ToolDefinition, ToolFailed
@@ -12,59 +11,66 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 
 from common.utils.helper import Helper
 from common.utils.logger import log
-from search.database_searching.model_provider import (
-    bedrock_hooks,
-    bedrock_model,
-    model_id,
-)
-from search.database_searching.review_models import RequirementReview, page_number
+from search.database_searching.model_provider import (bedrock_hooks,bedrock_model,model_id,)
+from search.database_searching.review_models import (EvidenceRecord,RequirementReview,page_number,)
 from search.database_searching.search import SearchEngine
 
 
 MAX_SEARCHES = 3
 
-AGENT_SYSTEM_PROMPT = """You are an expert contract analysis assistant. Your task is to verify whether specific contractual requirements are supported by the provided retrieved text.
-
-You must base all conclusions ONLY on the retrieved context. Do not use outside knowledge or assumptions.
-
-IMPORTANT RULES:
-- Never describe the search process or retrieval steps.
-- Do not explain how the information was found.
-- Only present the conclusion and supporting evidence.
-- Return all relevant pages
-- Everytime explict evidence in the form of a quote is returned, always have page number with it
-- Always include specific sources and page. Never return "Hybrid Search Results" for source.
-- Do NOT return a header or footer as source, always refer to the citation or metadata
-- Always return the document name as source
-- Never include internal labels like "[result 1]" or "[result 2]" in your Response or in any quote. Quote only the actual contract wording.
-- Never truncate a quote with an ellipsis (...). Every quote must be a complete sentence or clause as it appears in the source text.
-
-ANALYSIS TASK:
-For each requirement provided by the user, analyze whether the contract text explicitly supports the requirement and provide a recommendation.
-
+AGENT_SYSTEM_PROMPT = """You are an expert contract analysis assistant. Your task is to determine whether a specific contractual requirement is supported by the retrieved contract text.
+Base every conclusion ONLY on the retrieved contract context. Do not use outside knowledge, assumptions, or information that is not explicitly supported by the retrieved text.
+ 
 RECOMMENDATION DEFINITIONS:
+
 MET:
-The retrieved text explicitly states the requirement is met.
+The retrieved contract text explicitly provides sufficient evidence that the requirement is satisfied.
 NOT MET:
-The retrieved text shows that the requirement is not met.
+The retrieved contract text explicitly provides sufficient evidence that the requirement is not satisfied.
 UNCLEAR:
-The retrieved text does not provide enough explicit evidence to determine whether the requirement is met.
-
-Return output in the following JSON format exactly:
-
+The retrieved contract text does not provide enough explicit evidence to determine whether the requirement is satisfied.
+ 
+EVIDENCE RULES:
+- Use only retrieved contract text.
+- Every retrieved passage is identified by [chunk N].
+- Every supporting citation must reference an actual retrieved chunk ID.
+- Never invent a chunk ID.
+- Return every passage materially needed to support the recommendation in Evidence.
+- For each evidence item, return the chunk_id and an exact verbatim quote from that chunk.
+- Quotes must be copied exactly from the retrieved contract text.
+- Never paraphrase evidence quotes.
+- Never truncate a quote with an ellipsis (...).
+- Do not use headers or footers as evidence unless they themselves contain the contractual provision being evaluated.
+- If the retrieved text does not contain sufficient supporting evidence, return an empty Evidence list when appropriate.
+- Do not generate document names or page numbers. Python derives document and page information from the cited chunk metadata.
+ 
+RESPONSE RULES:
+- Response contains reasoning only.
+- Explain why the retrieved evidence supports MET, NOT MET, or UNCLEAR.
+- Keep the explanation concise and focused, preferably 2-4 sentences.
+- Do not repeat the entire requirement.
+- Do not include document names in Response.
+- Do not include page numbers in Response.
+- Do not include chunk IDs in Response.
+- Do not include citation references in Response.
+- Do not include verbatim contract quotes in Response.
+- For MET, explain what contractual provision or obligation satisfies the requirement.
+- For NOT MET, explain what material requirement the contract explicitly fails to satisfy.
+- For UNCLEAR, explain specifically what required fact, threshold, obligation, or provision cannot be established from the retrieved text.
+ 
+Return exactly one JSON object in this format:
 {
     "Recommendation": "MET | NOT MET | UNCLEAR",
-    "Response": "<detailed explanation with evidence and reasoning. Include quotes if helpful>"
+    "Response": "<concise reasoning only>",
+    "Evidence": [
+        {
+            "chunk_id": 1234,
+            "quote": "<exact verbatim contract wording from chunk 1234>"
+        }
+    ]
 }
-
-
-ADDITIONAL GUIDELINES:
-- Prefer direct quotes from the contract when possible in your Response.
-- Keep evidence excerpts focused and precise.
-- If multiple relevant excerpts exist, include them in your Response.
-- If no evidence exists, state that clearly in your Response and return UNCLEAR as Recommendation.
-- Provide detailed reasoning in the Response field, explaining why you made this Recommendation."""
-
+Do not return Source or Page fields. Python derives document names and page numbers from the Evidence chunk metadata.
+"""
 
 @dataclass
 class ContractDeps:
@@ -73,21 +79,24 @@ class ContractDeps:
     max_searches: int = MAX_SEARCHES
     searches: int = 0
 
-
 def build_deps(table_name=None):
     return ContractDeps(search_engine=SearchEngine(table_name=table_name))
-
 
 async def retrieve(deps, query):
     return await deps.search_engine.hybrid_search(query)
 
-
+# CHECK CHUNKS
 def record_chunks(deps, results):
     kept = []
     for result in results:
         chunk_id = result.get("id")
         if chunk_id is None:
             continue
+        try:
+            chunk_id = int(chunk_id)
+        except (TypeError, ValueError):
+            continue
+        result["id"] = chunk_id
         existing = deps.chunks.get(chunk_id)
         if existing is None:
             deps.chunks[chunk_id] = result
@@ -99,25 +108,32 @@ def record_chunks(deps, results):
 
 
 def chunk_provenance(chunk):
-    metadata = chunk.get("metadata")
+    metadata = chunk.get("metadata") or {}
     return {
         "doc_id": metadata.get("doc_id"),
         "page": metadata.get("page"),
         "printed_page": (metadata.get("printed_page") or "").strip()
     }
 
-
 def format_retrieved_chunks(chunks):
     blocks = []
-    for i, chunk in enumerate(chunks, 1):
+    for chunk in chunks:
         text = chunk.get("text")
+        chunk_id = chunk.get("id")
+        metadata = chunk.get("metadata") or {}
         if not text or not text.strip():
-            raise ValueError(f"Retrieved chunk {i} (id={chunk.get('id')}) has no text")
-        blocks.append(f"[result {i}]\n{text.strip()}")
+            raise ValueError(f"Retrieved chunk (id={chunk_id}) has no text")
+        doc_id = metadata.get("doc_id", "")
+        page = page_number(metadata.get("page"),metadata.get("printed_page", ""),)
+        blocks.append(
+            f"[chunk {chunk_id}]\n"
+            f"Document: {doc_id}\n"
+            f"Page: {page}\n"
+            f"Text:\n{text.strip()}")
 
     return "\n\n".join(blocks)
 
-
+# MODEL OUTPUT HELPERS 
 def extract_json_object(text):
     """The first {...} JSON object in the text, tolerating a <thinking>...</thinking>
     preamble or other stray text the model sometimes emits before the JSON.
@@ -127,7 +143,6 @@ def extract_json_object(text):
     if start == -1 or end == -1 or end < start:
         raise ValueError("No JSON object found in model output")
     return json.loads(text[start:end + 1])
-
 
 def chunks_sources(chunks):
     pages_by_doc = {}
@@ -169,7 +184,6 @@ def strip_result_tags(text):
     back into its Response text despite being told not to."""
     return RESULT_TAG.sub("", text or "")
 
-
 def first_quote(text):
     text = text or ""
     match = FIRST_QUOTE.search(text) or FIRST_SINGLE_QUOTE.search(text)
@@ -177,38 +191,38 @@ def first_quote(text):
         return ""
     return LEADING_RESULT_TAG.sub("", match.group(1).strip())
 
+def normalize_text(text):
+    return re.sub(r"\s+", " ", text or "").strip()
 
 def top_citation(deps):
     """The single highest-confidence retrieved chunk, for the one-line citation display."""
     scored = [chunk for chunk in deps.chunks.values() if chunk.get("retrieval_confidence") is not None]
     return max(scored, key=lambda chunk: chunk["retrieval_confidence"]) if scored else None
 
-
+#DISPLAY
 def format_review_display(review, deps):
-    chunk = top_citation(deps)
-    where = chunk_provenance(chunk) if chunk else {"doc_id": "", "page": None, "printed_page": ""}
-    page = page_number(where["page"], where["printed_page"]) if chunk else ""
-    quote = first_quote(review.argument)
-
     lines = [
         f"AI recommended status: {review.status.title()}",
         "",
-        f"AI response: {review.argument}",
+        f"AI response: {review.in_reviewer_terms(review.argument)}",
         "",
-        f"Page number: {page}",
+        f"Page number: {review.page_numbers()}",
         "",
         f"Confidence: {confidence_label(review.retrieval_confidence)}",
     ]
-    if where["doc_id"] or quote:
+    verified = [record for record in review.evidence if record.verified]
+    if verified:
         lines += ["", "Cited contract text:"]
-        if where["doc_id"]:
-            lines.append(f"{where['doc_id']}, page {page}")
-        if quote:
-            lines.append(f'"{quote}"')
+ 
+        for record in verified:
+            page = page_number(record.page, record.printed_page,)
+            lines += [f"{record.doc_id}, page {page}", f'"{record.quote}"', "",]
+    else:
+        lines += ["","Note: No verified cited contract text was found for this status.",]
 
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
-
+#SEARCH TOOL
 async def search_contract(context: RunContext[ContractDeps], query: str) -> str:
 
     deps = context.deps
@@ -221,35 +235,28 @@ async def search_contract(context: RunContext[ContractDeps], query: str) -> str:
     record_chunks(deps, results)
     return format_retrieved_chunks(results)
 
-
+#TOOL HOOKS
 review_hooks = Hooks()
-
-
 @review_hooks.on.before_tool_execute(tools=["search_contract"])
 async def charge_search_budget(context: RunContext[ContractDeps], *, call: ToolCallPart,
-                               tool_def: ToolDefinition,
-                               args: ValidatedToolArgs) -> ValidatedToolArgs:
+        tool_def: ToolDefinition,args: ValidatedToolArgs) -> ValidatedToolArgs:
     deps = context.deps
     if deps.searches >= deps.max_searches:
-        log.debug(f"charge_search_budget() refused search {deps.searches + 1}, "
-                  f"the limit is {deps.max_searches}")
-        raise ToolFailed(
-            f"Search budget for this requirement is used up after {deps.max_searches} searches. "
+        log.debug(f"charge_search_budget() refused search {deps.searches + 1}, the limit is {deps.max_searches}")
+        raise ToolFailed(f"Search budget for this requirement is used up after {deps.max_searches} searches. "
             "Decide from the text you already have, and return UNCLEAR if it does not settle it.")
-
     deps.searches += 1
     return args
 
 
 @review_hooks.on.tool_execute_error(tools=["search_contract"])
 async def retry_failed_search(context: RunContext[ContractDeps], *, call: ToolCallPart,
-                              tool_def: ToolDefinition, args: ValidatedToolArgs,
-                              error: Exception):
+    tool_def: ToolDefinition, args: ValidatedToolArgs,error: Exception):
     query = str(args.get("query", ""))[:120]
     Helper.print_exception("search_contract", error, f"Retrieval failed for query '{query}'.")
     raise ModelRetry("The search backend failed. Try once more with a shorter query.")
 
-
+#AGENT
 contract_agent = Agent(
     bedrock_model(),
     deps_type=ContractDeps,
@@ -261,12 +268,11 @@ contract_agent = Agent(
     name="contract_agent",
 )
 
-
+# REQUIREMENT REVIEW
 async def review_requirement(requirement, deps=None, sheet="", item="", legal_cite="",
                              row=None, usage=None):
 
-    review = RequirementReview(
-        requirement=requirement, sheet=sheet, item=item, legal_cite=legal_cite,
+    review = RequirementReview(requirement=requirement, sheet=sheet, item=item, legal_cite=legal_cite,
         row=row, model=model_id(),
     )
     if not (requirement or "").strip():
@@ -277,21 +283,25 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
     run_usage = usage if usage is not None else RunUsage()
 
     try:
+        #Initial retrieval
         seed = await retrieve(deps, requirement)
         record_chunks(deps, seed)
         review.chunks_retrieved = len(deps.chunks)
 
-        result = await contract_agent.run(
-            f"Requirement to verify:\n{requirement}\n\n"
-            "Retrieved contract context (each [result i] includes text and metadata):\n"
+        #Agent analysis
+        result = await contract_agent.run(f"Requirement to verify:\n{requirement}\n\n"
+            "Retrieved contract context(each passage is identified by a persistent [chunk N] ID):\n"
             f"{format_retrieved_chunks(seed)}\n\n"
-            "Now perform the analysis as specified in the system prompt and return a single JSON object.",
+            "Analyze the requirement using only the retrieved contract context. "
+            "If additional evidence is needed, use search_contract. "
+            "Return exactly one JSON object containing Recommendation, Response, and Evidence.",
             deps=deps,
             usage=run_usage,
             usage_limits=UsageLimits(request_limit=4 + deps.max_searches),
         )
         review.chunks_retrieved = len(deps.chunks)
 
+        #Parse Model Json
         try:
             parsed = extract_json_object(result.output)
         except (json.JSONDecodeError, ValueError, TypeError) as parse_err:
@@ -300,60 +310,152 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
             review.argument = f"The model output could not be parsed as JSON. Raw output was:\n{result.output}"
             return review
 
-        review.status = parsed.get("Recommendation", "UNCLEAR")
+        # Recommendation
+        status = str(parsed.get("Recommendation", "UNCLEAR")).strip().upper()
+        review.status = (status if status in {"MET", "NOT MET", "UNCLEAR"} else "UNCLEAR")
         review.argument = strip_result_tags(parsed.get("Response", ""))
+ 
+        # Evidence
+        review.evidence = []
+        evidence_items = parsed.get("Evidence", [])
+ 
+        if not isinstance(evidence_items, list):
+            evidence_items = []
+ 
+        for evidence_item in evidence_items:
+            if not isinstance(evidence_item, dict):
+                continue
+            try:
+                chunk_id = int(evidence_item.get("chunk_id"))
+            except (TypeError, ValueError):
+                continue
+ 
+            quote = (evidence_item.get("quote") or "").strip()
+            chunk = deps.chunks.get(chunk_id)
+ 
+            # Ignore invented/missing chunk IDs.
+            if not chunk or not quote:
+                continue
+            text = chunk.get("text") or ""
+            metadata = chunk.get("metadata") or {}
+ 
+            # Normalize whitespace before quote verification.
+            normalized_quote = normalize_text(quote)
+            normalized_text = normalize_text(text)
+ 
+            verified = (normalized_quote in normalized_text)
+ 
+            review.evidence.append(EvidenceRecord(
+                    quote=quote,
+                    chunk_id=chunk_id,
+                    doc_id=metadata.get("doc_id","",),
+                    page=metadata.get("page"),
+                    printed_page=metadata.get("printed_page","",),
+                    retrieval_confidence=chunk.get("retrieval_confidence"),
+                    verified=verified,))
+ 
+        # Quote verification
+        review.quotes_verified = (bool(review.evidence) and all(record.verified for record in review.evidence))
+ 
+        # Confidence
+        # Only VERIFIED CITED evidence contributes to the final retrieval
+        # confidence. A high-scoring retrieved chunk that was not actually
+        # used as evidence does not determine the final confidence.
 
-        cited = [chunk.get("retrieval_confidence") for chunk in deps.chunks.values()
-                 if chunk.get("retrieval_confidence") is not None]
-        review.retrieval_confidence = max(cited) if cited else None
-        review.combined_confidence = review.retrieval_confidence
-        review.sources = chunks_sources(deps.chunks.values())
+        verified_cited = [record.retrieval_confidence for record in review.evidence
+            if (record.verified and record.retrieval_confidence is not None)]
+ 
+        review.retrieval_confidence = (max(verified_cited) if verified_cited else None)
 
-        log.info(f"review_requirement() {sheet} item {item} = {review.status}, "
-                 f"retrieval confidence {review.retrieval_confidence}, "
-                 f"chunks {review.chunks_retrieved}")
+        # is combined_confidence and retrieval confidence same?
+        review.combined_confidence = (review.retrieval_confidence)
+ 
+        # Sources now represent evidence actually cited, rather than every retrieved chunk.
+        review.sources = review.where_found()
+ 
+        # LOGGING
+        log.info(
+            f"review_requirement() {sheet} item {item} "
+            f"= {review.status}, "
+            f"retrieval confidence {review.retrieval_confidence}, "
+            f"chunks {review.chunks_retrieved}")
+ 
         log.info("review_requirement() display:\n" + format_review_display(review, deps))
         return review
 
     except Exception as lclEx:
-        Helper.print_exception("review_requirement", lclEx,
-                               f"Review failed for requirement '{requirement[:120]}'.")
+        Helper.print_exception("review_requirement", lclEx, f"Review failed for requirement '{requirement[:120]}'.")
         review.status = "UNCLEAR"
         review.error = f"{type(lclEx).__name__}: {lclEx}"
         review.argument = review.argument or "The automated review did not complete for this requirement."
         return review
 
 
-async def answer_question_formatted(query, deps=None, usage=None):
-
-    deps = replace(deps or build_deps(), chunks={}, searches=0)
-    run_usage = usage if usage is not None else RunUsage()
-
+# FORMATTED QUESTION
+async def answer_question_formatted(query,deps=None,usage=None,):
+ 
+    deps = replace(deps or build_deps(), chunks={}, searches=0,)
+    run_usage = (usage if usage is not None else RunUsage())
     seed = await retrieve(deps, query)
     record_chunks(deps, seed)
-
-    result = await contract_agent.run(
-        f"Question:\n{query}\n\n"
-        "Retrieved contract context (each [result i] includes text and metadata):\n"
+ 
+    result = await contract_agent.run(f"Question:\n{query}\n\n"
+        "Retrieved contract context (each passage is identified by a persistent [chunk N] ID):\n"
         f"{format_retrieved_chunks(seed)}\n\n"
-        "Now perform the analysis as specified in the system prompt and return a single JSON object.",
-        deps=deps,
-        usage=run_usage,
-        usage_limits=UsageLimits(request_limit=4 + deps.max_searches),
-    )
-
+        "Analyze the question using only the retrieved contract context. If additional evidence is needed, use search_contract. "
+        "Return exactly one JSON object containing Recommendation, Response, and Evidence.",
+        deps=deps, usage=run_usage,
+        usage_limits=UsageLimits(request_limit=4 + deps.max_searches),)
+ 
     try:
         parsed = extract_json_object(result.output)
-    except (json.JSONDecodeError, ValueError, TypeError):
+    except (json.JSONDecodeError, ValueError,TypeError,):
         log.warning("answer_question_formatted() model output was not valid JSON, returning it as-is")
+ 
         return result.output
+ 
+    review = RequirementReview(
+        requirement=query, status=(str(parsed.get("Recommendation","UNCLEAR",)).strip().upper()),
+        argument=strip_result_tags(parsed.get("Response","",)),
+        model=model_id(),)
+ 
+    evidence_items = parsed.get("Evidence", [],)
+ 
+    if not isinstance(evidence_items, list,):
+        evidence_items = []
 
-    cited = [chunk.get("retrieval_confidence") for chunk in deps.chunks.values()
-             if chunk.get("retrieval_confidence") is not None]
+    for evidence_item in evidence_items:
+        if not isinstance(evidence_item,dict,):
+            continue
+        try:
+            chunk_id = int(evidence_item.get("chunk_id"))
+        except (TypeError,ValueError,):
+            continue
+ 
+        quote = (evidence_item.get("quote") or "").strip()
+        chunk = deps.chunks.get(chunk_id)
 
-    review = SimpleNamespace(
-        status=parsed.get("Recommendation", "UNCLEAR"),
-        argument=strip_result_tags(parsed.get("Response", "")),
-        retrieval_confidence=max(cited) if cited else None,
-    )
-    return format_review_display(review, deps)
+        if not chunk or not quote:
+            continue
+ 
+        text = chunk.get("text") or ""
+        metadata = (chunk.get("metadata") or {})
+ 
+        verified = (normalize_text(quote) in normalize_text(text))
+ 
+        review.evidence.append(EvidenceRecord(
+                quote=quote,chunk_id=chunk_id,
+                doc_id=metadata.get("doc_id","",),
+                page=metadata.get("page"),
+                printed_page=metadata.get("printed_page","",),
+                retrieval_confidence=chunk.get("retrieval_confidence"),
+                verified=verified,))
+ 
+    review.quotes_verified = (bool(review.evidence) and all(record.verified for record in review.evidence))
+    verified_cited = [record.retrieval_confidence for record in review.evidence
+        if (record.verified and record.retrieval_confidence is not None)]
+    review.retrieval_confidence = (max(verified_cited) if verified_cited else None)
+    review.combined_confidence = (review.retrieval_confidence)
+    review.sources = (review.where_found())
+ 
+    return format_review_display(review, deps,)
