@@ -4,38 +4,56 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: Target environment
-        required: true
-        default: dev
-        type: choice
-        options:
-          - dev
-          - qa
-          - uat
-          - prod
+      - val
+      - prod
 
 permissions:
   contents: read
   id-token: write
 
-concurrency:
-  group: aisuite-deploy-${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
-  cancel-in-progress: false
-
 jobs:
-  deploy:
-    name: Deploy ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+
+  resolve-environments:
+    name: Resolve target environments
     runs-on: ubuntu-latest
-    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+    outputs:
+      environments: ${{ steps.resolve.outputs.environments }}
+    steps:
+      - name: Resolve target environments
+        id: resolve
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          case "${REF_NAME}" in
+            main) environments='["dev"]' ;;
+            val) environments='["qa","uat"]' ;;
+            prod) environments='["prod"]' ;;
+            *) environments='[]' ;;
+          esac
+
+          echo "environments=${environments}" >>"${GITHUB_OUTPUT}"
+
+  deploy:
+    name: Deploy ${{ matrix.environment }}
+    needs: resolve-environments
+    if: needs.resolve-environments.outputs.environments != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(needs.resolve-environments.outputs.environments) }}
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    concurrency:
+      group: aisuite-deploy-${{ matrix.environment }}
+      cancel-in-progress: false
     env:
-      DEPLOYMENT_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+      DEPLOYMENT_ENV: ${{ matrix.environment }}
       AISUITE_DEPLOY_REGION: ${{ vars.AISUITE_DEPLOY_REGION || 'us-east-1' }}
       # Stable within a release so DeployedAt tags do not churn every deploy.
-      # workflow_dispatch has no head_commit; guard push-only access or the value is empty.
-      DEPLOYMENT_TIMESTAMP: ${{ github.event_name == 'push' && github.event.head_commit.timestamp || github.run_started_at }}
+      DEPLOYMENT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
 
     steps:
       - name: Checkout
