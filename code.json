@@ -1,5 +1,6 @@
 {
   "name": "macsuite-aisuite",
+  "version": "",
   "description": "Greenfield TypeScript AWS CDK infrastructure for AISuite: VPC, ECS Fargate RAG API, RDS Postgres, and Bedrock.",
   "longDescription": "AISuite is a MAC Suite greenfield platform that provisions and operates contract-aware retrieval-augmented generation (RAG) infrastructure on AWS. This repository contains the TypeScript AWS CDK application that deploys per-environment stacks with an imported CloudTamer VPC, an internal Application Load Balancer, ECS Fargate for the RAG API and on-demand batch tasks, private RDS Postgres with pgvector, plus S3, Secrets Manager, ECR, and Bedrock. Logical stages map to shared non-prod and prod AWS accounts and are deployed via GitHub Actions OIDC. The goal is reusable, government-wide discoverable infrastructure that supports Medicaid and Medicare contract analysis workloads for CMS stakeholders.",
   "status": "Development",
@@ -19,10 +20,15 @@
   "repositoryURL": "https://github.com/Enterprise-CMCS/macsuite-aisuite",
   "repositoryHost": "github.com/Enterprise-CMCS",
   "repositoryVisibility": "public",
+  "homepageURL": "",
+  "downloadURL": "",
+  "disclaimerURL": "",
+  "disclaimerText": "",
   "vcs": "git",
-  "laborHours": 0,
+  "laborHours": 5917,
   "reuseFrequency": {
-    "forks": 0
+    "forks": 0,
+    "clones": 0
   },
   "platforms": [
     "web",
@@ -33,19 +39,24 @@
   ],
   "softwareType": "standalone/backend",
   "languages": [
-    "TypeScript",
     "Python",
-    "Shell"
+    "TypeScript",
+    "Shell",
+    "PLpgSQL",
+    "Dockerfile"
   ],
   "maintenance": "contract",
   "contractNumber": [
     "75FCMC24F0027"
   ],
   "SBOM": "https://github.com/Enterprise-CMCS/macsuite-aisuite/network/dependencies",
+  "relatedCode": [],
+  "reusedCode": [],
+  "partners": [],
   "date": {
     "created": "2026-07-06T16:59:40Z",
-    "lastModified": "2026-08-28T05:07:59Z",
-    "metadataLastUpdated": "2026-08-28T20:00:00Z"
+    "lastModified": "2026-09-09T22:08:25Z",
+    "metadataLastUpdated": "2026-10-01T00:43:56.319Z"
   },
   "tags": [
     "aisuite",
@@ -69,6 +80,7 @@
   "projects": [
     "AISuite"
   ],
+  "systems": [],
   "subsetInHealthcare": [
     "policy",
     "operational",
