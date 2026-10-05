@@ -7,6 +7,12 @@ import re
 _CONTRACT_SECTION_PREFIX = "contract:"
 _EMBEDDINGS_TABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
+# Shared reference material (42 CFR Part 438, the CMS State Guide, ...) that
+# search should consult alongside whichever contract is active, not instead
+# of it. Unlike the per-state sections this one is never the active contract
+# except while it is being ingested.
+COMMON_CONTRACT_SECTION = "contract:common_cms_regs"
+
 
 def resolve_config_path(config_file="aws.properties.ini", *, ai_prop_file=None, utils_dir=None):
     if ai_prop_file is None:
@@ -76,6 +82,17 @@ def get_config_property(config, str_property_name, *, default=None, raise_if_mis
     if not raise_if_missing:
         return default
     raise KeyError(str_property_name)
+
+
+def common_embeddings_table_name(config, section=COMMON_CONTRACT_SECTION):
+    """The shared-knowledge-base table name, or None if that section isn't configured.
+
+    Read directly off `section` rather than through active-contract resolution,
+    since this table needs to be consulted regardless of which contract is active.
+    """
+    if not config.has_section(section) or not config.has_option(section, "embeddings_table_name"):
+        return None
+    return validate_embeddings_table_name(config.get(section, "embeddings_table_name").strip())
 
 
 def list_embeddings_table_names_from_config(config):

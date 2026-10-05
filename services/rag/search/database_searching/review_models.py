@@ -1,9 +1,9 @@
 import re
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-Status = Literal["MET", "NOT MET", "UNCLEAR"]
+Status = Literal["MET", "NOT MET", "Unsure"]
 
 # "in chunk 3566", "from chunks 3733 and 3740" - how the model cites the search
 # results while it works. The reviewer reading the workbook never sees the chunks,
@@ -57,7 +57,7 @@ class RequirementAssessment(BaseModel):
     evidence: List[CitedEvidence] = Field(default_factory=list)
     missing_information: str = Field(
         default="",
-        description="For NOT MET or UNCLEAR, the specific language or provision that would settle it",
+        description="For NOT MET or Unsure, the specific language or provision that would settle it",
     )
     confidence: float = Field(ge=0.0, le=1.0, description="How likely this status is correct, 0.0 to 1.0")
 
@@ -98,6 +98,10 @@ class EvidenceRecord(BaseModel):
     printed_page: Optional[str] = ""
     retrieval_confidence: Optional[float] = None
     verified: bool = False
+    # "contract" or "common" (42 CFR Part 438 / CMS State Guide). check_citations
+    # already refuses a "common" quote as MET evidence, so this is audit-trail
+    # visibility for the sidecar rather than something downstream branches on.
+    source: str = "contract"
 
 
 class RequirementReview(BaseModel):
@@ -107,7 +111,7 @@ class RequirementReview(BaseModel):
     legal_cite: str = ""
     row: Optional[int] = None
 
-    status: Status = "UNCLEAR"
+    status: Status = "Unsure"
     argument: str = ""
     counter_argument: str = ""
     follow_up: str = ""
@@ -123,6 +127,13 @@ class RequirementReview(BaseModel):
     chunks_retrieved: int = 0
     model: str = ""
     error: str = ""
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _legacy_status(cls, value):
+        # Sidecars written before the rename say "UNCLEAR". A line that will not
+        # load is a review quietly done twice, or dropped under --render-only.
+        return "Unsure" if value == "UNCLEAR" else value
 
     def in_reviewer_terms(self, text):
         """The model's prose with its chunk ids swapped for the pages they came from."""

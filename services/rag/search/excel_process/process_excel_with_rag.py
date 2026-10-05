@@ -39,10 +39,10 @@ DEFAULT_STATUS_OPTIONS = ["Met", "Unsure", "Not met", "N/A"]
 STATUS_WORDING = {
     "MET": ("met", "yes"),
     "NOT MET": ("not met", "no"),
-    "UNCLEAR": ("unsure", "unclear"),
+    "Unsure": ("unsure", "unclear"),
 }
 
-STANDARD_WORDING = {"MET": "Met", "NOT MET": "Not met", "UNCLEAR": "Unsure"}
+STANDARD_WORDING = {"MET": "Met", "NOT MET": "Not met", "Unsure": "Unsure"}
 
 CONFIDENCE_BANDS = ((0.80, "Strong evidence"), (0.60, "Moderate evidence"))
 LOWEST_BAND = "Limited evidence"
@@ -455,7 +455,7 @@ def summarise(name, reviews):
     unverified = sum(1 for review in reviews if review.evidence and not review.quotes_verified)
 
     print(f"\n{name}: {len(reviews)} reviewed at {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
-    for status in ("MET", "NOT MET", "UNCLEAR"):
+    for status in ("MET", "NOT MET", "Unsure"):
         if counts.get(status):
             print(f"  {status:<8} {counts[status]}")
     if unverified:

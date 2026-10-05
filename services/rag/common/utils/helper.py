@@ -74,6 +74,11 @@ class Helper:
         return Helper.validate_embeddings_table_name(name.strip())
 
     @staticmethod
+    def get_common_embeddings_table_name(config_file='aws.properties.ini'):
+        config = Helper.load_config(config_file)
+        return contract_cfg.common_embeddings_table_name(config)
+
+    @staticmethod
     def get_property(str_property_name, config_file='aws.properties.ini', default=_RAISE_IF_MISSING):
         env_value = Helper.get_env_property(str_property_name)
         if env_value:

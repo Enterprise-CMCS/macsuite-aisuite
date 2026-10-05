@@ -302,7 +302,7 @@ which would delete the sidecar it renders from.
 
 Two things to know about the output. Status is left blank when the verdict has no
 matching dropdown option — `A. Completeness` offers Yes/No and has nowhere to put
-an UNCLEAR — and the reason goes in General Comments. And openpyxl warns that it
+an Unsure — and the reason goes in General Comments. And openpyxl warns that it
 is dropping the workbook's conditional-formatting extension: macros, dropdowns
 and layout survive the round trip, the colour-scale rules on the Summary sheet do
 not.

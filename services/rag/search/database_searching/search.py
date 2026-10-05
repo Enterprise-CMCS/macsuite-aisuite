@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import numpy as np
@@ -11,6 +12,13 @@ RRF_K = 60
 
 
 MIN_EF_SEARCH = 64
+
+# Offsets a source table's row ids apart from every other source's in a
+# federated search, so two tables' unrelated rows sharing a serial id (both
+# tables start counting from 1) don't collide as the same dict key in
+# agents.record_chunks(). The id is never sent back to Postgres, so a
+# synthetic value is fine.
+_FEDERATED_ID_OFFSET = 1_000_000_000
 
 
 def _parse_metadata(metadata):
@@ -150,3 +158,65 @@ class SearchEngine:
 
         log.debug(f"reranked_search() reranked {len(candidates)} candidates down to {len(reranked)}")
         return reranked
+
+
+class FederatedSearchEngine:
+    """Fans hybrid_search out across several embeddings tables and merges the results.
+
+    Used to consult the shared regulatory knowledge base (42 CFR Part 438, the CMS
+    State Guide) alongside whichever contract is active, since each contract's
+    table only ever holds that contract's own document. Only hybrid_search is
+    federated - it's the only method agents.retrieve() calls.
+
+    The primary (first) source keeps its full `limit` - exactly what a plain
+    SearchEngine would have returned - and every other source adds at most
+    `reference_limit` rows on top. Merging into one shared `limit` instead would
+    have had the reference table's passages crowd the contract's own out, since
+    both tables' rank-based fused_scores land on the same scale; a requirement
+    whose wording tracks the regulation closely could come back with most of its
+    slots spent on the regulation and too little contract text to decide on.
+
+    Every merged row is tagged with the label its source table was given, so a
+    caller (agents.format_evidence, agents.check_citations) can tell a passage
+    of federal regulation or CMS guidance apart from the contract itself - the
+    two must never be treated as the same kind of evidence.
+
+    The first source is the primary one and its failure is raised, the same as a
+    plain SearchEngine. Any other source failing - most likely its table not
+    existing yet in an environment bootstrap hasn't been re-run in - is logged and
+    skipped, so a missing reference table degrades search to contract-only rather
+    than failing every review.
+    """
+
+    def __init__(self, sources, reference_limit=4):
+        """sources: an iterable of (table_name, label) pairs, primary first.
+        reference_limit: the most rows each non-primary source adds per search."""
+        self.sources = [(SearchEngine(table_name=name), label) for name, label in sources]
+        self.reference_limit = reference_limit
+
+    async def hybrid_search(self, query_text, limit=12, dense_limit=60, lexical_limit=60):
+        per_table = await asyncio.gather(*(
+            engine.hybrid_search(query_text, limit=limit if offset == 0 else self.reference_limit,
+                                 dense_limit=dense_limit, lexical_limit=lexical_limit)
+            for offset, (engine, _label) in enumerate(self.sources)
+        ), return_exceptions=True)
+
+        merged = []
+        for offset, ((engine, label), rows) in enumerate(zip(self.sources, per_table)):
+            if isinstance(rows, BaseException):
+                if offset == 0 or not isinstance(rows, Exception):
+                    raise rows
+                Helper.print_exception("FederatedSearchEngine.hybrid_search", rows,
+                                       f"Search of '{label}' table {engine.table_name} failed, "
+                                       "continuing without it.")
+                continue
+            for row in rows:
+                if row.get("id") is not None:
+                    row["id"] += offset * _FEDERATED_ID_OFFSET
+                row["source"] = label
+                merged.append(row)
+
+        # Not trimmed back to `limit` - see the class docstring. The order only
+        # matters within a source, since agents.format_evidence groups by source.
+        merged.sort(key=lambda row: row.get("fused_score") or 0, reverse=True)
+        return merged

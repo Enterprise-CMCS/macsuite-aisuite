@@ -10,6 +10,7 @@ if str(_RAG_ROOT) not in sys.path:
     sys.path.insert(0, str(_RAG_ROOT))
 
 from common.utils.contract_config import (  # noqa: E402
+    common_embeddings_table_name,
     get_config_property,
     list_embeddings_table_names_from_config,
     load_config,
@@ -111,6 +112,52 @@ class ActiveContractResolutionTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             get_config_property(load_config(path), "input_prefix")
         self.assertIn("Multiple active", str(ctx.exception))
+
+    def test_common_embeddings_table_name_present(self):
+        path = self._write_ini(
+            """
+            [default]
+            input_prefix =
+
+            [contract:tn_6756]
+            active = true
+            input_prefix = state_of_TN/MCCRS-TN-6756-TennCare/
+            embeddings_table_name = embeddings_tn_6756_tenncare
+
+            [contract:common_cms_regs]
+            active = false
+            input_prefix = common/cms-mcc-regulatory/
+            embeddings_table_name = embeddings_common_cms_regs
+            """
+        )
+        config = load_config(path)
+        self.assertEqual(
+            common_embeddings_table_name(config),
+            "embeddings_common_cms_regs",
+        )
+
+    def test_common_embeddings_table_name_absent(self):
+        path = self._write_ini(
+            """
+            [default]
+            input_prefix =
+
+            [contract:tn_6756]
+            active = true
+            input_prefix = state_of_TN/MCCRS-TN-6756-TennCare/
+            embeddings_table_name = embeddings_tn_6756_tenncare
+            """
+        )
+        config = load_config(path)
+        self.assertIsNone(common_embeddings_table_name(config))
+
+    def test_shipped_dev_ini_has_common_cms_regs_section(self):
+        shipped = _RAG_ROOT / "common" / "utils" / "aws.properties.ini"
+        config = load_config(str(shipped))
+        self.assertEqual(
+            common_embeddings_table_name(config),
+            "embeddings_common_cms_regs",
+        )
 
     def test_no_contract_sections_uses_default(self):
         path = self._write_ini(
