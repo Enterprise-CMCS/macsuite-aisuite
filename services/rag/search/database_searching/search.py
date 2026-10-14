@@ -60,7 +60,8 @@ class SearchEngine:
                     id,
                     text,
                     metadata,
-                    embedding <=> $1::vector AS distance
+                    embedding <=> $1::vector AS distance,
+                    1-(embedding <=> $1::vector) AS retrieval_confidence
                 FROM {self.table_name}
                 ORDER BY embedding <=> $1::vector
                 LIMIT $2
