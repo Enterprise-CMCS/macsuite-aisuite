@@ -15,7 +15,6 @@ async def register_vector_init(conn):
         pass
     await conn.execute(SEARCH_PATH_SQL)
 
-
 async def initialization_db():
     global postgres_pool
     async with _pool_lock:
@@ -28,6 +27,9 @@ async def initialization_db():
                 port=DB_PORT,
                 min_size=1,
                 max_size=5,
+                # Replace connections idle > 60 s, before a VPN/NAT/server timeout
+                # silently closes them ("connection was closed in the middle of operation").
+                max_inactive_connection_lifetime=60,
                 init=register_vector_init,
                 ssl="require",
             )
@@ -56,6 +58,11 @@ async def release_connection(connection):
         raise RuntimeError("Database pool is not initialized")
     await postgres_pool.release(connection)
 
+async def expire_idle_connections():
+    """Discard every pooled connection so the next acquire opens a new one.
+    Called after a dropped connection: its idle siblings are often dead too."""
+    if postgres_pool is not None:
+        await postgres_pool.expire_connections()
 
 async def close_db():
     global postgres_pool
@@ -64,3 +71,71 @@ async def close_db():
             await postgres_pool.close()
             postgres_pool = None
             print("Database connection pool closed.")
+
+
+# import asyncio
+# import asyncpg
+# from pgvector.asyncpg import register_vector
+# from common.utils.settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+# from data_embeddings_storage.database.embeddings_schema import SEARCH_PATH_SQL
+
+# postgres_pool = None
+# _pool_lock = asyncio.Lock()
+
+
+# async def register_vector_init(conn):
+#     try:
+#         await register_vector(conn)
+#     except Exception:
+#         pass
+#     await conn.execute(SEARCH_PATH_SQL)
+
+
+# async def initialization_db():
+#     global postgres_pool
+#     async with _pool_lock:
+#         if postgres_pool is None:
+#             postgres_pool = await asyncpg.create_pool(
+#                 user=DB_USER,
+#                 password=DB_PASSWORD,
+#                 database=DB_NAME,
+#                 host=DB_HOST,
+#                 port=DB_PORT,
+#                 min_size=1,
+#                 max_size=5,
+#                 init=register_vector_init,
+#                 ssl="require",
+#             )
+#             print("Database connection pool initialized.")
+
+#     return postgres_pool
+
+
+# async def register_vector_types(conn):
+#     await register_vector(conn)
+#     await conn.execute(SEARCH_PATH_SQL)
+
+
+# async def get_connection():
+#     global postgres_pool
+#     if postgres_pool is None:
+#         await initialization_db()
+#     if postgres_pool is None:
+#         raise RuntimeError("Failed to initialize database pool")
+#     return await postgres_pool.acquire()
+
+
+# async def release_connection(connection):
+#     global postgres_pool
+#     if postgres_pool is None:
+#         raise RuntimeError("Database pool is not initialized")
+#     await postgres_pool.release(connection)
+
+
+# async def close_db():
+#     global postgres_pool
+#     async with _pool_lock:
+#         if postgres_pool is not None:
+#             await postgres_pool.close()
+#             postgres_pool = None
+#             print("Database connection pool closed.")

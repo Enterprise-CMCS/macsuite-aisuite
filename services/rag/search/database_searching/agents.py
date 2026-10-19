@@ -1,3 +1,4 @@
+import ast
 import json
 import re
  
@@ -16,7 +17,6 @@ from search.database_searching.model_provider import (bedrock_hooks,bedrock_mode
 from search.database_searching.review_models import (EvidenceRecord,RequirementReview,page_number,)
 from search.database_searching.search import SearchEngine
 from difflib import SequenceMatcher
- 
 
 
 # ==================================CONFIGURATION============================
@@ -34,7 +34,6 @@ MAX_REFERENCE_CHARS = 6000
 # Numeric retrieval confidence is passed to Stage 2 as an input and kept as a
 # MET guardrail (>= 0.40), but is never shown in Status itself.
 DECISION_CONFIDENCE_LABELS = {"HIGH", "MEDIUM", "LOW"}
-
 
 
 # =====================STAGE 1 PROMPT: EVIDENCE ANALYSIS ONLY===================
@@ -417,7 +416,10 @@ def build_deps(table_name=None):
 
     if not common_table:
         log.info("build_deps() no shared regulatory table configured; Stage 2 runs without RegulatoryReference.")
-
+    
+    if common_table:
+        log.info(f"build_deps() regulatory reference table = '{common_table}' "
+                 f"(contract table = '{table_name or Helper.get_embeddings_table_name()}')")
     return ContractDeps(
         search_engine=SearchEngine(table_name=table_name),
         reference_engine=SearchEngine(table_name=common_table) if common_table else None,)
@@ -440,6 +442,8 @@ async def retrieve_reference(deps, requirement, item="", legal_cite=""):
         return []
 
     query = " ".join(part for part in (item, legal_cite, requirement) if part)
+    log.info(f"retrieve_reference() item '{item}' searching table "
+             f"'{deps.reference_engine.table_name}' with query: {query[:200]}")
     try:
         results = await deps.reference_engine.hybrid_search(query, limit=MAX_REFERENCE_CHUNKS)
     except Exception as lclEx:
@@ -457,6 +461,11 @@ async def retrieve_reference(deps, requirement, item="", legal_cite=""):
             "source": metadata.get("doc_id", ""),
             "page": page_number(metadata.get("page"), metadata.get("printed_page", "")),
             "text": text,})
+        
+        log.info(f"  ref #{len(references)}: source={metadata.get('doc_id', '')} "
+                 f"page={metadata.get('page')} "
+                 f"confidence={result.get('retrieval_confidence')} "
+                 f"fused={result.get('fused_score')} | {text[:150]!r}")
         used += len(text)
 
     log.debug(f"retrieve_reference() item '{item}' returned {len(references)} reference passage(s)")
@@ -465,8 +474,6 @@ async def retrieve_reference(deps, requirement, item="", legal_cite=""):
 def record_chunks(deps, results):
     kept = []
     for result in results:
-        print('result_keys:', result.keys())
-        print('result:', result)
         chunk_id = result.get("id")
         if chunk_id is None:
             continue
@@ -494,7 +501,6 @@ def get_metadata(chunk):
         except (json.JSONDecodeError, TypeError):
             return {}
     return metadata if isinstance(metadata, dict) else {}
-
 
 def chunk_provenance(chunk):
     metadata = get_metadata(chunk)
@@ -538,14 +544,28 @@ def extract_json_object(output):
     
     # strict=False: verbatim contract quotes often contain raw newlines/tabs,
     # which strict JSON rejects ("Invalid control character").
-    parsed = json.loads(text[start:end + 1], strict=False)
+    candidate = text[start:end + 1]
+    try:
+        parsed = json.loads(candidate, strict=False)
+    except json.JSONDecodeError as json_err:
+        # Fallback: the model sometimes writes Python-style 'single-quoted' strings.
+        try:
+            parsed = ast.literal_eval(candidate)
+        except (ValueError, SyntaxError):
+            raise json_err
     if isinstance(parsed, str):  # JSON-encoded string wrapping another object
         parsed = json.loads(parsed, strict=False)
     if not isinstance(parsed, dict):
         raise TypeError(f"Expected JSON object/dict, got {type(parsed).__name__}")
     return parsed
- 
- 
+
+# Added to a re-ask when the model's JSON could not be parsed. Unescaped double
+# quotes (from quoted contract text) and stray backslashes are the usual cause.
+
+JSON_RETRY_NOTE = ("\n\nYour previous response was not valid JSON. Return EXACTLY one valid JSON "
+    "object and nothing else. Every key and every string value must be wrapped in double quotes. "
+    "If the TEXT inside a value contains a double quotation mark, replace that mark with a "
+    "single quote. Do not use backslashes.")
 RESULT_TAG = re.compile(r"\[result\s+\d+\]\s*",re.IGNORECASE,)
 
 def strip_result_tags(text):
@@ -578,11 +598,9 @@ def confidence_band(score):
         return "Medium Confidence"
     return "Low Confidence"
  
- 
 def confidence_label(score):
     """Backward-compatible display helper."""
     return confidence_band(score)
- 
  
 def calculate_retrieval_confidence(evidence):
     """
@@ -597,7 +615,6 @@ def calculate_retrieval_confidence(evidence):
         for record in evidence
         if (record.verified and record.retrieval_confidence is not None)]
     return max(scores) if scores else None
-
 
 def recommendation_display(review):
     """
@@ -722,7 +739,7 @@ decision_agent = Agent(bedrock_model(), system_prompt=DECISION_SYSTEM_PROMPT,
     model_settings={
         "temperature": 0.0,
         "top_p": 1.0,
-        "max_tokens": 8000,
+        "max_tokens": 16000,
         "bedrock_additional_model_requests_fields": {
             "reasoningConfig": {"type": "enabled", "maxReasoningEffort": DECISION_REASONING_EFFORT},
         },
@@ -858,10 +875,11 @@ async def review_requirement(
                     '"Evidence":[{"chunk_id":123,"quote":"..."}],'
                     '"MissingInformation":"..."}\n'
                     "No markdown fences or text outside the JSON."
+                    f"{JSON_RETRY_NOTE}"
                 ),
                 deps=deps,
                 usage=run_usage,
-                usage_limits=UsageLimits(request_limit=5),
+                usage_limits=UsageLimits(request_limit=run_usage.requests + 5),
             )
         
             stage1 = extract_json_object(retry_result.output)
@@ -903,30 +921,30 @@ async def review_requirement(
             legal_cite=legal_cite,
             reference=reference,)
  
-        # Stage 2: final MET/UNSURE decision
-        stage2_result = await decision_agent.run(
-            ("Make the final contract review decision using the following validated Stage-1 analysis.\n\n"
-            f"{json.dumps(decision_input, indent=2)}"), usage=run_usage, usage_limits=UsageLimits(request_limit=5),)
- 
+        # Stage 2: final MET/UNSURE decision (asked again once if its JSON is malformed)
+        stage2_prompt = ("Make the final contract review decision using the following validated Stage-1 analysis.\n\n"
+            f"{json.dumps(decision_input, indent=2)}")
+        for attempt in (1, 2):
+            stage2_result = await decision_agent.run(stage2_prompt, usage=run_usage,
+                usage_limits=UsageLimits(request_limit=run_usage.requests + 5),)
+            try:
+                stage2 = extract_json_object(stage2_result.output)
+                break
+            except (json.JSONDecodeError, ValueError, TypeError,) as parse_err:
+                log.warning(f"review_requirement() {sheet} item {item}: "
+                    f"Stage 2 output was not valid JSON (attempt {attempt} of 2): {parse_err}")
+                if attempt == 2:
+                    review.status = "UNSURE"
+                    review.decision_confidence = "Low"
+                    review.error = (f"Stage 2 JSON error: {parse_err}")
+                    return review
+                stage2_prompt += JSON_RETRY_NOTE
+
         # Confirm extended thinking actually ran (look for this line in the log).
         thought = any(isinstance(part, ThinkingPart)
                       for message in stage2_result.all_messages()
                       for part in getattr(message, "parts", []))
         log.info(f"review_requirement() {sheet} item {item}: Stage 2 extended thinking used = {thought}")
-
-        # Parse Stage 2
-        try:
-            stage2 = extract_json_object(stage2_result.output)
-            if not isinstance(stage2, dict):
-                raise TypeError(f"Stage 2 expected dict, got {type(stage2).__name__}")
-            
-        except (json.JSONDecodeError,ValueError,TypeError,) as parse_err:
-            log.warning(f"review_requirement() " f"{sheet} item {item}: "
-                "Stage 2 output was not valid JSON: " f"{parse_err}")
-            review.status = "UNSURE"
-            review.decision_confidence = "Low"
-            review.error = (f"Stage 2 JSON error: {parse_err}")
-            return review
 
         # Final Recommendation
         status = str(stage2.get("Recommendation", "UNSURE")).strip().upper()
