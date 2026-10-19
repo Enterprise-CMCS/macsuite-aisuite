@@ -172,19 +172,16 @@ class ActiveContractResolutionTests(unittest.TestCase):
         self.assertEqual(get_config_property(config, "embeddings_table_name"), "embeddings")
         self.assertIsNone(resolve_active_contract_section(config))
 
-    def test_shipped_dev_ini_defaults_to_tn_6756(self):
+    def test_shipped_dev_ini_defaults_to_ne_102897(self):
         shipped = _RAG_ROOT / "common" / "utils" / "aws.properties.ini"
         config = load_config(str(shipped))
-        self.assertEqual(
-            get_config_property(config, "input_prefix"),
-            "state_of_TN/MCCRS-TN-6756-TennCare/",
-        )
+        self.assertEqual(get_config_property(config, "input_prefix"), "NE/")
         self.assertEqual(
             get_config_property(config, "embeddings_table_name"),
-            "embeddings_tn_6756_tenncare",
+            "embeddings_ne_1",
         )
-        self.assertEqual(len(list_embeddings_table_names_from_config(config)), 5)
-        self.assertEqual(resolve_active_contract_section(config), "contract:tn_6756")
+        self.assertEqual(len(list_embeddings_table_names_from_config(config)), 8)
+        self.assertEqual(resolve_active_contract_section(config), "contract:ne_102897")
 
     def test_absolute_config_path_passthrough(self):
         path = self._write_ini(
