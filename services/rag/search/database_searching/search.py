@@ -10,6 +10,13 @@ from common.utils.logger import log
 
 RRF_K = 60
 
+# How hybrid_search's fused score splits between the vector arm and the
+# full-text arm. Each arm's reciprocal rank is scaled by its weight before the
+# two are summed, so a chunk only the full-text arm found can still make the
+# cut, but on rank alone it no longer outweighs a close semantic match.
+SEMANTIC_WEIGHT = 0.8
+FULLTEXT_WEIGHT = 0.2
+
 
 MIN_EF_SEARCH = 64
 
@@ -133,15 +140,34 @@ class SearchEngine:
                         l.lexical_rank,
                         d.position AS dense_position,
                         l.position AS lexical_position,
-                        (COALESCE(1.0 / ($5 + d.position), 0)
-                            + COALESCE(1.0 / ($5 + l.position), 0))::float8 AS fused_score
+                        ($7 * COALESCE(1.0 / ($5 + d.position), 0)
+                            + $8 * COALESCE(1.0 / ($5 + l.position), 0))::float8 AS fused_score
                     FROM dense d
                     FULL OUTER JOIN lexical l ON d.id = l.id
                     ORDER BY fused_score DESC
                     LIMIT $6
-                """, embedding_flattened, query_text, dense_limit, lexical_limit, RRF_K, limit)
+                """, embedding_flattened, query_text, dense_limit, lexical_limit, RRF_K, limit,
+                    SEMANTIC_WEIGHT, FULLTEXT_WEIGHT)
 
             return [dict(row, metadata=_parse_metadata(row["metadata"])) for row in results] if results else []
+        finally:
+            await release_connection(connection)
+
+    async def rows_by_id(self, ids):
+        """The rows with these ids, for reading the passages beside a hit. They
+        were not retrieved for the query, so they carry no distance or retrieval
+        confidence and never lend a review its confidence."""
+        if not ids:
+            return []
+        connection = await get_connection()
+        try:
+            results = await connection.fetch(f"""
+                SELECT id, text, metadata
+                FROM {self.table_name}
+                WHERE id = ANY($1::int[])
+            """, list(ids))
+            return [dict(row, metadata=_parse_metadata(row["metadata"]), distance=None,
+                         retrieval_confidence=None) for row in results]
         finally:
             await release_connection(connection)
 
@@ -220,3 +246,13 @@ class FederatedSearchEngine:
         # matters within a source, since agents.format_evidence groups by source.
         merged.sort(key=lambda row: row.get("fused_score") or 0, reverse=True)
         return merged
+
+    async def rows_by_id(self, ids):
+        """Rows from the primary (contract) table only. Its ids carry no offset,
+        so any id at or past the first offset belongs to a reference table and is
+        dropped - the regulation is not read for context around a hit."""
+        engine, label = self.sources[0]
+        rows = await engine.rows_by_id([row_id for row_id in ids if row_id < _FEDERATED_ID_OFFSET])
+        for row in rows:
+            row["source"] = label
+        return rows

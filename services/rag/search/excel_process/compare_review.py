@@ -24,7 +24,7 @@ from search.excel_process.process_excel_with_rag import (
 
 DESCRIPTION = "Compare AI-reviewed CRT workbooks against their originals, tab by tab."
 
-BUCKETS = ("Met", "Not Met", "Unsure", "Blank", "Unrecognized")
+BUCKETS = ("Met", "Not Met", "Unsure", "N/A", "Blank", "Unrecognized")
 
 REPORT_NAME = "comparison_report.xlsx"
 

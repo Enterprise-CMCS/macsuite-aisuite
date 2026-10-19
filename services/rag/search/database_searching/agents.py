@@ -1,7 +1,5 @@
 import math
-import re
 from dataclasses import dataclass, field, replace
-from difflib import SequenceMatcher
 from typing import Dict
 
 from pydantic_ai import Agent, ModelRetry, RunContext, ToolDefinition, ToolFailed
@@ -19,16 +17,23 @@ from search.database_searching.model_provider import (
     model_id,
 )
 from search.database_searching.review_agents import (
+    JUDGMENT_RULES,
+    STATUS_DEFINITIONS,
     adjudication_prompt,
     adjudicator_agent,
     challenge_prompt,
     challenger_agent,
+    requirement_block,
 )
 from search.database_searching.review_models import (
     EvidenceRecord,
     RequirementAssessment,
     RequirementReview,
+    best_quoted,
+    merge_evidence,
+    neighbour_ids,
     page_label,
+    with_neighbours,
 )
 from search.database_searching.search import FederatedSearchEngine, SearchEngine
 
@@ -41,6 +46,13 @@ REFERENCE_TOP_K = 4
 
 MAX_SEARCHES = 3
 
+# The top contract hits per search that get the passage either side of them
+# added (see add_neighbours) - up to 2 * NEIGHBOUR_HITS * NEIGHBOUR_SPAN extra
+# passages, so the context grows by a bounded amount rather than doubling.
+NEIGHBOUR_HITS = 4
+
+NEIGHBOUR_SPAN = 1
+
 # How many times check_citations will bounce a REFERENCE MATERIAL citation back
 # to the model before resolving it programmatically. Uncapped, a regulation-heavy
 # requirement (one whose wording tracks a specific CFR cite closely) can spend the
@@ -50,10 +62,6 @@ MAX_SEARCHES = 3
 MAX_CITATION_RETRIES = 2
 
 MAX_CHUNK_CHARS = 1800
-
-QUOTE_MATCH_RATIO = 0.85
-
-QUOTE_MATCH_MIN_RUN = 8
 
 ANALYST_PROMPT = """You are a CMS reviewer checking whether a state's Medicaid managed care contract \
 satisfies one specific requirement from the Contract Review Tool.
@@ -69,21 +77,17 @@ evidence the requirement is met - if the contract section has nothing on point, 
 Unsure regardless of how clearly the regulation states the rule.
 
 Method:
-1. Read the retrieved contract text you were given against the exact wording of the requirement.
-2. If they do not cover the requirement, call search_contract with the language the contract itself \
+1. Read the retrieved contract text against what the requirement demands, and against the federal rule \
+cited with it when one is given.
+2. If it does not cover the requirement, call search_contract with the language the contract itself \
 would use - the defined term, the statutory cite, the section name - rather than repeating the \
 requirement verbatim. A requirement about "provider directory update frequency" is more likely to be \
-found by searching "provider directory shall be updated" than by searching the requirement text.
+found by searching "provider directory shall be updated" than by searching the requirement text. A \
+requirement about what a document must contain is often met by a list, so search for the list's \
+lead-in ("the member handbook must include") as well as for the item.
 3. Commit to a status and quote the wording that decides it.
 
-Status definitions:
-- MET: the retrieved text explicitly establishes what the requirement demands, at the strength it \
-demands. A requirement that the contract "must require" something is not met by text that permits it.
-- NOT MET: the retrieved text covers this subject and shows the requirement is not satisfied, or \
-contradicts it.
-- Unsure: the retrieved text does not settle it either way. This includes retrieval coming back with \
-nothing relevant. Unsure is the honest answer far more often than reviewers like, and it is much less \
-damaging than a wrong MET.
+""" + STATUS_DEFINITIONS + """
 
 Rules:
 - Every quote must be copied verbatim from the retrieved text. Do not stitch wording from two passages \
@@ -94,6 +98,7 @@ into one quote. The quote is how the passage is identified, so copy it exactly.
 contract by the page or section name shown above each passage.
 - For NOT MET and Unsure, missing_information names the specific provision or language that would \
 settle the question.
+""" + JUDGMENT_RULES + """
 - confidence is calibrated: 0.9+ means the quoted text is unambiguous, around 0.5 means it is arguable, \
 below 0.3 means you are reviewing on evidence too thin to rely on."""
 
@@ -145,9 +150,38 @@ def build_deps(table_name=None):
 
 
 async def retrieve(deps, query):
-    return await deps.search_engine.hybrid_search(
+    results = await deps.search_engine.hybrid_search(
         query, limit=deps.top_k,
         dense_limit=deps.candidate_limit, lexical_limit=deps.candidate_limit)
+    return await add_neighbours(deps, results)
+
+
+async def add_neighbours(deps, results):
+    """results with the passages either side of the top contract hits.
+
+    Reviewers found provisions the review missed sitting right beside text it
+    had retrieved - a handbook item whose "must include" lead-in was in the
+    chunk before, an obligation finished in the chunk after. Only the contract
+    is expanded; the reference material is guidance, not text to read around.
+    A failed lookup costs the context, not the review."""
+    expand = [result["id"] for result in results
+              if result.get("id") is not None and chunk_provenance(result)["source"] != "common"]
+    expand = expand[:NEIGHBOUR_HITS]
+    wanted = [row_id for row_id in neighbour_ids(expand, NEIGHBOUR_SPAN)
+              if row_id not in {result.get("id") for result in results}]
+    if not wanted:
+        return results
+
+    try:
+        rows = await deps.search_engine.rows_by_id(wanted)
+    except Exception as lclEx:
+        Helper.print_exception("agents.add_neighbours", lclEx,
+                               "Neighbouring passage lookup failed, continuing with the hits alone.")
+        return results
+
+    expanded = with_neighbours(results, rows, expand, NEIGHBOUR_SPAN)
+    log.debug(f"add_neighbours() added {len(expanded) - len(results)} passages beside {len(expand)} hits")
+    return expanded
 
 
 def record_chunks(deps, results):
@@ -225,33 +259,6 @@ def format_evidence(chunks):
     return "\n\n".join(sections)
 
 
-def _normalize(text):
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())).strip()
-
-
-def _match_ratio(needle, haystack):
-    blocks = SequenceMatcher(None, needle, haystack, autojunk=False).get_matching_blocks()
-    matched = sum(block.size for block in blocks if block.size >= QUOTE_MATCH_MIN_RUN)
-    return matched / len(needle) if needle else 0.0
-
-
-def quote_supported(quote, chunk_text):
-    haystack = _normalize(chunk_text)
-    if not haystack:
-        return False
-
-    fragments = [part for part in re.split(r"\.{3}|…", quote or "") if len(_normalize(part)) >= 20]
-    for fragment in fragments or [quote]:
-        needle = _normalize(fragment)
-        if not needle:
-            return False
-        if needle in haystack:
-            continue
-        if _match_ratio(needle, haystack) < QUOTE_MATCH_RATIO:
-            return False
-    return True
-
-
 def quoted_chunk(deps, quote):
     """The retrieved chunk this quote was copied from, or None if it was not.
 
@@ -261,13 +268,13 @@ def quoted_chunk(deps, quote):
 
     Contract chunks are searched first. State contracts often copy 42 CFR 438
     word for word, and a quote the contract itself carries must be credited to
-    the contract, not to whichever copy happened to be retrieved first.
+    the contract, not to whichever copy happened to be retrieved first. Within
+    each, the closest match wins, not the first one over the threshold.
     """
-    chunks = sorted(deps.chunks.values(), key=lambda chunk: chunk_provenance(chunk)["source"] == "common")
-    for chunk in chunks:
-        if quote_supported(quote, chunk.get("text")):
-            return chunk
-    return None
+    chunks = list(deps.chunks.values())
+    contract = [chunk for chunk in chunks if chunk_provenance(chunk)["source"] != "common"]
+    reference = [chunk for chunk in chunks if chunk_provenance(chunk)["source"] == "common"]
+    return best_quoted(quote, contract) or best_quoted(quote, reference)
 
 
 def evidence_records(deps, cited):
@@ -385,8 +392,9 @@ def check_citations(context: RunContext[ContractDeps], assessment: RequirementAs
     # A quote that cannot be found in the retrieved text is not retried, it is
     # recorded unverified, so the reviewer sees the row was flagged rather than
     # losing the review to a failed retry.
-    if assessment.status == "MET" and not assessment.evidence:
-        raise ModelRetry("MET needs at least one quote from the retrieved text. Quote it or return Unsure.")
+    if assessment.status in ("MET", "N/A") and not assessment.evidence:
+        raise ModelRetry(f"{assessment.status} needs at least one quote from the retrieved contract text. "
+                         "Quote it or return Unsure.")
 
     # A quote that only matches a chunk from the REFERENCE MATERIAL section is
     # regulation or CMS guidance, not the contract.
@@ -408,9 +416,13 @@ def check_citations(context: RunContext[ContractDeps], assessment: RequirementAs
     # another retry risks spending the rest of the shared request budget and
     # losing the review to UsageLimitExceeded instead of landing on an answer.
     kept = [item for item in assessment.evidence if item not in reference_only]
+    if kept:
+        # Contract quotes still carry the status - the note below would land in
+        # Follow-up Required on a MET row, telling the reviewer the opposite.
+        return assessment.model_copy(update={"evidence": kept})
     return assessment.model_copy(update={
         "evidence": kept,
-        "status": assessment.status if kept else "Unsure",
+        "status": "Unsure",
         "missing_information": assessment.missing_information or (
             "Retrieval surfaced only the federal regulation / CMS guidance on this point, not "
             "corresponding language in the contract itself."
@@ -418,7 +430,7 @@ def check_citations(context: RunContext[ContractDeps], assessment: RequirementAs
     })
 
 
-async def review_requirement(requirement, deps=None, sheet="", item="", legal_cite="",
+async def review_requirement(requirement, deps=None, sheet="", item="", legal_cite="", tip="",
                              row=None, challenge=True, usage=None):
     review = RequirementReview(
         requirement=requirement, sheet=sheet, item=item, legal_cite=legal_cite,
@@ -432,12 +444,18 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
     run_usage = usage if usage is not None else RunUsage()
 
     try:
-        seed = await retrieve(deps, requirement)
-        record_chunks(deps, seed)
+        subject = requirement_block(requirement, legal_cite=legal_cite, tip=tip)
+
+        seed = record_chunks(deps, await retrieve(deps, requirement))
+        if legal_cite:
+            # Contracts cite the CFR section they implement, and the reference
+            # table is organised by it, so the cite finds passages the
+            # requirement's paraphrase misses.
+            seed += record_chunks(deps, await retrieve(deps, legal_cite))
         review.chunks_retrieved = len(deps.chunks)
 
         assessment = (await analyst_agent.run(
-            f"Requirement to review:\n{requirement}\n\n"
+            f"{subject}\n\n"
             f"Retrieved contract text:\n{format_evidence(seed)}\n\n"
             "Assess this requirement. Search again first if this text does not cover it.",
             deps=deps,
@@ -457,10 +475,10 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
             unverified = [record.quote for record in review.evidence if not record.verified]
 
             objection = (await challenger_agent.run(
-                challenge_prompt(requirement, pool, assessment), usage=run_usage)).output
+                challenge_prompt(subject, pool, assessment), usage=run_usage)).output
 
             verdict = (await adjudicator_agent.run(
-                adjudication_prompt(requirement, pool, assessment, objection, unverified),
+                adjudication_prompt(subject, pool, assessment, objection, unverified),
                 usage=run_usage)).output
 
             review.status = verdict.status
@@ -468,25 +486,36 @@ async def review_requirement(requirement, deps=None, sheet="", item="", legal_ci
             review.counter_argument = verdict.counter_argument
             review.follow_up = verdict.follow_up
             review.llm_confidence = verdict.confidence
+            # The adjudicator's quotes first - they decide the final status, so
+            # Where Found should lead with them.
+            review.evidence = merge_evidence(evidence_records(deps, verdict.evidence), review.evidence)
 
             if verdict.status != assessment.status:
                 log.info(f"review_requirement() {sheet} item {item}: the challenge changed the call from "
                          f"{assessment.status} to {verdict.status}")
 
             supported = any(record.verified and record.source != "common" for record in review.evidence)
-            if review.status == "MET" and not supported:
+            if review.status in ("MET", "N/A") and not supported:
                 # review.evidence is the analyst's quotes, which may be unverified
                 # (check_citations does not reject a quote it cannot find) - and
                 # the adjudicator's argument is free text, nothing in it checked
-                # against the retrieved chunks. A MET with no quote found in the
-                # contract's own text would otherwise land in the workbook with
-                # nothing a reviewer could check it against.
-                log.info(f"review_requirement() {sheet} item {item}: challenge called MET with no "
+                # against the retrieved chunks. A MET or N/A with no quote found
+                # in the contract's own text would otherwise land in the workbook
+                # with nothing a reviewer could check it against.
+                called = review.status
+                log.info(f"review_requirement() {sheet} item {item}: challenge called {called} with no "
                          "verified evidence behind it - downgraded to Unsure")
                 review.status = "Unsure"
+                # The adjudicator's argument was written for the status it
+                # called, and left as is it read "the contract explicitly
+                # requires" beside an Unsure - so say what happened first.
+                review.argument = (
+                    f"Left as Unsure: the review concluded {called}, but none of the contract wording "
+                    f"it relied on could be found in the retrieved text. Its reasoning was: "
+                    f"{review.argument}")
                 review.follow_up = review.follow_up or (
-                    "The reviewers called this MET, but not from a quote verified against the retrieved "
-                    "contract text - confirm this directly against the contract."
+                    f"The reviewers called this {called}, but not from a quote verified against the "
+                    "retrieved contract text - confirm this directly against the contract."
                 )
 
         cited = [record.retrieval_confidence for record in review.evidence

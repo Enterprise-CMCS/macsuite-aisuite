@@ -40,9 +40,10 @@ STATUS_WORDING = {
     "MET": ("met", "yes"),
     "NOT MET": ("not met", "no"),
     "Unsure": ("unsure", "unclear"),
+    "N/A": ("n/a", "na", "not applicable"),
 }
 
-STANDARD_WORDING = {"MET": "Met", "NOT MET": "Not met", "Unsure": "Unsure"}
+STANDARD_WORDING = {"MET": "Met", "NOT MET": "Not met", "Unsure": "Unsure", "N/A": "N/A"}
 
 CONFIDENCE_BANDS = ((0.80, "Strong evidence"), (0.60, "Moderate evidence"))
 LOWEST_BAND = "Limited evidence"
@@ -391,6 +392,7 @@ async def review_all(todo, sidecar, concurrency, challenge):
                 sheet=entry["sheet"],
                 item=entry["item"],
                 legal_cite=entry["legal_cite"],
+                tip=entry["tip"],
                 row=entry["row"],
                 challenge=challenge,
             )
@@ -455,7 +457,7 @@ def summarise(name, reviews):
     unverified = sum(1 for review in reviews if review.evidence and not review.quotes_verified)
 
     print(f"\n{name}: {len(reviews)} reviewed at {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
-    for status in ("MET", "NOT MET", "Unsure"):
+    for status in ("MET", "NOT MET", "Unsure", "N/A"):
         if counts.get(status):
             print(f"  {status:<8} {counts[status]}")
     if unverified:

@@ -62,7 +62,26 @@ Hybrid is what the agents call, for both contract review and the query API.
 Vector search alone misses exact contract vocabulary (statute cites, defined
 terms, “shall not”); full-text alone misses paraphrased requirements. RRF needs
 no score normalisation between the two, which matters because `ts_rank_cd` and
-cosine distance are not on comparable scales.
+cosine distance are not on comparable scales. The fusion is weighted 80%
+semantic / 20% full-text (`SEMANTIC_WEIGHT` / `FULLTEXT_WEIGHT` in
+`search/database_searching/search.py`): each arm's reciprocal rank is scaled by
+its weight before they are summed.
+
+Each search also brings in the passage either side of its top contract hits —
+`add_neighbours()` in `search/database_searching/agents.py`, `NEIGHBOUR_HITS`
+(4) hits, `NEIGHBOUR_SPAN` (1) passage each way. Reviewers found provisions the
+review missed sitting right beside text it had retrieved: a handbook item whose
+"the member handbook must include" lead-in was in the chunk before, an
+obligation finished in the chunk after. Chunks are inserted in document order,
+so the neighbours are fetched by SERIAL id (`rows_by_id()` in `search.py`), and
+`with_neighbours()` in `review_models.py` keeps only rows from the same document,
+the same element type and a page within one of the hit — tables and images are
+inserted after all the text, so an adjacent id is not always adjacent text. Each
+neighbour is placed beside its hit so the passage reads in order. Only the
+contract is expanded, never the reference table. Neighbours were not retrieved
+for the query, so they carry no retrieval confidence and never lend a row its
+score, but a quote taken from one is verified and cited like any other. A failed
+lookup is logged and the search returns the hits alone.
 
 Every row carries a **retrieval confidence**, which is the cosine similarity
 (`1 - distance` from pgvector’s `<=>`) clamped to 0–1. `hybrid_search` scores the
@@ -133,6 +152,23 @@ from `locations[].page_index` where it does not, because a couple of hundred
 elements only carry the latter and would otherwise land with no page — and a
 chunk with no page cannot be cited.
 
+`rag_process` splits each TEXT element with `split_with_context()` in
+`data_embeddings_storage/database/recursive_text_splitter.py`. The splitter
+breaks at the largest unit that fits 1024 characters — paragraph, line,
+sentence, clause, word — where it used to slice every 1024 characters mid-word.
+BDA returns one element per paragraph or list item, so an item such as
+"xxii. Information about the EPSDT program" was embedded with nothing to say it
+is something the member handbook must include. Each chunk is now written with
+the current section heading (`TITLE` / `SECTION_TITLE`, or a one-line markdown
+heading) on its first line and, for a list item, the sentence that opened the
+list (a paragraph ending in `:`) on the next. A long list split across chunks
+keeps its lead-in on every slice. The next paragraph that is not a list item
+closes the list, and context resets at each new document. Both are contract
+text, so they are embedded and searchable and a quote of them still verifies.
+Tables and images pass through unchanged. A chunk can run to roughly 1600
+characters with its context, inside `MAX_CHUNK_CHARS` (1800) in `agents.py`.
+Changing this needs only `rag_process` re-run, not BDA.
+
 ### Page numbers
 
 On a document with front matter, position in the file is not the number printed
@@ -162,6 +198,8 @@ Chunk metadata carries `doc_id`, the zero-based page index, and `printed_page`,
 and that is all a citation is built from. `page_label()` in
 `search/database_searching/review_models.py` renders the printed number as
 `page 85`, falling back to the index stepped forward by one where there is none.
+Where the printed number and the PDF position differ it carries both —
+`page xiv (PDF p. 14)` — because reviewers split between the two conventions.
 That is what the model sees in each chunk header and what lands in Where Found
 and in the quotes on the RAG Analysis sheet. `page_numbers()` on
 `RequirementReview` returns the same numbers bare, ordered by position in the
@@ -180,7 +218,13 @@ means nothing to a reviewer reading the spreadsheet. `format_evidence()` in
 document only, so the model has nothing else to cite by, and `quoted_chunk()`
 matches the quote it returns back to the passage it came from. That match is also
 what `verified` means: the wording really is in the contract rather than
-something the model composed. Reviews recorded before this change still carry
+something the model composed. Contracts repeat their own wording across
+sections, so a quote can clear the match threshold in more than one passage;
+`best_quoted()` in `review_models.py` credits it to the closest match rather than
+the first one retrieved, which sent reviewers to the wrong page when a
+near-duplicate came back ahead of the exact text. Contract passages are still
+preferred over the reference table, and an exact tie goes to the earlier passage.
+Reviews recorded before this change still carry
 ids in their prose, so `in_reviewer_terms()` swaps them for the pages they came
 from as the workbook is written.
 
