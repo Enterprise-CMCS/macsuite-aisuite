@@ -6,8 +6,8 @@ Application code for the CMCS Agentic RAG pipeline (Phase 2 packaging).
 
 ### Cloud layout
 
-Each environment deploys an internal ALB and ECS Fargate RAG API, on-demand ECS
-batch tasks (pre-processing, RAG process, DB bootstrap), and private RDS
+Each environment deploys an internal ALB and ECS Fargate RAG API, two
+S3-triggered ingest Lambdas (pre-processing and embeddings), and private RDS
 Postgres with pgvector. S3, Secrets Manager, ECR, and Bedrock sit outside the
 VPC but in the same account/region.
 
@@ -35,11 +35,12 @@ flowchart LR
   crt --> llm
 ```
 
-1. **Pre-processing** lists source docs under the active contract’s S3 prefix,
-   runs Bedrock Data Automation, and writes parsed text/table/image outputs to
-   the post-processing bucket.
-2. **RAG process** loads those outputs, chunks text, writes split JSON, embeds
-   with Bedrock, and stores vectors in the active contract’s embeddings table.
+1. **Pre-processing** runs once for each PDF/DOCX uploaded to the documents
+   bucket. It runs Bedrock Data Automation, parses the text/table/image
+   outputs, splits text into chunks, and writes one combined JSON per file to
+   `RAG_Output/` in the post-processing bucket.
+2. **RAG process** runs once for each `RAG_Output/` JSON. It embeds every item
+   with Bedrock and stores the vectors in that file’s `emb_<file>` table.
 3. **API** answers natural-language questions via search over that table and a
    Bedrock foundation model.
 4. **Contract review** runs the requirements in a CMS Contract Review Tool
@@ -197,17 +198,21 @@ VPN/bastion).
 | Mode | Local command | Cloud |
 |------|---------------|--------|
 | Query API | `python -m search.routes.endpoint` (or Docker image `CMD` → uvicorn) | Always-on ECS Fargate service on port `8001` |
-| Pre-process batch | `python -m data_preprocessing.pre_processing` | ECS on-demand task |
-| Embeddings batch | `python -m data_embeddings_storage.rag_process` | ECS on-demand task |
+| Pre-process (one file) | `python -m data_preprocessing.pre_processing <source-key>` | Lambda, one invocation per uploaded `.pdf` / `.docx` |
+| Embeddings (one file) | `python -m data_embeddings_storage.rag_process RAG_Output/<folders>/<file>.json` | Lambda, one invocation per `RAG_Output/` JSON |
 | Contract review | `python search/excel_process/process_excel_with_rag.py` | not deployed yet; run it on demand |
 | DB bootstrap | usually not local (needs master secret) | One-shot Fargate task: `python -m data_embeddings_storage.database.bootstrap` |
 
-Typical ingest order after documents land in the input prefix:
+Typical ingest order for one document (the deployed Lambdas do this on upload):
 
 ```sh
-python -m data_preprocessing.pre_processing
-python -m data_embeddings_storage.rag_process
+python -m data_preprocessing.pre_processing NE/contract.pdf
+python -m data_embeddings_storage.rag_process RAG_Output/NE/contract.json
 ```
+
+Writing `RAG_Output/` into a deployed post-processing bucket already triggers the
+embeddings Lambda, so run the second command only where that Lambda is not
+deployed.
 
 ### Query API (local)
 
@@ -294,7 +299,7 @@ modified.
 turns a change to how a finding is presented into a four-second check instead of
 an hour of Bedrock time. It needs no Bedrock and no database: the agents and the
 connection pool are imported inside the functions that use them, because
-`common/utils/settings.py` fetches the database secret at import and importing it
+`common/utils/db_settings.py` fetches the database secret at import and importing it
 at the top of the module killed a render before `main()` saw the flag. Rows the
 sidecar does not cover are named rather than left silently blank, since a workbook
 rendering 600 of 667 requirements looks finished. It refuses to run with `--fresh`,
@@ -314,29 +319,28 @@ not.
 - **Batch / bootstrap**: run the corresponding ECS task definitions on the
   private cluster/subnets. Stack outputs include bootstrap cluster name, task
   definition ARN, security group, and subnet IDs (`RunTask` contract).
-- Bucket names and model IDs are injected via ECS environment variables (see
-  below), which override matching keys in `aws.properties.ini`.
+- Bucket names and model IDs are injected via Lambda / ECS environment variables
+  (see below), which override matching keys in `aws.properties.ini`.
 
 ## Environment variables
 
 Path, model, and table defaults live in
 [`common/utils/aws.properties.ini`](common/utils/aws.properties.ini). Comments
 at the top of that file list env → property mappings. `Helper` applies env
-overrides first, then the active `[contract:…]` section, then `[default]`.
+overrides first, then `[default]`.
 
-### Cloud (ECS-injected)
+### Cloud (injected by CDK)
 
 | Variable | Role |
 |----------|------|
-| `AWS_REGION` / `AWS_DEFAULT_REGION` | AWS region |
-| `DOCUMENTS_BUCKET` | Source documents bucket |
-| `POST_PROCESSING_BUCKET` | BDA / RAG post-processing bucket |
-| `PIPELINE_CODE_BUCKET` | Pipeline code bucket |
-| `PIPELINE_TEMP_BUCKET` | Temp / summary logs bucket |
-| `DB_SECRET_ARN` (or `DB_SECRET_NAME`) | Secrets Manager secret for app DB credentials |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | AWS region (search API) |
+| `DOCUMENTS_BUCKET` | Source documents bucket (pre-processing Lambda) |
+| `POST_PROCESSING_BUCKET` | BDA / RAG post-processing bucket (both Lambdas) |
+| `PIPELINE_TEMP_BUCKET` | Temp / summary logs bucket (pre-processing Lambda) |
+| `DB_SECRET_ARN` (or `DB_SECRET_NAME`) | Secrets Manager secret for app DB credentials (embeddings Lambda and search API) |
 | `BEDROCK_MODEL_ID` | Foundation LLM |
 | `BEDROCK_EMBED_MODEL_ID` | Embedding model |
-| `EMBEDDINGS_TABLE_NAME` | Optional override of active contract table name |
+| `EMBEDDINGS_TABLE_NAME` | Table used by the search API (default `embeddings`) |
 
 **Bootstrap task only** (from Secrets Manager at task start; never put in task
 env plain text, workflow args, or logs):
@@ -368,74 +372,53 @@ need valid account permissions for the non-prod (or prod) account you target.
 
 ## Specifying documents and contracts
 
-There is **no per-file CLI** and no document-id filter on search.
+Ingest runs once per file (see below). There is no document-id filter on
+search.
 
-### Ingest (batch)
+### Ingest (event-driven)
 
-Pre-processing lists **all** `.pdf` and `.docx` objects under
-`input_bucket_name` + the active contract’s `input_prefix`.
+Drop a file, or a folder of files, into `input_bucket_name`. S3 sends one event
+notification per `.pdf`, `.PDF`, `.docx` or `.DOCX` object directly to the
+pre-processing Lambda (`data_preprocessing.pre_processing.handler`), so every
+file gets its own invocation. Suffix filters are case-sensitive, so other
+casings such as `.Pdf` are ignored. All paths come from the uploaded object's
+key; nothing in the INI selects a prefix.
 
-To focus work on a particular file:
+Output for `<folder>/<file>.pdf` in the post-processing bucket:
 
-1. Upload that object under the contract prefix (or only that object present), **or**
-2. Temporarily set `input_prefix` to a narrower key prefix that contains only
-   what you want, **or**
-3. Switch the active contract (see below) if the document belongs to another
-   contract’s tree.
+- `<folder>_bdaoutput/<file>/` raw BDA output
+- `<folder>_bdaoutput/BDA{Text,Table,Image}Output/`-style per-kind JSONs named
+  `<file>-preprocessed-{text,table,image}.json`
+- `RAG_Output/<folder>/<file>.json`, the text, table and image items combined
+  into one list. Text is split into 1,024-character chunks with a 30-character
+  overlap (`data_preprocessing/recursive_text_splitter.py`).
 
-Then re-run pre-process → rag_process. Embeddings write to the active
-contract’s `embeddings_table_name`.
+Each new `RAG_Output/**.json` triggers the embeddings Lambda
+(`data_embeddings_storage.rag_process.handler`), which writes to its own table
+`emb_<filename>` (lowercased, non-alphanumerics become `_`, max 41 chars with a
+hash suffix when truncated). The table name is not read from the INI.
+
+Both Lambdas are standard Lambda functions in the VPC's private subnets with a
+15-minute timeout (the Lambda maximum). Each runs at most 5 files at once and
+scales to zero when idle. Uploads beyond that wait in Lambda's asynchronous
+event queue for up to 6 hours, and a failed invocation is retried twice.
 
 ### Search (API)
 
-The agent accepts only a natural-language `query`. Results come from the active
-contract embeddings table configured in the INI / `EMBEDDINGS_TABLE_NAME`.
+The agent accepts only a natural-language `query`. The search API reads the
+table named by `EMBEDDINGS_TABLE_NAME` (default `embeddings`); it does not yet
+search the per-file `emb_*` tables.
 
-## Per-contract configuration (dev)
-
-Multi-contract isolation uses shared S3 buckets with per-contract prefixes and a
-per-contract embeddings table on the same RDS instance.
+## Shared buckets (dev)
 
 | Role | Dev bucket |
 |------|------------|
 | Source documents (input) | `aisuite-dev-contract-rag` |
 | BDA / RAG post-processing | `aisuite-dev-contract-rag-post-processing` |
-| Pipeline code | `aisuite-dev-llm-pipeline-code` |
 | Pipeline temp / summary logs | `aisuite-dev-llm-pipeline-temp` |
 
-Contract-specific paths and `embeddings_table_name` live in `[contract:…]` sections of
-`common/utils/aws.properties.ini`. ECS still overrides bucket names via env
-(`DOCUMENTS_BUCKET`, `POST_PROCESSING_BUCKET`, `PIPELINE_CODE_BUCKET`,
+Deployed bucket names come from env (`DOCUMENTS_BUCKET`, `POST_PROCESSING_BUCKET`,
 `PIPELINE_TEMP_BUCKET`).
-
-### Active contract
-
-Exactly one section may have `active = true`. Currently `ne_102897` (Nebraska).
-To switch:
-
-1. Set `active = true` on the target `[contract:…]` section.
-2. Set `active = false` on the previously active section.
-3. Leave prefixes and `embeddings_table_name` alone unless rewiring storage.
-4. Restart / redeploy tasks so they reload the INI.
-
-### Contract matrix (dev)
-
-| ID | Active | `input_prefix` | `embeddings_table_name` |
-|----|--------|----------------|-------------------------|
-| `me_0002` | false | `state_of_ME/MCR-ME-0002-NEMT/` | `embeddings_me_0002_nemt` |
-| `tn_6756` | false | `state_of_TN/MCCRS-TN-6756-TennCare/` | `embeddings_tn_6756_tenncare` |
-| `wa_6369` | false | `state_of_WA/MCCRS-WA-6369-IFC/` | `embeddings_wa_6369_ifc` |
-| `wa_6472` | false | `state_of_WA/MCCRS-WA-6472-AHIMC/` | `embeddings_wa_6472_ahimc` |
-| `wa_6473` | false | `state_of_WA/MCCRS-WA-6473-IFC/` | `embeddings_wa_6473_ifc` |
-| `ne_102897` | true | `NE/` | `embeddings_ne_102897` |
-
-Full `output_prefix` / BDA / RAG folder paths are in the INI under each contract section.
-
-### Bootstrap note
-
-Bootstrap creates each contract’s embeddings table (and indexes) so switching `active`
-does not require a re-run for DDL. Search/store use only the active contract table.
-
 ## One-time DB bootstrap (app user)
 
 CDK manages an on-demand Fargate task that bootstraps the private RDS database.

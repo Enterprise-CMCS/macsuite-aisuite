@@ -184,22 +184,14 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       });
     });
 
-    it("passes the bucket, database, and Bedrock contract to the container", () => {
+    it("passes the database and Bedrock contract to the container", () => {
       const template = synthesize(environmentName);
       const environment = apiContainerEnvironment(template, serviceName);
 
-      expect(environment.DOCUMENTS_BUCKET).toBe(
-        `aisuite-${environmentName}-contract-rag`,
-      );
-      expect(environment.POST_PROCESSING_BUCKET).toBe(
-        `aisuite-${environmentName}-contract-rag-post-processing`,
-      );
-      expect(environment.PIPELINE_CODE_BUCKET).toBe(
-        `aisuite-${environmentName}-llm-pipeline-code`,
-      );
-      expect(environment.PIPELINE_TEMP_BUCKET).toBe(
-        `aisuite-${environmentName}-llm-pipeline-temp`,
-      );
+      expect(environment.DOCUMENTS_BUCKET).toBeUndefined();
+      expect(environment.POST_PROCESSING_BUCKET).toBeUndefined();
+      expect(environment.PIPELINE_CODE_BUCKET).toBeUndefined();
+      expect(environment.PIPELINE_TEMP_BUCKET).toBeUndefined();
       expect(environment.DB_SECRET_ARN).toBeDefined();
       expect(environment.BEDROCK_MODEL_ID).toBe("us.amazon.nova-pro-v1:0");
       expect(environment.BEDROCK_EMBED_MODEL_ID).toBe("us.cohere.embed-v4:0");

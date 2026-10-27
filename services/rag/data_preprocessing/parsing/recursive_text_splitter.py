@@ -1,9 +1,8 @@
 class RecursiveCharacterTextSplitter:
-    def __init__(self, chunk_size=1024, chunk_overlap=30, length_function=len, is_separator_regex=False):
+    def __init__(self, chunk_size=1024, chunk_overlap=30, length_function=len):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.length_function = length_function
-        self.is_separator_regex = is_separator_regex
 
     def split_text(self, text):
         """

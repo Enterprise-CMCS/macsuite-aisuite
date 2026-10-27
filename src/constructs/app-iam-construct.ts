@@ -1,6 +1,5 @@
 import * as cdk from "aws-cdk-lib";
 import * as iam from "aws-cdk-lib/aws-iam";
-import type * as s3 from "aws-cdk-lib/aws-s3";
 import type * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
 
@@ -20,9 +19,6 @@ const BEDROCK_RERANK_MODEL = "cohere.rerank-v3-5:0";
 
 export interface AppIamConstructProps {
   dbSecret: secretsmanager.ISecret;
-  documentsBucket: s3.IBucket;
-  pipelineTempBucket: s3.IBucket;
-  postProcessingBucket: s3.IBucket;
 }
 
 export class AppIamConstruct extends Construct {
@@ -39,53 +35,8 @@ export class AppIamConstruct extends Construct {
 
     this.taskRole = new iam.Role(this, "TaskRole", {
       assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-      description: "AISuite RAG pipeline task role.",
+      description: "AISuite RAG search API task role.",
     });
-
-    this.taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ["s3:ListBucket"],
-        resources: [props.documentsBucket.bucketArn],
-        sid: "DocumentsBucketList",
-      }),
-    );
-    this.taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ["s3:GetObject"],
-        resources: [`${props.documentsBucket.bucketArn}/*`],
-        sid: "DocumentsBucketRead",
-      }),
-    );
-
-    this.taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ["s3:ListBucket"],
-        resources: [props.postProcessingBucket.bucketArn],
-        sid: "PostProcessingBucketList",
-      }),
-    );
-    this.taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"],
-        resources: [`${props.postProcessingBucket.bucketArn}/*`],
-        sid: "PostProcessingBucketAccess",
-      }),
-    );
-
-    this.taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ["s3:ListBucket"],
-        resources: [props.pipelineTempBucket.bucketArn],
-        sid: "PipelineTempBucketList",
-      }),
-    );
-    this.taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ["s3:GetObject", "s3:PutObject"],
-        resources: [`${props.pipelineTempBucket.bucketArn}/*`],
-        sid: "PipelineTempBucketAccess",
-      }),
-    );
 
     this.taskRole.addToPolicy(
       new iam.PolicyStatement({
@@ -122,44 +73,6 @@ export class AppIamConstruct extends Construct {
             `arn:aws:bedrock:${inferenceRegion}::foundation-model/${BEDROCK_RERANK_MODEL}`,
         ),
         sid: "BedrockRerank",
-      }),
-    );
-
-    this.taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: [
-          "bedrock:CreateDataAutomationProject",
-          "bedrock:DeleteDataAutomationProject",
-          "bedrock:GetDataAutomationProject",
-          "bedrock:UpdateDataAutomationProject",
-        ],
-        resources: [
-          `arn:aws:bedrock:${region}:${account}:data-automation-project/*`,
-        ],
-        sid: "BedrockDataAutomationProjects",
-      }),
-    );
-
-    this.taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ["bedrock:ListDataAutomationProjects"],
-        resources: ["*"],
-        sid: "BedrockDataAutomationProjectList",
-      }),
-    );
-
-    this.taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: [
-          "bedrock:GetDataAutomationStatus",
-          "bedrock:InvokeDataAutomationAsync",
-        ],
-        resources: [
-          `arn:aws:bedrock:${region}:${account}:data-automation-project/*`,
-          `arn:aws:bedrock:${region}:${account}:data-automation-profile/*`,
-          `arn:aws:bedrock:${region}:${account}:data-automation-invocation/*`,
-        ],
-        sid: "BedrockDataAutomationRuntime",
       }),
     );
   }

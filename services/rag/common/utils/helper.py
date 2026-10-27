@@ -14,7 +14,6 @@ class Helper:
         "input_bucket_name": ("DOCUMENTS_BUCKET",),
         "output_bucket": ("POST_PROCESSING_BUCKET",),
         "RagSplitOutPutBucket": ("POST_PROCESSING_BUCKET",),
-        "code_bucket_name": ("PIPELINE_CODE_BUCKET",),
         "temp_bucket_name": ("PIPELINE_TEMP_BUCKET",),
         "vector-db-admin-secret": ("DB_SECRET_ARN", "DB_SECRET_NAME"),
         "foundation_llm_model_id": ("BEDROCK_MODEL_ID",),

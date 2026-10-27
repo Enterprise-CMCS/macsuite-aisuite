@@ -3,8 +3,8 @@ boto3>=1.42.60
 fastapi>=0.135.0
 pgvector>=0.4.0
 pydantic>=2.12.5
-pydantic-ai>=2.27.1
-awswrangler==3.13.0
+pydantic-ai-slim[bedrock]>= 2.59.0
+awswrangler>=3.17.1
 uvicorn>=0.39.0
 structlog==25.5.0
 openpyxl==3.1.5

@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 from botocore.config import Config
 
-from data_preprocessing.bedrock.bda_results import BDAResults
+from data_preprocessing.bedrock.bda_results import BDAResults, doc_output_prefix, per_doc_output_key
 from data_preprocessing.parsing.parsed_text_data import element_page, printed_page_map
 from common.utils.helper import Helper
 from common.utils.logger import log
@@ -234,11 +234,11 @@ def parsed_image_info(source_data):
     log.info(f"parsed_image_info() Total Images for {source_key} document. totalImagesAnalysed={total_images_analysed}")
     return image_data
 
-def invoke_parsed_images_data():
+def invoke_parsed_images_data(source_key):
     try:
         log.info(f"invoke_parsed_images_data() Starts Parsed_Images File __main__={__name__}")
         output_bucket = Helper.get_property("output_bucket")
-        output_prefix = Helper.get_property("output_prefix")
+        output_prefix = doc_output_prefix(source_key)
         foundation_llm_model_id = Helper.get_property("foundation_llm_model_id")
         max_concurrent_image_calls = int(Helper.get_property("concurrent_bedrock_image_calls", default=5))
 
@@ -315,21 +315,13 @@ def invoke_parsed_images_data():
         for data in parsed_data:
             log.debug(f"Parsing data at counter = {i_count}")
             image_data_lcl = parsed_image_info(data)
-            source_key = data.get("metadata", {}).get("s3_key")
-            Helper.summary_file("IMAGE", f"\n{now}Processing file {source_key}")
+            bda_source_key = data.get("metadata", {}).get("s3_key")
+            Helper.summary_file("IMAGE", f"\n{now}Processing file {bda_source_key}")
             all_image.extend(image_data_lcl)
             i_count = i_count + 1
 
 
-        #BDAImageOutputFolder = os.getenv("BDAImageOutputFolder")
-        bda_image_output_folder = Helper.get_property("BDAImageOutputFolder")
-        #BDAImageOutputFilename = os.getenv("BDAImageOutputFilename")
-
-        bda_image_output_filename = os.path.join(bda_image_output_folder, Helper.get_property("BDAImageOutputFilename"))
-        log.debug(f"Output Table File Name={bda_image_output_filename}")
-
-        # BDAImagesOutputFilename = "Output-BDA-images.json"
-
+        bda_image_output_filename = per_doc_output_key(source_key, "image")
         log.debug(f"Output Image File Name={bda_image_output_filename}")
 
         s3_client = boto3.client('s3')

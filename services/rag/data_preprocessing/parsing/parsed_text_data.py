@@ -5,10 +5,11 @@ import re
 import boto3
 import datetime
 
-from data_preprocessing.bedrock.bda_results import BDAResults
+from data_preprocessing.bedrock.bda_results import BDAResults, doc_output_prefix, per_doc_output_key
 from common.utils.settings import aws_client,aws_session
 from common.utils.helper import Helper
 from common.utils.logger import log
+from data_preprocessing.parsing.recursive_text_splitter import RecursiveCharacterTextSplitter
 
 
 # Page furniture carries no requirement, so it is not retrievable text. The page
@@ -236,15 +237,23 @@ def parsed_text_info(source_data):
     return final_docs
 
 
-def invoke_parsed_text_data():
+def chunk_text_docs(docs):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1024, chunk_overlap=30, length_function=len,)
+    chunked_docs = []
+    for doc in docs:
+        metadata = doc.get("metadata", {})
+        for chunk in splitter.split_text(doc.get("text", "")):
+            chunked_docs.append({"text": chunk, "metadata": {**metadata}})
+    return chunked_docs
+
+
+def invoke_parsed_text_data(source_key):
     log.info(f"***************** invoke_parsed_text_data Starts. __name__={__name__}")
     try:
 
         output_bucket = Helper.get_property("output_bucket")
-        output_prefix = Helper.get_property("output_prefix")
-        bda_text_output_folder = Helper.get_property("BDATextOutputFolder")
-        bda_text_output_filename = Helper.get_property("BDATextOutputFilename")
-
+        output_prefix = doc_output_prefix(source_key)
         aws_client_s3 = aws_client("s3")
 
         log.info(f"invoke_parsed_text_data() output_bucket={output_bucket} output_prefix={output_prefix}")
@@ -259,22 +268,15 @@ def invoke_parsed_text_data():
 
         log.debug(f"invoke_parsed_text_data() Parsing loaded document")
         for data in parsed_data:
-            docs = parsed_text_info(data)
-            text_data.extend(docs)
+            text_data.extend(parsed_text_info(data))
 
-        # BDATextOutputFilename = "Output-BDA-texts.json"
-        bda_text_output_filename = os.path.join(bda_text_output_folder, bda_text_output_filename)
+        text_chunks = chunk_text_docs(text_data)
+        bda_text_output_filename = per_doc_output_key(source_key, "text")
 
         log.debug(
-            f"invoke_parsed_text_data() Creating One file for {len(text_data)} Parsed document. Name of Output Text File Name={bda_text_output_filename}")
+            f"invoke_parsed_text_data() Split {len(text_data)} parsed document(s) into {len(text_chunks)} chunk(s). Name of Output Text File Name={bda_text_output_filename}")
         s3_client = boto3.client('s3')
-        s3_client.put_object(Bucket=output_bucket, Key=bda_text_output_filename, Body=json.dumps(text_data,indent=2))
-        ####
-        #with open(BDATextOutputFilename, "w", encoding='utf-8') as f:
-        #    log.info(f"Dumping data to file {BDATextOutputFilename}")
-        #    json.dump(Text_data, f, indent=2)
-
-        ####
+        s3_client.put_object(Bucket=output_bucket, Key=bda_text_output_filename, Body=json.dumps(text_chunks, indent=2))
         log.info(f"*****************invoke_parsed_text_data() Ends .__name__={__name__}. Returning True.")
         return True
 

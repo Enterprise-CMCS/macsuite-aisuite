@@ -7,7 +7,7 @@ import boto3
 from common.utils.settings import aws_client
 from common.utils.helper import Helper
 from common.utils.logger import log
-from data_preprocessing.bedrock.bda_results import BDAResults
+from data_preprocessing.bedrock.bda_results import BDAResults, doc_output_prefix, per_doc_output_key
 from data_preprocessing.parsing.parsed_text_data import element_page, printed_page_map
 
 def _parse_markdown_table(md):
@@ -120,13 +120,13 @@ def parse_table_elements_simple(source_data):
     return results
 
 
-def invoke_parsed_bda_data():
+def invoke_parsed_bda_data(source_key):
     try:
         log.info(f"***************** invoke_parsed_bda_data Starts. __name__={__name__}")
         awsClientS3 = aws_client("s3")
 
         output_bucket = Helper.get_property("output_bucket")
-        output_prefix = Helper.get_property("output_prefix")
+        output_prefix = doc_output_prefix(source_key)
 
         log.info(f"output_bucket={output_bucket}, output_prefix={output_prefix}")
         log.debug(f"Calling fetch_parsed_bda_results")
@@ -140,11 +140,7 @@ def invoke_parsed_bda_data():
             table_data = parse_table_elements_simple(dataObj)
             test_table.extend(table_data)
 
-        bda_table_output = Helper.get_property("BDATableOutputFolder")
-
-        bda_table_output_filename = os.path.join(
-            bda_table_output,
-            Helper.get_property("BDATableOutputFilename"))
+        bda_table_output_filename = per_doc_output_key(source_key, "table")
         log.debug(f"Output Table File Name={bda_table_output_filename}")
 
         s3_client = boto3.client('s3')

@@ -44,7 +44,7 @@ class ActiveContractResolutionTests(unittest.TestCase):
             input_bucket_name = aisuite-dev-contract-rag
             input_prefix =
             embeddings_table_name = embeddings
-            code_bucket_name = aisuite-dev-llm-pipeline-code
+            temp_bucket_name = aisuite-dev-llm-pipeline-temp
 
             [contract:me_0002]
             active = false
@@ -67,8 +67,8 @@ class ActiveContractResolutionTests(unittest.TestCase):
             "embeddings_tn_6756_tenncare",
         )
         self.assertEqual(
-            get_config_property(config, "code_bucket_name"),
-            "aisuite-dev-llm-pipeline-code",
+            get_config_property(config, "temp_bucket_name"),
+            "aisuite-dev-llm-pipeline-temp",
         )
         self.assertEqual(
             list_embeddings_table_names_from_config(config),

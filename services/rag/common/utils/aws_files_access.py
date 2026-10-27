@@ -1,6 +1,17 @@
+from urllib.parse import unquote_plus
+
 from botocore.exceptions import ClientError
 from common.utils.helper import Helper
 from common.utils.logger import log
+
+
+def object_keys(event):
+    
+    keys = []
+    for record in event.get("Records", []):
+        if "s3" in record:
+            keys.append(unquote_plus(record["s3"]["object"]["key"]))
+    return keys
 
 
 class AwsFilesAccess:
