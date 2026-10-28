@@ -11,6 +11,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from common.utils.logger import log
@@ -44,8 +45,8 @@ STATUS_WORDING = {
 
 STANDARD_WORDING = {"MET": "Met", "NOT MET": "Not met", "UNCLEAR": "Unsure"}
 
-CONFIDENCE_BANDS = ((0.80, "Strong evidence"), (0.60, "Moderate evidence"))
-LOWEST_BAND = "Limited evidence"
+CONFIDENCE_BANDS = ((0.70, "High"), (0.40, "Medium"))
+LOWEST_BAND = "Low"
 
 MAX_CELL_CHARS = 4000
 MAX_ERROR_CHARS = 220
@@ -66,7 +67,7 @@ _CELL_RANGE = re.compile(r"^\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z]+)\$?(\d+))?$")
 
 WORKBOOK_SUFFIXES = (".xlsm", ".xlsx")
 
-DEFAULT_CONCURRENCY = 4
+DEFAULT_CONCURRENCY = 8
 
 
 def _text(value):
@@ -90,15 +91,31 @@ def _summarise_error(error):
         return text
     return text[:MAX_ERROR_CHARS].rsplit(" ", 1)[0] + " ..."
 
-
 def confidence_band(score):
     if score is None:
-        return None
+        return "Low"
     for floor, label in CONFIDENCE_BANDS:
         if score >= floor:
             return label
     return LOWEST_BAND
 
+def status_with_confidence(review):
+    status = (review.status or "UNSURE").strip().upper()
+    score = review.retrieval_confidence
+
+    # Band shown = the Decision Analyst's own confidence (which already takes
+    # retrieval confidence into account). Older sidecar reviews without it
+    # fall back to the retrieval band.
+    band = (getattr(review, "decision_confidence", "") or "").strip().title() or confidence_band(score)
+
+    # Defensive guardrails; agents.py should already enforce these.
+    # MET requires retrieval >= 0.40 and High or Medium decision confidence.
+    if status == "MET" and (score is None or score < 0.40 or band not in ("High", "Medium")):
+        status = "UNSURE"
+        band = "Low"
+
+    status_text = "MET" if status == "MET" else "Unsure"
+    return f"{status_text} with {band} Confidence"
 
 def _free_name(path):
     suffix = 2
@@ -107,7 +124,6 @@ def _free_name(path):
         if not candidate.exists():
             return candidate
         suffix += 1
-
 
 def match_status(status, options):
     wanted = STATUS_WORDING.get(status, ())
@@ -138,7 +154,8 @@ def _quote_lines(records):
         location = ", ".join(part for part in (record.doc_id,
                                                page_label(record.page, record.printed_page)) if part)
         flag = "" if record.verified else " [unverified]"
-        lines.append(f"{location}{flag}\n\"{_squeeze(record.quote)}\"".strip())
+        text = record.chunk_text or record.quote
+        lines.append(f"{location}{flag}\n\"{_squeeze(text)}\"".strip())
     return "\n\n".join(lines)
 
 
@@ -146,47 +163,135 @@ class CRTWorkbook:
 
     def __init__(self, path):
         self.path = Path(path)
+        # Formula-preserving copy: this is the one that gets written and saved.
         self.workbook = load_workbook(self.path, keep_vba=self.path.suffix.lower() == ".xlsm",
                                       data_only=False)
+        # Values copy: Excel's last calculated result for every formula cell.
+        # Some CRT templates build the Requirement text with a formula (e.g. the
+        # CHIP rows), so text is READ from here, never sent to the AI as "=IF(...)".
+        self.values = load_workbook(self.path, data_only=True)
+        self.formula_text_rows = 0
+        self.formula_without_value = []
         log.info(f"CRTWorkbook() Opened {self.path.name} with {len(self.workbook.sheetnames)} sheets")
+
+    def cell_text(self, sheet, row, column):
+        """Cell text as Excel displays it: a formula cell returns its last
+        calculated value (empty if the workbook was never calculated/saved in Excel)."""
+        raw = sheet.cell(row=row, column=column).value
+        if isinstance(raw, str) and raw.startswith("="):
+            return _text(self.values[sheet.title].cell(row=row, column=column).value)
+        return _text(raw)
+
+    @staticmethod
+    def is_formula(sheet, row, column):
+        raw = sheet.cell(row=row, column=column).value
+        return isinstance(raw, str) and raw.startswith("=")
 
     @property
     def requirement_sheets(self):
         return [sheet for sheet in self.workbook.worksheets
-                if _text(sheet.cell(row=HEADER_ROW, column=REQUIREMENT_COL).value) == "Requirement"]
+                if self.cell_text(sheet, HEADER_ROW, REQUIREMENT_COL) == "Requirement"]
 
     def last_reviewable_row(self, sheet):
         limit = min(sheet.max_row, MAX_SCAN_ROW)
         for row in range(FIRST_DATA_ROW, limit + 1):
-            if _text(sheet.cell(row=row, column=ITEM_COL).value).lower().startswith(TIPS_MARKER):
+            if self.cell_text(sheet, row, ITEM_COL).lower().startswith(TIPS_MARKER):
                 return row - 1
         return limit
 
-    def requirements(self, sheet_names=None, skip_answered=False):
+    def requirements(self, sheet_names=None, skip_answered=False, include_hidden=False):
+        """
+        Every VISIBLE requirement row: any row with an Item ID and Requirement
+        text that is not hidden.
+
+        Rows are collected REGARDLESS of:
+          - an existing Status ("Met", "MET", "Yes", "N/A", "Not met", ...),
+            which is overwritten with the AI's result;
+          - gray shading (conditional formatting, e.g. sections marked N/A),
+            which is formatting only and is ignored.
+
+        Skipped:
+          - section-heading rows (no Item ID);
+          - hidden rows and hidden sheets (e.g. collapsed CHIP sections), to
+            save run time. Pass include_hidden=True (--include-hidden) to
+            review them too;
+          - rows with a Status, only when skip_answered=True (--skip-answered).
+        """
         rows = []
+        self.hidden_skipped = {}
         for sheet in self.requirement_sheets:
             if sheet_names and sheet.title not in sheet_names:
                 continue
+            sheet_hidden = sheet.sheet_state != "visible"
 
             for row in range(FIRST_DATA_ROW, self.last_reviewable_row(sheet) + 1):
-                item = _text(sheet.cell(row=row, column=ITEM_COL).value)
-                requirement = _text(sheet.cell(row=row, column=REQUIREMENT_COL).value)
+                item = self.cell_text(sheet, row, ITEM_COL)
+                requirement = self.cell_text(sheet, row, REQUIREMENT_COL)
+                requirement_is_formula = self.is_formula(sheet, row, REQUIREMENT_COL)
+                if requirement_is_formula and not requirement and item:
+                    # Formula with no saved result: never send "=IF(...)" to the AI.
+                    self.formula_without_value.append(f"{sheet.title} row {row} {item}")
+                    continue
                 if not item or not requirement:
                     continue
-                if skip_answered and _text(sheet.cell(row=row, column=STATUS_COL).value):
+
+                hidden = sheet_hidden or bool(sheet.row_dimensions[row].hidden)
+                if hidden and not include_hidden:
+                    self.hidden_skipped[sheet.title] = self.hidden_skipped.get(sheet.title, 0) + 1
                     continue
+
+                existing_status = self.cell_text(sheet, row, STATUS_COL)
+                if skip_answered and existing_status:
+                    continue
+                if requirement_is_formula:
+                    self.formula_text_rows += 1
 
                 rows.append({
                     "sheet": sheet.title,
                     "row": row,
                     "item": item,
-                    "legal_cite": _text(sheet.cell(row=row, column=LEGAL_CITE_COL).value),
+                    "legal_cite": self.cell_text(sheet, row, LEGAL_CITE_COL),
                     "requirement": requirement,
-                    "tip": _text(sheet.cell(row=row, column=TIP_COL).value),
+                    "tip": self.cell_text(sheet, row, TIP_COL),
+                    # For the selection summary only; not sent to the AI.
+                    "existing_status": existing_status,
+                    "hidden": hidden,
                 })
 
         log.info(f"requirements() Collected {len(rows)} requirement rows from {self.path.name}")
         return rows
+
+    def selection_summary(self, rows):
+        """Print what was selected per sheet, so it is easy to confirm that
+        Met / Yes / N/A and gray rows are included and hidden rows are not."""
+        by_sheet = {}
+        for entry in rows:
+            by_sheet.setdefault(entry["sheet"], []).append(entry)
+
+        print("  Selected requirement rows by sheet (existing Status before this run):")
+        for sheet, entries in by_sheet.items():
+            counts = {}
+            for entry in entries:
+                label = entry["existing_status"] or "(blank)"
+                counts[label] = counts.get(label, 0) + 1
+            status_text = ", ".join(f"{label} {count}" for label, count in
+                                    sorted(counts.items(), key=lambda pair: -pair[1]))
+            hidden = sum(1 for entry in entries if entry["hidden"])
+            hidden_text = f"; {hidden} hidden included" if hidden else ""
+            print(f"    {sheet}: {len(entries)} ({status_text}{hidden_text})")
+
+        if self.formula_text_rows:
+            print(f"  {self.formula_text_rows} requirement(s) are Excel formulas; their displayed text "
+                  "(last value calculated by Excel) is used.")
+        if self.formula_without_value:
+            print(f"  WARNING: {len(self.formula_without_value)} requirement formula(s) have no saved value and "
+                  "were skipped. Open the workbook in Excel, let it calculate, save, and run again. "
+                  f"First: {self.formula_without_value[0]}")
+
+        skipped = getattr(self, "hidden_skipped", {})
+        if skipped:
+            print(f"  Hidden rows skipped (not reviewed, not overwritten): {sum(skipped.values())} "
+                  f"({', '.join(f'{sheet} {count}' for sheet, count in skipped.items())})")
 
     def status_options(self, sheet, row):
         for validation in sheet.data_validations.dataValidation:
@@ -208,56 +313,56 @@ class CRTWorkbook:
         return list(DEFAULT_STATUS_OPTIONS)
 
     def write_review(self, review):
-        sheet = self.workbook[review.sheet]
-        row = review.row
-        options = self.status_options(sheet, row)
-        wording = match_status(review.status, options)
+        sheet, row = self.workbook[review.sheet], review.row
 
-        follow_up = review.in_reviewer_terms(review.follow_up or review.missing_information)
-        if wording is None:
-            follow_up = follow_up or "Automated review could not determine this from the contract text."
-            log.debug(f"write_review() {review.sheet} row {row}: {review.status} has no matching option "
-                      f"in {options}, leaving Status blank")
-        else:
-            sheet.cell(row=row, column=STATUS_COL).value = wording
-
-        comment = self._comment(review, wording)
+        # Status: Stage-2 recommendation + retrieval-confidence band
+        sheet.cell(row=row, column=STATUS_COL).value = status_with_confidence(review)
+        
+        # Where found: locations derived from Stage-1 evidence
         sheet.cell(row=row, column=WHERE_FOUND_COL).value = _clip(review.where_found()) or None
-        sheet.cell(row=row, column=FOLLOW_UP_COL).value = _clip(follow_up) or None
-        sheet.cell(row=row, column=COMMENTS_COL).value = _clip(comment) or None
+        
+        # Follow-up
+        # follow_up = review.in_reviewer_terms(review.follow_up or review.missing_information)
+        # sheet.cell(row=row, column=FOLLOW_UP_COL).value = _clip(follow_up) or None
+        
+        # General comments: Stage-1 reasoning + verified contract text
+        sheet.cell(row=row, column=COMMENTS_COL).value = _clip(self._comment(review)) or None
 
-    def _comment(self, review, wording=None):
-        parts = [self._verdict_line(review, wording)]
-        if review.error:
-            parts.append(f"Automated review failed: {_summarise_error(review.error)}")
+    def _comment(self, review):
+        parts = []
+        # Stage-1 AI reasoning
         if review.argument:
-            parts.append(f"AI response: {review.in_reviewer_terms(review.argument)}")
+            parts.append(f"AI Reasoning:\n{review.in_reviewer_terms(review.argument)}")
 
-        pages = review.page_numbers()
-        if pages:
-            parts.append(f"Page number: {pages}")
+        # Stage-2 decision rationale (uses 42 CFR Part 438 / CMS State Guide context)
+        # (Decision confidence itself is shown in the Status column.)
+        decision_response = getattr(review, "decision_response", "")
+        if decision_response:
+            parts.append(f"Decision rationale:\n{review.in_reviewer_terms(decision_response)}")
 
-        score = review.combined_confidence
-        if score is None:
-            score = review.retrieval_confidence
-        band = confidence_band(score)
-        if band:
-            parts.append(f"Confidence: {band}")
-
-        if review.evidence and not review.quotes_verified:
-            parts.append("Note: at least one quote could not be matched back to the retrieved text.")
-        elif not review.evidence and not review.error:
-            parts.append("Note: no contract text was quoted for this status. The confidence above "
-                         "comes from the passages the search returned, not from a cited provision.")
-
+        # Errors
+        # if review.error:
+        #     parts.append(f"Automated review failed: {_summarise_error(review.error)}")
+        
+        # Evidence validation
+        # if review.evidence and not review.quotes_verified:
+        #     parts.append("Note: at least one cited quote could not be verified against the retrieved contract text.")
+        # elif not review.evidence and not review.error:
+        #     parts.append("No verified contract text was identified for this requirement.")
+        
         comment = "\n\n".join(parts)
+        
+        # Verified contract quotes
         quotes = self._quote_block(review, len(comment) + 2)
-        return f"{comment}\n\n{quotes}" if quotes else comment
+        return "\n\n".join(p for p in (comment, quotes) if p)
 
     @staticmethod
     def _quote_block(review, used):
+        verified = [record for record in review.evidence if record.verified]
+        if not verified:
+            return ""
         budget = MAX_CELL_CHARS - used - len(QUOTE_HEADING) - 1
-        block = fit_quotes(review.evidence, budget, f"the {ANALYSIS_SHEET} sheet")
+        block = fit_quotes(verified, budget, f"the {ANALYSIS_SHEET} sheet")
         return f"{QUOTE_HEADING}\n{block}" if block else ""
 
     @staticmethod
@@ -292,7 +397,9 @@ class CRTWorkbook:
                 _clip(review.in_reviewer_terms(review.follow_up)),
                 _clip(review.in_reviewer_terms(review.missing_information)),
                 _clip(review.where_found()), review.page_numbers(),
-                review.llm_confidence, review.retrieval_confidence, review.combined_confidence,
+                # "LLM Confidence" column: Stage 2's own High/Medium/Low label.
+                review.decision_confidence or review.llm_confidence,
+                review.retrieval_confidence, review.combined_confidence,
                 quotes_verified,
                 review.chunks_retrieved,
                 fit_quotes(review.evidence, MAX_CELL_CHARS, "the .reviewed.jsonl sidecar"),
@@ -396,10 +503,11 @@ async def review_all(todo, sidecar, concurrency, challenge):
             )
             append_sidecar(sidecar, review)
             counter["finished"] += 1
-            print(f"  [{counter['finished']}/{len(todo)}] {entry['sheet']} {entry['item']} "
-                  f"-> {review.status}"
-                  + (f" (confidence {review.combined_confidence:.2f})"
-                     if review.combined_confidence is not None else ""))
+            print(
+                f"  [{counter['finished']}/{len(todo)}] "
+                f"{entry['sheet']} {entry['item']} "
+                f"-> {status_with_confidence(review)}"
+            )
             return review
 
     return await asyncio.gather(*(run_one(entry) for entry in todo))
@@ -414,11 +522,17 @@ def report_unreviewed(todo):
 
 
 async def review_workbook(workbook_path, sheets=None, limit=None, concurrency=DEFAULT_CONCURRENCY,
-                          challenge=True, fresh=False, skip_answered=False, render_only=False):
+                          challenge=True, fresh=False, skip_answered=False, render_only=False,
+                          include_hidden=False):
     workbook = CRTWorkbook(workbook_path)
-    pending = workbook.requirements(sheet_names=sheets, skip_answered=skip_answered)
+    pending = workbook.requirements(sheet_names=sheets, skip_answered=skip_answered,
+                                    include_hidden=include_hidden)
     if limit:
         pending = pending[:limit]
+
+    if skip_answered:
+        print("  --skip-answered is on: rows that already have a Status (Met, Yes, N/A, ...) are NOT reviewed.")
+    workbook.selection_summary(pending)
 
     sidecar = sidecar_path(workbook_path)
     if fresh and sidecar.exists():
@@ -455,7 +569,7 @@ def summarise(name, reviews):
     unverified = sum(1 for review in reviews if review.evidence and not review.quotes_verified)
 
     print(f"\n{name}: {len(reviews)} reviewed at {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
-    for status in ("MET", "NOT MET", "UNCLEAR"):
+    for status in ("MET", "UNSURE"):
         if counts.get(status):
             print(f"  {status:<8} {counts[status]}")
     if unverified:
@@ -495,6 +609,7 @@ async def run(args):
                 fresh=args.fresh,
                 skip_answered=args.skip_answered,
                 render_only=args.render_only,
+                include_hidden=args.include_hidden,
             )
             print(f"  written to {saved}\n")
     finally:
@@ -518,7 +633,11 @@ def main():
     parser.add_argument("--no-challenge", action="store_true",
                         help="Skip the challenger and adjudicator, one pass only")
     parser.add_argument("--skip-answered", action="store_true",
-                        help="Leave rows that already have a Status alone")
+                        help="Leave rows that already have a Status alone. Default: every visible requirement "
+                             "row is reviewed and overwritten, including Met / Yes / N/A and gray rows")
+    parser.add_argument("--include-hidden", action="store_true",
+                        help="Also review hidden requirement rows (e.g. collapsed CHIP sections). "
+                             "Default: hidden rows are skipped to save time")
     parser.add_argument("--fresh", action="store_true", help="Discard the sidecar and review everything again")
     parser.add_argument("--render-only", action="store_true",
                         help="Rebuild the workbook from the sidecar without reviewing anything")
@@ -529,6 +648,8 @@ def main():
 
     return asyncio.run(run(args))
 
-
 if __name__ == "__main__":
     sys.exit(main())
+
+
+

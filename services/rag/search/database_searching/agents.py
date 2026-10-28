@@ -18,7 +18,10 @@ from search.database_searching.review_models import (EvidenceRecord,RequirementR
 from search.database_searching.search import SearchEngine
 from difflib import SequenceMatcher
 
-
+try:
+    from json_repair import repair_json
+except ImportError:          # library not installed: behave as before
+    repair_json = None
 # ==================================CONFIGURATION============================
  
 MAX_SEARCHES = 3
@@ -34,7 +37,6 @@ MAX_REFERENCE_CHARS = 6000
 # Numeric retrieval confidence is passed to Stage 2 as an input and kept as a
 # MET guardrail (>= 0.40), but is never shown in Status itself.
 DECISION_CONFIDENCE_LABELS = {"HIGH", "MEDIUM", "LOW"}
-
 
 # =====================STAGE 1 PROMPT: EVIDENCE ANALYSIS ONLY===================
  
@@ -76,6 +78,14 @@ EVIDENCE RULES:
 - Return every passage materially needed for evaluating the requirement.
 - Do not use headers or footers as evidence unless they contain the
   contractual provision being evaluated.
+- Passages labeled "Section: Contract definition of ..." come from the
+  contract's glossary or definitions section. They are valid contract
+  evidence. If a definition contains an obligation (for example a timeframe,
+  a required element, or who must do something), cite it like any other
+  provision.
+- When the requirement depends on how a term is defined (for example
+  grievance, appeal, adverse benefit determination, marketing, enrollee),
+  cite the contract's own definition of that term if it was retrieved.
 - Do not generate document names or page numbers.
 - Python derives document and page information from chunk metadata.
 - If the retrieved evidence is incomplete, clearly explain what material
@@ -215,8 +225,10 @@ APPLICABILITY CONDITIONS ARE NOT CONTRACT ELEMENTS:
 WEIGH STAGE 1 GAPS, DO NOT COPY THEM:
 - MissingInformation lists what Stage 1 could not find. For each gap,
   decide whether it is MATERIAL under the regulation. Ignore gaps that are
-  applicability conditions, definitions of terms, or wording differences
+  applicability conditions or wording differences
   where the verified evidence already establishes the same obligation.
+  A missing definition is material only when the requirement itself asks
+  the contract to define that term.
 - Return UNSURE only for a material gap, and name it.
 
 CHECK LISTS ELEMENT BY ELEMENT:
@@ -226,6 +238,21 @@ CHECK LISTS ELEMENT BY ELEMENT:
   unless that word or an equivalent appears in VerifiedEvidence. For
   example, "gender" or "sexual orientation" in the contract is not the same
   as "sex" in the regulation; a missing item is a material gap.
+
+DEFINED TERMS:
+- 42 CFR (in RegulatoryReference) sets the standard meaning of a term.
+- If the contract defines the term -- in a passage labeled as a contract
+  definition, or in its own text (for example "As used in this section,
+  X means ...") -- that definition shows how the state uses the term and
+  governs how the contract's provisions are read. Check that it still
+  covers everything the federal definition requires.
+- If the contract definition is narrower than the federal one, or leaves
+  out a listed element, return UNSURE, name the missing element, and lower
+  confidence. Do not return MET.
+- If the contract does not define the term, that is NOT a gap by itself
+  (unless the requirement asks the contract to define it). Read the
+  contract's provisions using the federal meaning and decide as usual.
+- Text that defines a term can satisfy a requirement on its own.
 
 ==================================================
 FINAL RECOMMENDATIONS
@@ -391,8 +418,8 @@ Return EXACTLY one JSON object:
     "Response": "<concise explanation of the final decision>"
 }
 """
- 
 
+ 
 # ===============================DEPENDENCIES========================================
  
 @dataclass
@@ -490,6 +517,54 @@ def record_chunks(deps, results):
             existing["retrieval_confidence"] = result.get("retrieval_confidence")
             existing["distance"] = result.get("distance")
     return kept
+
+
+# ==================================CONTRACT DEFINITIONS (glossary)===========================================
+MAX_DEFINITION_CHUNKS = 3
+
+# Defined terms too common
+_GENERIC_TERMS = {"may", "must", "will", "shall", "should", "state", "contract", "contractor"}
+
+_DEFINITION_TERMS = {}   # contract table name -> its defined terms (loaded once per run)
+
+def _words(text):
+    return " " + re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip() + " "
+
+def matching_terms(requirement, terms):
+    """Defined terms that appear in the requirement text (also as a plural)."""
+    text = _words(requirement)
+    found = []
+    for term in terms:
+        base = _words(re.sub(r"\(.*?\)", "", term)).strip() # remove parenthetical content from term
+        if len(base) < 4 or base in _GENERIC_TERMS:
+            continue
+        if f" {base} " in text or f" {base}s " in text or (base.endswith("y") and f" {base[:-1]}ies " in text):
+            found.append(term)
+    return found
+
+async def retrieve_definitions(deps, requirement):
+    """The contract's own definitions of terms used in the requirement.
+    Returns [] when the contract has no glossary or no defined term appears."""
+    engine = deps.search_engine
+    table = engine.table_name
+    if table not in _DEFINITION_TERMS:
+        try:
+            _DEFINITION_TERMS[table] = await engine.definition_terms()
+        except Exception as lclEx:
+            log.warning(f"retrieve_definitions() could not load defined terms from '{table}': {lclEx}")
+            _DEFINITION_TERMS[table] = []
+        log.info(f"retrieve_definitions() '{table}' has {len(_DEFINITION_TERMS[table])} defined term(s)")
+
+    terms = matching_terms(requirement, _DEFINITION_TERMS[table])
+    if not terms:
+        return []
+    try:
+        results = await engine.definition_search(requirement, terms, limit=MAX_DEFINITION_CHUNKS)
+    except Exception as lclEx:
+        log.warning(f"retrieve_definitions() lookup failed for terms {terms}: {lclEx}")
+        return []
+    log.info(f"retrieve_definitions() terms {terms} -> {len(results)} contract definition(s)")
+    return results
  
 # CHUNK / PROVENANCE 
 # =============================================================================
@@ -521,11 +596,14 @@ def format_retrieved_chunks(chunks):
 
         doc_id = metadata.get("doc_id", "")
         page = page_number(metadata.get("page"),metadata.get("printed_page", ""),)
- 
+        section = ""
+        if metadata.get("section_type") == "definition":
+            section = f"Section: Contract definition of '{metadata.get('term', '')}'\n"
         blocks.append(
             f"[chunk {chunk_id}]\n"
             f"Document: {doc_id}\n"
             f"Page: {page}\n"
+            f"{section}"
             f"Text:\n{text.strip()}")
     return "\n\n".join(blocks)
  
@@ -541,18 +619,23 @@ def extract_json_object(output):
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end < start:
         raise ValueError("No JSON object found in model output")
-    
     # strict=False: verbatim contract quotes often contain raw newlines/tabs,
     # which strict JSON rejects ("Invalid control character").
     candidate = text[start:end + 1]
     try:
         parsed = json.loads(candidate, strict=False)
     except json.JSONDecodeError as json_err:
-        # Fallback: the model sometimes writes Python-style 'single-quoted' strings.
+        # Fallback 1: the model sometimes writes Python-style 'single-quoted' strings.
         try:
             parsed = ast.literal_eval(candidate)
         except (ValueError, SyntaxError):
-            raise json_err
+            # Fallback 2: repair unescaped quotes copied from contract text.
+            if repair_json is None:
+                raise json_err
+            parsed = repair_json(candidate, return_objects=True)
+            if not isinstance(parsed, dict) or not parsed:
+                raise json_err
+            log.info("extract_json_object() repaired malformed JSON from the model")
     if isinstance(parsed, str):  # JSON-encoded string wrapping another object
         parsed = json.loads(parsed, strict=False)
     if not isinstance(parsed, dict):
@@ -844,6 +927,10 @@ async def review_requirement(
     try:
         # Initial retrieval
         seed = await retrieve(deps, requirement)
+        # Contract's own definitions of terms in the requirement if glossary exists otherwise [].
+        seen = {chunk.get("id") for chunk in seed}
+        seed += [chunk for chunk in await retrieve_definitions(deps, requirement)
+                 if chunk.get("id") not in seen]
         record_chunks(deps, seed)
         review.chunks_retrieved = len(deps.chunks)
 
