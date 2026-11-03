@@ -7,7 +7,9 @@ import json
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data_embeddings_storage.database.recursive_text_splitter import RecursiveCharacterTextSplitter
+from data_embeddings_storage.database.merge_elements import merge_lead_in_lists
 from data_embeddings_storage.database.definitions import tag_definitions
+from data_embeddings_storage.database.table_splitter import split_table
 from common.utils.helper import Helper
 from common.utils.settings import aws_client
 from common.utils.aws_files_access import AwsFilesAccess
@@ -66,7 +68,6 @@ async def invoke_rag_process():
         log.info(f"str_bda_tables_json_filename={str_bda_tables_json_filename}")
         log.info(f"output_excel_json_folder_pre_process={output_excel_json_folder_pre_process}")
 
-
         #get BDA Text Data
         log.info(f"Opening Output BDA Texts Json File to access the BDA pre-processed data={ str_bda_text_json_filename}")
         str_bda_text_json_filename = f"{bda_text_output_folder}{str_bda_text_json_filename}"
@@ -110,18 +111,40 @@ async def invoke_rag_process():
         all_json_data = texts_data + images_data + table_data + json_files_table
         log.info(f"Total number of documents before splitting: {len(all_json_data)}")
 
+        # Keep a lead-in line ending in ":" together with the list under it.
+        all_json_data = merge_lead_in_lists(all_json_data)
         # If the contract has a glossary/definitions section, make it one chunk per term
         # (metadata section_type="definition", term=...). No glossary: nothing changes.
         all_json_data = tag_definitions(all_json_data)
         definition_count = sum(1 for doc in all_json_data
                                if doc.get("metadata", {}).get("section_type") == "definition")
-        log.info(f"Contract definitions found: {definition_count}")
+        log.info(f"Documents after merging lists: {len(all_json_data)}; contract definitions found: {definition_count}")
+
+        '''
+        for filename in os.listdir(strOutPutExcelJsonFolderPreProcess):
+            if filename.endswith(".json"):
+                file_path = os.path.join(strOutPutExcelJsonFolderPreProcess, filename)
+                log.info("Processing file Excel Json Files " + file_path)
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if data:
+                        flat_data = flatten_json(data)
+                        valid_items = [item for item in flat_data if isinstance(item, dict) and item.get("text")]
+                        json_files_table.extend(valid_items)
+                log.info(f"Processed: {filename}")
+        
+        log.info(f"Total valid JSON entries: {len(json_files_table)}")
+        
+        # Combine all JSON data (texts, images, and excel files)
+        all_json_data = texts_data + images_data + json_files_table
+        log.info(f"Total number of documents before splitting: {len(all_json_data)}")
+        '''
 
         # Initialize text splitter
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1024,
-            chunk_overlap=30,
-            length_function=len,
+            # whole sentences/words, never mid-word          
+            chunk_overlap=30,        
             is_separator_regex=False,
         )
 
@@ -139,7 +162,6 @@ async def invoke_rag_process():
                 text_content = doc.get('text', "")
                 # Split the text content into chunks
                 text_chunks = text_splitter.split_text(text_content)
-
                 # Create a new JSON entry for each chunk
                 for idx, chunk in enumerate(text_chunks):
                     split_entry = {
@@ -149,6 +171,10 @@ async def invoke_rag_process():
                         }
                     }
                     split_docs.append(split_entry)
+            elif element_type == "TABLE":
+                # Large tables: whole rows, header repeated, padding removed.
+                for chunk in split_table(doc.get('text', ""), chunk_size=8000, chunk_overlap=0):
+                    split_docs.append({"text": chunk, "metadata": {**metadata}})
             else:
                 split_docs.append(doc)
 
@@ -177,6 +203,8 @@ async def invoke_rag_process():
         bootlretval = False
         
         if chroma_db_or_pg_vector == "CHROMADB":
+            # SSSS
+            #bootlretval = process_chroma_db(bedrock_runtime, split_docs)
             log.info(f" After calling ProcessChromaDB. Returning bootlretval={bootlretval}")
         else:
             # SSSS
