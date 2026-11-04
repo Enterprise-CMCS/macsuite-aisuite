@@ -144,11 +144,11 @@ def invoke_image_analysis_batch(image_strings):
     return asyncio.run(run_batch())
 
 
-def image_text_organization(data, elements, image_analysis_text, source_key,  doc_id, printed_pages=None):
+def image_text_organization(data, elements, image_analysis_text, source_key,  doc_name, printed_pages=None):
     log.debug("***************** Parsed_Images.image_text_organization start *****************************")
     log.debug(f"Passed (Decoded)image_analysis_text =  {image_analysis_text}".encode('cp1252', errors='ignore').decode('cp1252'))
-    log.debug(f"Passed (Decoded) source_key= {source_key}.encode('cp1252', errors='ignore').decode('cp1252')")
-    log.debug(f"Passed (Decoded) doc_id={doc_id}.encode('cp1252', errors='ignore').decode('cp1252')")
+    log.debug(f"Passed (Decoded) source_key= {source_key}".encode('cp1252', errors='ignore').decode('cp1252'))
+    log.debug(f"Passed (Decoded) doc_name={doc_name}".encode('cp1252', errors='ignore').decode('cp1252'))
     summary = elements.get("summary","")
     content_markdown = elements.get("representation",{}).get("markdown",None)
     if image_analysis_text:
@@ -166,9 +166,9 @@ def image_text_organization(data, elements, image_analysis_text, source_key,  do
     reading_order = elements.get("reading_order",float("inf"))
     images = {
         "text" : content,
-        "doc_id": f"{doc_id}::Order{reading_order}",
+        "doc_id": f"{doc_name}::Order{reading_order}",
         "metadata":{
-            "doc_name":doc_id,
+            "doc_id":doc_name,
             "page":page_number,
             "printed_page": (printed_pages or {}).get(page_number, ""),
             "element_type": "IMAGE",
@@ -186,9 +186,9 @@ def parsed_image_info(source_data):
     # Images are collected here first and then sent to Bedrock together, so the calls run concurrently.
     pending_analysis_items = []
     source_key = source_data.get("metadata", {}).get("s3_key")
-    log.debug(f"s3_akey from data. source_key={source_key}")
-    doc_id = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-    log.debug(f"Getting doc_id={doc_id}")
+    log.debug(f"s3_key from data. source_key={source_key}")
+    doc_name = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0].replace(" ", "_")
+    log.debug(f"Getting doc_name={doc_name}")
 
     printed_pages = printed_page_map(source_data.get("elements"))
 
@@ -196,6 +196,8 @@ def parsed_image_info(source_data):
         element_type = elements.get("type")
         if element_type == "FIGURE":
             sub_type = elements.get("sub_type")
+            if sub_type == "LOGO":
+                continue
             if sub_type in ["DIAGRAM","IMAGE","CHART"]:
                 #log.debug(f"Element type = {element_type} Sub element type ={sub_type}")
                 s3_keys = elements.get("crop_images")
@@ -217,7 +219,7 @@ def parsed_image_info(source_data):
                 continue
 
             image_analysis_text = ''
-            other_subtype_document = image_text_organization(source_data,elements,image_analysis_text,source_key,doc_id,printed_pages)
+            other_subtype_document = image_text_organization(source_data,elements,image_analysis_text,source_key,doc_name,printed_pages)
             total_images_analysed = total_images_analysed + 1
             image_data += [other_subtype_document]
 
@@ -227,7 +229,7 @@ def parsed_image_info(source_data):
         image_analysis_texts = image_batch_processing(image_strings)
 
         for (record_index, elements, str_encoded), image_analysis_text in zip(pending_analysis_items, image_analysis_texts):
-            image_data_temp = image_text_organization(source_data, elements, image_analysis_text, source_key, doc_id, printed_pages)
+            image_data_temp = image_text_organization(source_data, elements, image_analysis_text, source_key, doc_name, printed_pages)
             image_data[record_index] = image_data_temp
             total_images_analysed = total_images_analysed + 1
 

@@ -73,6 +73,11 @@ class Helper:
         return Helper.validate_embeddings_table_name(name.strip())
 
     @staticmethod
+    def get_common_embeddings_table_name(config_file='aws.properties.ini'):
+        config = Helper.load_config(config_file)
+        return contract_cfg.common_embeddings_table_name(config)
+
+    @staticmethod
     def get_property(str_property_name, config_file='aws.properties.ini', default=_RAISE_IF_MISSING):
         env_value = Helper.get_env_property(str_property_name)
         if env_value:
@@ -154,17 +159,17 @@ class Helper:
             str_summary_folder += '/'
 
         if str_file_name == "TEXT":
-            str_summary_file = os.path.join(str_summary_folder, "Text_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Text_SummaryFile.log"
         elif str_file_name == "TABLE":
-            str_summary_file = os.path.join(str_summary_folder, "Table_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Table_SummaryFile.log"
         elif str_file_name == "IMAGE":
-            str_summary_file = os.path.join(str_summary_folder, "Image_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Image_SummaryFile.log"
         elif str_file_name == "EXCELTABLE":
-            str_summary_file = os.path.join(str_summary_folder, "ExcelTable_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}ExcelTable_SummaryFile.log"
         elif str_file_name == "BEDROCK":
-            str_summary_file = os.path.join(str_summary_folder, "Bedrock_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Bedrock_SummaryFile.log"
         else:
-            str_summary_file = os.path.join(str_summary_folder, "Unknown_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Unknown_SummaryFile.log"
         s3_client = aws_client('s3')
 
         try:
