@@ -270,13 +270,8 @@ def invoke_parsed_text_data(source_key):
         for data in parsed_data:
             text_data.extend(parsed_text_info(data))
 
-<<<<<<< HEAD
         text_chunks = chunk_text_docs(text_data)
         bda_text_output_filename = per_doc_output_key(source_key, "text")
-=======
-        bda_text_output_filename = os.path.join(bda_text_output_folder, bda_text_output_filename)
-        log.debug(f"Output Text File Name={bda_text_output_filename}")
->>>>>>> feature/regulatory-reference-decision-agent
 
         log.debug(
             f"invoke_parsed_text_data() Split {len(text_data)} parsed document(s) into {len(text_chunks)} chunk(s). Name of Output Text File Name={bda_text_output_filename}")
