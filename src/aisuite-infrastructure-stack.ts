@@ -6,6 +6,10 @@ import { AppIamConstruct } from "./constructs/app-iam-construct";
 import { ComputeConstruct } from "./constructs/compute-construct";
 import { DatabaseConstruct } from "./constructs/database-construct";
 import { EmbeddingsLambdaConstruct } from "./constructs/embeddings-lambda-construct";
+import {
+  IngestWorkflowConstruct,
+  MANIFEST_RUN_PREFIXES,
+} from "./constructs/ingest-workflow-construct";
 import { NetworkingConstruct } from "./constructs/networking-construct";
 import { PreProcessingLambdaConstruct } from "./constructs/pre-processing-lambda-construct";
 import { SecretsConstruct } from "./constructs/secrets-construct";
@@ -53,14 +57,6 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
       dbSecret: database.appDbSecret,
     });
 
-    const compute = new ComputeConstruct(this, "Compute", {
-      appSecurityGroup: networking.appSecurityGroup,
-      dbSecret: database.appDbSecret,
-      deploymentConfig,
-      taskRole: appIam.taskRole,
-      vpc: networking.vpc,
-    });
-
     const preProcessing = new PreProcessingLambdaConstruct(
       this,
       "PreProcessingLambda",
@@ -81,6 +77,38 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
       postProcessingBucket: storage.postProcessingBucket,
       vpc: networking.vpc,
     });
+
+    const compute = new ComputeConstruct(this, "Compute", {
+      appSecurityGroup: networking.appSecurityGroup,
+      dbSecret: database.appDbSecret,
+      deploymentConfig,
+      documentsBucket: storage.documentsBucket,
+      pipelineTempBucket: storage.pipelineTempBucket,
+      taskRole: appIam.taskRole,
+      vpc: networking.vpc,
+    });
+
+    const ingestWorkflow = new IngestWorkflowConstruct(this, "IngestWorkflow", {
+      cluster: compute.cluster,
+      deploymentConfig,
+      embeddingsFunction: embeddings.function,
+      preProcessingFunction: preProcessing.function,
+      reviewContainer: compute.reviewContainer,
+      reviewSecurityGroup: networking.appSecurityGroup,
+      reviewTaskDefinition: compute.reviewTaskDefinition,
+    });
+    compute.apiContainer.addEnvironment(
+      "INGEST_STATE_MACHINE_ARN",
+      ingestWorkflow.stateMachine.stateMachineArn,
+    );
+
+    // Shared by the manifest API and the requirement review task.
+    storage.documentsBucket.grantRead(appIam.taskRole);
+    for (const prefix of MANIFEST_RUN_PREFIXES) {
+      storage.pipelineTempBucket.grantReadWrite(appIam.taskRole, `${prefix}*`);
+    }
+    ingestWorkflow.stateMachine.grantStartExecution(appIam.taskRole);
+    ingestWorkflow.stateMachine.grantRead(appIam.taskRole);
 
     new cdk.CfnOutput(this, "DeploymentEnvironment", {
       description: "AISuite deployment environment represented by this stack.",
@@ -132,18 +160,49 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, "PreProcessingFunctionName", {
       description:
-        "Lambda triggered by each PDF/DOCX uploaded to the documents bucket; writes RAG_Output/ JSON.",
+        "Lambda the manifest workflow invokes per document; writes RAG_Output/ JSON.",
       value: preProcessing.function.functionName,
     });
 
     new cdk.CfnOutput(this, "EmbeddingsFunctionName", {
       description:
-        "Lambda triggered by each RAG_Output/ JSON written to the post-processing bucket; stores embeddings.",
+        "Lambda the manifest workflow invokes to build the versioned per-state embeddings table.",
       value: embeddings.function.functionName,
     });
 
+    new cdk.CfnOutput(this, "IngestStateMachineArn", {
+      description:
+        "Step Functions state machine running a manifest: pre-processing, embeddings, requirement review and MuleSoft notification.",
+      value: ingestWorkflow.stateMachine.stateMachineArn,
+    });
+
+    new cdk.CfnOutput(this, "RequirementReviewTaskDefinitionArn", {
+      description:
+        "Fargate task definition the manifest workflow runs to review legal requirements.",
+      value: compute.reviewTaskDefinition.taskDefinitionArn,
+    });
+
+    new cdk.CfnOutput(this, "ManifestNotificationQueueUrl", {
+      description:
+        "SQS queue MuleSoft polls for COMPLETED/FAILED manifest run notifications.",
+      value: ingestWorkflow.notificationQueue.queueUrl,
+    });
+
+    new cdk.CfnOutput(this, "ManifestNotificationQueueArn", {
+      description:
+        "ARN of the manifest notification queue, for granting MuleSoft consume access.",
+      value: ingestWorkflow.notificationQueue.queueArn,
+    });
+
+    new cdk.CfnOutput(this, "ManifestNotificationDeadLetterQueueUrl", {
+      description:
+        "Dead-letter queue for manifest notifications MuleSoft failed to process.",
+      value: ingestWorkflow.notificationDeadLetterQueue.queueUrl,
+    });
+
     new cdk.CfnOutput(this, "AppTaskRoleArn", {
-      description: "ECS task role for the AISuite RAG search API.",
+      description:
+        "ECS task role shared by the RAG API and the requirement review task.",
       value: appIam.taskRole.roleArn,
     });
 

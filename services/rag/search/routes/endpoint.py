@@ -11,6 +11,7 @@ from common.utils.contract_config import validate_embeddings_table_name
 from common.utils.helper import Helper
 from data_embeddings_storage.database.connection import get_connection, release_connection
 from search.database_searching.agents import answer_question_formatted, build_deps
+from search.routes import manifest_api
 
 logger = structlog.get_logger(__name__)
 # Keyed by embeddings table name, so one running process can answer against
@@ -18,11 +19,12 @@ logger = structlog.get_logger(__name__)
 # AgentRequest.contract. process_agent_query() always resolves to a concrete
 # table name (never None) before this cache is touched.
 _deps_by_table = {}
-# Cached at first use. The INI only declares a handful of [contract:...]
-# sections, but bootstrap pre-creates (and older runs have left behind) many
-# more embeddings_* tables than that - the database itself, not the INI, is
+# Cached at first use and refreshed on a miss. The INI only declares a handful
+# of [contract:...] sections, but bootstrap pre-creates (and every manifest run
+# adds a versioned) embeddings_* table - the database itself, not the INI, is
 # the authoritative set of contracts a request is allowed to select.
 _known_table_names = None
+
 
 class AgentRequest(BaseModel):
     """Request model for agent endpoint."""
@@ -58,6 +60,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+manifest_api.install(app)
 
 
 @app.get("/", tags=["Info"])
@@ -70,6 +73,9 @@ async def root():
         "model": os.environ.get('BEDROCK_MODEL_ID', 'amazon.nova-pro-v1:0'),
         "endpoints": [
             {"path": "/agent", "methods": ["GET", "POST"], "description": "AI agent endpoint"},
+            {"path": "/manifest", "methods": ["POST"], "description": "Validate a MuleSoft manifest and start the review workflow"},
+            {"path": "/manifest/{requestKey}", "methods": ["GET"], "description": "Manifest workflow status"},
+            {"path": "/manifest/{requestKey}/results", "methods": ["GET"], "description": "Reviewed legal requirements"},
             {"path": "/contracts", "methods": ["GET"], "description": "Configured embeddings tables and the default"},
             {"path": "/health", "methods": ["GET"], "description": "Health check"},
             {"path": "/docs", "methods": ["GET"], "description": "Interactive API docs"}
@@ -90,9 +96,9 @@ async def health_check():
     return {"status": "healthy", "service": "agentic-rag-api", "version": "2.0.0"}
 
 
-async def _valid_table_names():
+async def _valid_table_names(refresh=False):
     global _known_table_names
-    if _known_table_names is None:
+    if _known_table_names is None or refresh:
         connection = await get_connection()
         try:
             rows = await connection.fetch(
@@ -112,7 +118,7 @@ async def list_contracts():
     `contract` explicitly rather than relying on this default - see
     AgentRequest.contract."""
     return {
-        "contracts": sorted(await _valid_table_names()),
+        "contracts": sorted(await _valid_table_names(refresh=True)),
         "default": Helper.get_embeddings_table_name(),
     }
 
@@ -135,7 +141,8 @@ async def process_agent_query(query: str, contract: Optional[str] = None) -> Age
             # resolve internally, so the response can say which table actually
             # answered instead of leaving that implicit.
             table_name = Helper.get_embeddings_table_name()
-        elif table_name not in await _valid_table_names():
+        elif (table_name not in await _valid_table_names()
+              and table_name not in await _valid_table_names(refresh=True)):
             # Inside try: a DB hiccup while checking membership (not "unknown
             # contract" itself, which still raises 400 below) should land in
             # the same graceful AgentResponse(success=False) path every other

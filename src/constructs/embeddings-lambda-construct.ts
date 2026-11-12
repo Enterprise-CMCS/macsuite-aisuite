@@ -3,6 +3,7 @@ import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecr_assets from "aws-cdk-lib/aws-ecr-assets";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as logs from "aws-cdk-lib/aws-logs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3n from "aws-cdk-lib/aws-s3-notifications";
 import type * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
@@ -11,13 +12,15 @@ import { Construct } from "constructs";
 import { APPLICATION_NAME, type DeploymentConfig } from "../deployment-config";
 import {
   BEDROCK_EMBED_MODEL_ID,
+  COMMON_EMBEDDINGS_TABLE_NAME,
+  COMMON_INPUT_PREFIX,
   INGEST_MAX_CONCURRENCY,
   INGEST_TIMEOUT,
   RAG_SERVICE_DIR,
 } from "./pre-processing-lambda-construct";
 
-// Pre-processing writes one combined JSON per source file here (bda_results.RAG_OUTPUT_PREFIX).
 export const RAG_OUTPUT_PREFIX = "RAG_Output/";
+export const COMMON_RAG_OUTPUT_PREFIX = `${RAG_OUTPUT_PREFIX}${COMMON_INPUT_PREFIX}`;
 
 export interface EmbeddingsLambdaConstructProps {
   appSecurityGroup: ec2.ISecurityGroup;
@@ -37,8 +40,16 @@ export class EmbeddingsLambdaConstruct extends Construct {
   ) {
     super(scope, id);
 
-    const { name } = props.deploymentConfig;
-    const { account, region } = cdk.Stack.of(this);
+    const { name, protectedEnvironment } = props.deploymentConfig;
+    const { account } = cdk.Stack.of(this);
+    const functionName = `${APPLICATION_NAME}-${name}-embeddings`;
+    const logGroup = new logs.LogGroup(this, "LogGroup", {
+      logGroupName: `/aws/lambda/${functionName}`,
+      removalPolicy: protectedEnvironment
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+      retention: logs.RetentionDays.ONE_MONTH,
+    });
 
     this.function = new lambda.DockerImageFunction(this, "Function", {
       architecture: lambda.Architecture.ARM_64,
@@ -48,13 +59,16 @@ export class EmbeddingsLambdaConstruct extends Construct {
         platform: ecr_assets.Platform.LINUX_ARM64,
       }),
       description:
-        "Runs RAG embeddings to RDS postgres vector DB",
+        "Allocates, fills and publishes the versioned per-state embeddings table in RDS PostgreSQL; invoked by the manifest workflow.",
       environment: {
         BEDROCK_EMBED_MODEL_ID,
+        COMMON_EMBEDDINGS_TABLE_NAME,
+        COMMON_INPUT_PREFIX,
         DB_SECRET_ARN: props.dbSecret.secretArn,
         POST_PROCESSING_BUCKET: props.postProcessingBucket.bucketName,
       },
-      functionName: `${APPLICATION_NAME}-${name}-embeddings`,
+      functionName,
+      logGroup,
       memorySize: 2048,
       reservedConcurrentExecutions: INGEST_MAX_CONCURRENCY,
       securityGroups: [props.appSecurityGroup],
@@ -78,11 +92,10 @@ export class EmbeddingsLambdaConstruct extends Construct {
       }),
     );
 
-    // Only RAG_Output/ JSON triggers embeddings; the other BDA outputs in this bucket do not.
     props.postProcessingBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
       new s3n.LambdaDestination(this.function),
-      { prefix: RAG_OUTPUT_PREFIX, suffix: ".json" },
+      { prefix: COMMON_RAG_OUTPUT_PREFIX, suffix: ".json" },
     );
   }
 }

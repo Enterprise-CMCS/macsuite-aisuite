@@ -9,7 +9,7 @@ import { EmbeddingsLambdaConstruct } from "../src/constructs/embeddings-lambda-c
 import { getDeploymentConfig } from "../src/deployment-config";
 
 describe("EmbeddingsLambdaConstruct", () => {
-  it("runs as a standard VPC Lambda invoked once per RAG_Output JSON", () => {
+  it("runs as a standard VPC Lambda invoked only by the manifest workflow", () => {
     const app = new cdk.App();
     const deploymentConfig = getDeploymentConfig("prod");
     const stack = new cdk.Stack(app, "EmbeddingsTestStack", {
@@ -37,6 +37,14 @@ describe("EmbeddingsLambdaConstruct", () => {
       Timeout: 900,
       VpcConfig: Match.objectLike({ SubnetIds: Match.anyValue() }),
     });
+    template.hasResource("AWS::Logs::LogGroup", {
+      DeletionPolicy: "Retain",
+      Properties: {
+        LogGroupName: "/aws/lambda/aisuite-prod-embeddings",
+        RetentionInDays: 30,
+      },
+    });
+    template.resourceCountIs("Custom::S3BucketNotifications", 1);
     template.hasResourceProperties("Custom::S3BucketNotifications", {
       NotificationConfiguration: {
         LambdaFunctionConfigurations: [
@@ -46,17 +54,13 @@ describe("EmbeddingsLambdaConstruct", () => {
               Key: {
                 FilterRules: [
                   { Name: "suffix", Value: ".json" },
-                  { Name: "prefix", Value: "RAG_Output/" },
+                  { Name: "prefix", Value: "RAG_Output/common/" },
                 ],
               },
             },
           }),
         ],
       },
-    });
-    template.hasResourceProperties("AWS::Lambda::Permission", {
-      Action: "lambda:InvokeFunction",
-      Principal: "s3.amazonaws.com",
     });
     template.resourceCountIs("AWS::Events::Rule", 0);
   });

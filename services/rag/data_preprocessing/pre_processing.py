@@ -1,3 +1,4 @@
+from common.utils.manifest import SUPPORTED_DOCUMENT_EXTENSIONS
 from common.utils.helper import Helper
 from common.utils.aws_files_access import object_keys
 from data_preprocessing.bedrock import bedrock_BDA as bda
@@ -5,8 +6,6 @@ from data_preprocessing.bedrock.bda_results import OUTPUT_FOLDERS, per_doc_outpu
 from data_preprocessing.parsing import parsed_images
 from data_preprocessing.parsing import parsed_text_data
 from data_preprocessing.parsing import parsed_bda_table
-
-SUPPORTED_EXTENSIONS = (".pdf", ".docx")
 
 
 def process(source_key):
@@ -61,7 +60,7 @@ def merge_outputs_to_rag_output(source_key):
 def handler(event, context=None):
     rag_outputs = []
     for key in object_keys(event):
-        if not key.lower().endswith(SUPPORTED_EXTENSIONS):
+        if not key.lower().endswith(SUPPORTED_DOCUMENT_EXTENSIONS):
             continue
         process(key)
         rag_outputs.append(merge_outputs_to_rag_output(key))

@@ -51,6 +51,9 @@ def resolve_active_contract_section(config):
         if config.getboolean(section, "active", fallback=False)
     ]
     if len(active_sections) == 0:
+        state_sections = [s for s in sections if s != COMMON_CONTRACT_SECTION]
+        if not state_sections:
+            return None
         raise ValueError(
             "No active contract section: set active = true on exactly one "
             f"[contract:…] section (found: {sections})."
@@ -61,6 +64,13 @@ def resolve_active_contract_section(config):
             f"{active_sections}; only one may have active = true."
         )
     return active_sections[0]
+
+
+def normalize_s3_prefix(prefix):
+    if prefix is None:
+        return None
+    cleaned = str(prefix).strip().strip("/")
+    return f"{cleaned}/" if cleaned else None
 
 
 def validate_embeddings_table_name(table_name):
@@ -82,15 +92,34 @@ def get_config_property(config, str_property_name, *, default=None, raise_if_mis
         return default
     raise KeyError(str_property_name)
 
+
+def common_input_prefix(config, section=COMMON_CONTRACT_SECTION):
+    """The S3 prefix for shared common-table documents, normalized with a trailing slash."""
+    if config.has_section(section) and config.has_option(section, "input_prefix"):
+        prefix = normalize_s3_prefix(config.get(section, "input_prefix"))
+        if prefix:
+            return prefix
+    if config.has_option("default", "common_input_prefix"):
+        return normalize_s3_prefix(config.get("default", "common_input_prefix"))
+    return None
+
+
 def common_embeddings_table_name(config, section=COMMON_CONTRACT_SECTION):
     """The shared-knowledge-base table name, or None if that section isn't configured.
 
-    Read directly off `section` rather than through active-contract resolution,
-    since this table needs to be consulted regardless of which contract is active.
+    Read directly off `section` (or `[default] common_embeddings_table_name`) rather than
+    through active-contract resolution, since this table is fixed and consulted across
+    every state contract review.
     """
-    if not config.has_section(section) or not config.has_option(section, "embeddings_table_name"):
-        return None
-    return validate_embeddings_table_name(config.get(section, "embeddings_table_name").strip())
+    if config.has_section(section) and config.has_option(section, "embeddings_table_name"):
+        raw = config.get(section, "embeddings_table_name").strip()
+        if raw:
+            return validate_embeddings_table_name(raw)
+    if config.has_option("default", "common_embeddings_table_name"):
+        raw = config.get("default", "common_embeddings_table_name").strip()
+        if raw:
+            return validate_embeddings_table_name(raw)
+    return None
 
 def list_embeddings_table_names_from_config(config):
     names = []

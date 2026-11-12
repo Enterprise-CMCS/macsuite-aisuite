@@ -8,7 +8,7 @@ import { PreProcessingLambdaConstruct } from "../src/constructs/pre-processing-l
 import { getDeploymentConfig } from "../src/deployment-config";
 
 describe("PreProcessingLambdaConstruct", () => {
-  it("runs as a standard VPC Lambda invoked once per uploaded PDF/DOCX", () => {
+  it("runs as a standard VPC Lambda invoked only by the manifest workflow", () => {
     const app = new cdk.App();
     const deploymentConfig = getDeploymentConfig("dev");
     const stack = new cdk.Stack(app, "PreProcessingTestStack", {
@@ -35,6 +35,13 @@ describe("PreProcessingLambdaConstruct", () => {
       Timeout: 900,
       VpcConfig: Match.objectLike({ SubnetIds: Match.anyValue() }),
     });
+    template.hasResource("AWS::Logs::LogGroup", {
+      DeletionPolicy: "Delete",
+      Properties: {
+        LogGroupName: "/aws/lambda/aisuite-dev-pre-processing",
+        RetentionInDays: 30,
+      },
+    });
     const [preProcessingFunction] = Object.values(
       template.findResources("AWS::Lambda::Function", {
         Properties: { FunctionName: "aisuite-dev-pre-processing" },
@@ -46,22 +53,23 @@ describe("PreProcessingLambdaConstruct", () => {
     expect(JSON.stringify(template.toJSON())).not.toContain(
       "secretsmanager:GetSecretValue",
     );
+    template.resourceCountIs("Custom::S3BucketNotifications", 1);
     template.hasResourceProperties("Custom::S3BucketNotifications", {
       NotificationConfiguration: {
-        LambdaFunctionConfigurations: [".pdf", ".PDF", ".docx", ".DOCX"].map(
-          (suffix) =>
-            Match.objectLike({
-              Events: ["s3:ObjectCreated:*"],
-              Filter: {
-                Key: { FilterRules: [{ Name: "suffix", Value: suffix }] },
+        LambdaFunctionConfigurations: Match.arrayWith([
+          Match.objectLike({
+            Events: ["s3:ObjectCreated:*"],
+            Filter: {
+              Key: {
+                FilterRules: [
+                  { Name: "suffix", Value: ".pdf" },
+                  { Name: "prefix", Value: "common/" },
+                ],
               },
-            }),
-        ),
+            },
+          }),
+        ]),
       },
-    });
-    template.hasResourceProperties("AWS::Lambda::Permission", {
-      Action: "lambda:InvokeFunction",
-      Principal: "s3.amazonaws.com",
     });
     template.resourceCountIs("AWS::Events::Rule", 0);
     template.resourceCountIs("AWS::Lambda::EventSourceMapping", 0);

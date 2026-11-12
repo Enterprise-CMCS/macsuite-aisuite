@@ -20,6 +20,8 @@ class Helper:
         "model_id_bedrock_profile_embed": ("BEDROCK_EMBED_MODEL_ID",),
         "model_id_bedrock_embeddings": ("BEDROCK_EMBED_MODEL_ID",),
         "embeddings_table_name": ("EMBEDDINGS_TABLE_NAME",),
+        "common_input_prefix": ("COMMON_INPUT_PREFIX",),
+        "common_embeddings_table_name": ("COMMON_EMBEDDINGS_TABLE_NAME",),
     }
 
     @staticmethod
@@ -74,8 +76,19 @@ class Helper:
 
     @staticmethod
     def get_common_embeddings_table_name(config_file='aws.properties.ini'):
+        env_value = Helper.get_env_property("common_embeddings_table_name")
+        if env_value:
+            return contract_cfg.validate_embeddings_table_name(env_value)
         config = Helper.load_config(config_file)
         return contract_cfg.common_embeddings_table_name(config)
+
+    @staticmethod
+    def get_common_input_prefix(config_file='aws.properties.ini'):
+        env_value = Helper.get_env_property("common_input_prefix")
+        if env_value:
+            return contract_cfg.normalize_s3_prefix(env_value)
+        config = Helper.load_config(config_file)
+        return contract_cfg.common_input_prefix(config)
 
     @staticmethod
     def get_property(str_property_name, config_file='aws.properties.ini', default=_RAISE_IF_MISSING):

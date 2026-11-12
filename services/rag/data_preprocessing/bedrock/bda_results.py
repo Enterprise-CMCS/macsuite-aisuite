@@ -14,30 +14,22 @@ OUTPUT_FOLDERS = {"text": "BDATextOutput", "table": "BDATableOutput", "image": "
 
 
 def output_root(key):
-    """Output location derived from the folder the file was dropped in.
-
-    NE/a.pdf -> NE_bdaoutput/ ; state_of_TN/Contract/a.pdf -> state_of_TN_bdaoutput/Contract/
-    """
     parts = [part for part in os.path.dirname(key).split("/") if part] or ["root"]
     return "/".join([f"{parts[0]}_bdaoutput", *parts[1:]]) + "/"
 
 
 def bda_output_prefix(key):
-    """Where BDA writes the raw output of every file in the same folder as key."""
     return f"{output_root(key)}bdaoutput/"
 
 
 def doc_output_prefix(key):
-    """BDA output prefix of a single source file, with a trailing slash so a.pdf never matches a_b.pdf."""
     return f"{bda_output_prefix(key)}{doc_name_for_key(key)}/"
 
 
 def per_doc_output_key(key, kind):
-    """<root>/BDA<Kind>Output/<file name>-preprocessed-<kind>.json, where kind is text, table or image."""
     return f"{output_root(key)}{OUTPUT_FOLDERS[kind]}/{doc_name_for_key(key)}-preprocessed-{kind}.json"
 
 
-# Combined text, table and image output of each file; writing it here triggers the embeddings Lambda.
 RAG_OUTPUT_PREFIX = "RAG_Output/"
 
 
@@ -51,9 +43,6 @@ class BDAResults:
 
         pass
 
-    """Look for object in list_objects_v2
-        Get paginator for given bucket and Prefix
-        Gets Body of files ending with result.json and creates Array of it and return to Callin function"""
 
     def fetch_parsed_bda_results(self, bucket, output_prefix,awsPClientS3, calledFrom=""):
         log.info(f"*********Bda_Parsed_file_Access.fetch_parsed_bda_results start ******************** called with bucket={bucket}, output_prefix={output_prefix}")

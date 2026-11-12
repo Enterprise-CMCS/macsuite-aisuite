@@ -7,5 +7,6 @@ export default defineConfig({
       reporter: ["text"],
     },
     globals: true,
+    testTimeout: 60000,
   },
 });

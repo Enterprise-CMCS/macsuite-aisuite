@@ -6,11 +6,32 @@ from common.utils.logger import log
 
 
 def object_keys(event):
-    
+    if not isinstance(event, dict):
+        return []
+
     keys = []
     for record in event.get("Records", []):
         if "s3" in record:
             keys.append(unquote_plus(record["s3"]["object"]["key"]))
+
+    for doc in event.get("documents", []):
+        if isinstance(doc, dict) and isinstance(doc.get("s3"), dict):
+            path = doc["s3"].get("path") or doc["s3"].get("key")
+            if path:
+                keys.append(unquote_plus(path))
+
+    if isinstance(event.get("s3"), dict):
+        path = event["s3"].get("path") or event["s3"].get("key")
+        if path:
+            keys.append(unquote_plus(path))
+
+    for rag_key in event.get("rag_output", []):
+        if isinstance(rag_key, str) and rag_key:
+            keys.append(rag_key)
+
+    if isinstance(event.get("key"), str) and event["key"]:
+        keys.append(unquote_plus(event["key"]))
+
     return keys
 
 

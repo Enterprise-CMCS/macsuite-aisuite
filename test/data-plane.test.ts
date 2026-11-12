@@ -27,6 +27,11 @@ const EXPECTED_OUTPUTS = [
   "ApiEcrRepositoryUri",
   "PreProcessingFunctionName",
   "EmbeddingsFunctionName",
+  "IngestStateMachineArn",
+  "RequirementReviewTaskDefinitionArn",
+  "ManifestNotificationQueueUrl",
+  "ManifestNotificationQueueArn",
+  "ManifestNotificationDeadLetterQueueUrl",
 ] as const;
 
 const DATA_RESOURCES = new Set([
