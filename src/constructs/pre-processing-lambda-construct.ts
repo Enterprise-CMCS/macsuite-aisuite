@@ -11,7 +11,7 @@ import { Construct } from "constructs";
 
 import { APPLICATION_NAME, type DeploymentConfig } from "../deployment-config";
 
-export const BEDROCK_MODEL_ID = "us.amazon.nova-pro-v1:0";
+export const BEDROCK_MODEL_ID = "us.amazon.nova-2-lite-v1:0";
 export const BEDROCK_EMBED_MODEL_ID = "us.cohere.embed-v4:0";
 export const RAG_SERVICE_DIR = path.resolve(process.cwd(), "services", "rag");
 
@@ -79,7 +79,7 @@ export class PreProcessingLambdaConstruct extends Construct {
       new iam.PolicyStatement({
         actions: ["bedrock:InvokeModel"],
         resources: [
-          "arn:aws:bedrock:*::foundation-model/amazon.nova-pro-v1:0",
+          "arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0",
           "arn:aws:bedrock:*::foundation-model/cohere.embed-v4:0",
           `arn:aws:bedrock:*:${account}:inference-profile/${BEDROCK_MODEL_ID}`,
           `arn:aws:bedrock:*:${account}:inference-profile/${BEDROCK_EMBED_MODEL_ID}`,

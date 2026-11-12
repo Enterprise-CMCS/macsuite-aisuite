@@ -31,7 +31,7 @@ export const API_IMAGE_TAG_CONTEXT_KEY = "aisuite:apiImageTag";
 
 const DEFAULT_API_IMAGE_TAG = "latest";
 
-const BEDROCK_MODEL_ID = "us.amazon.nova-pro-v1:0";
+const BEDROCK_MODEL_ID = "us.amazon.nova-2-lite-v1:0";
 const BEDROCK_EMBED_MODEL_ID = "us.cohere.embed-v4:0";
 
 const TASK_SIZE_BY_ENVIRONMENT = {
