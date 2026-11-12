@@ -41,11 +41,15 @@ flowchart LR
    `RAG_Output/` in the post-processing bucket.
 2. **RAG process** runs once for each `RAG_Output/` JSON. It embeds every item
    with Bedrock and stores the vectors in that file’s `emb_<file>` table.
-3. **API** answers natural-language questions via search over that table and a
-   Bedrock foundation model.
+3. **API** answers a natural-language question by running it through the same
+   two-stage review as a workbook requirement, against the contract table the
+   request names.
 4. **Contract review** runs the requirements in a CMS Contract Review Tool
-   workbook through the same retrieval and writes the findings back into the
+   workbook through the two-stage review and writes the findings back into the
    workbook.
+
+The foundation model is Amazon Nova 2 Lite (`us.amazon.nova-2-lite-v1:0`) and
+embeddings are Cohere Embed v4 (`us.cohere.embed-v4:0`).
 
 ### Retrieval
 
@@ -59,11 +63,19 @@ contract’s embeddings table:
 | `hybrid_search` | Both of the above in one round trip, fused with reciprocal rank fusion |
 | `reranked_search` | `hybrid_search` for recall, then Cohere rerank for precision — available but not wired into the agents |
 
-Hybrid is what the agents call, for both contract review and the query API.
-Vector search alone misses exact contract vocabulary (statute cites, defined
-terms, “shall not”); full-text alone misses paraphrased requirements. RRF needs
-no score normalisation between the two, which matters because `ts_rank_cd` and
-cosine distance are not on comparable scales.
+Which strategy runs depends on what is being retrieved (`agents.py`):
+
+| Retrieval | Strategy |
+|-----------|----------|
+| Seed passages for a requirement, and every `search_contract` call | `semantic_search` |
+| Definitions (`search_definition`: the seed for a definition requirement, and every `lookup_definition` call) | `hybrid_search` on `"<term> definition"`, up to `MAX_DEFINITION_CHUNKS` (10) |
+| Regulatory reference for Stage 2 (`retrieve_reference`) | `hybrid_search` on item ID + legal cite + requirement, up to `MAX_REFERENCE_CHUNKS` (5) |
+
+Hybrid is used where exact wording matters. Vector search alone misses exact
+vocabulary (statute cites such as `438.56(c)(2)(iii)`, item IDs, defined terms);
+full-text alone misses paraphrased requirements. RRF needs no score
+normalisation between the two, which matters because `ts_rank_cd` and cosine
+distance are not on comparable scales.
 
 Every row carries a **retrieval confidence**, which is the cosine similarity
 (`1 - distance` from pgvector’s `<=>`) clamped to 0–1. `hybrid_search` scores the
@@ -73,45 +85,90 @@ model — a model told a chunk scored 0.47 hands that back as its own confidence
 which would leave the two confidence columns in the workbook saying the same
 thing twice.
 
+### Two-stage review
+
+`review_requirement()` in `search/database_searching/agents.py` reviews one
+requirement:
+
+1. **Seed retrieval.** For a "definition for the term “X”" requirement, the
+   term's definition first (`retrieve_definition`), then a semantic search on the
+   requirement text. Every chunk retrieved is recorded on `ContractDeps.chunks`.
+2. **Stage 1, Evidence Analyst.** Reads the seed passages, may call
+   `search_contract` and `lookup_definition`, and returns `Reasoning`, `Evidence`
+   (`chunk_id` + exact `quote`) and `MissingInformation`. Output that does not
+   parse as JSON gets one retry with every retrieved chunk in the prompt.
+3. **Python verification.** `build_verified_evidence()` checks every quote against
+   the retrieved text (`locate_quote`, 95% match). A real quote cited to the wrong
+   chunk is moved to the right one; an invented chunk ID is dropped.
+   `calculate_retrieval_confidence()` scores the verified evidence.
+4. **Regulatory reference.** `retrieve_reference()` pulls up to 6,000 characters of
+   42 CFR Part 438 / CMS State Guide text from the shared regulations table (see
+   [Shared regulations table](#shared-regulations-table)). It is never recorded as
+   contract evidence, so it can't be quoted as the contract.
+5. **Stage 2, Decision Analyst.** Gets the requirement, Stage 1's reasoning, only the
+   *verified* evidence, the missing information, the regulatory reference and the
+   retrieval confidence band. It returns `Recommendation` (`MET` / `UNSURE`),
+   `Response` and `DecisionConfidence` (`HIGH` / `MEDIUM` / `LOW`). It runs with Nova
+   extended thinking (`reasoningConfig`, effort `medium`, `max_tokens` 8000).
+6. **Guardrails** in Python, after Stage 2:
+   - `MET` with `LOW` decision confidence becomes `UNSURE`.
+   - `MET` with retrieval confidence under `MEDIUM_CONFIDENCE_THRESHOLD` (0.40)
+     becomes `UNSURE` with `LOW`, and the response says why.
+
+Any exception leaves the requirement `UNSURE` / `Low` with the error on
+`RequirementReview.error`, so one bad row never stops a run.
+
+### Agent harness
+
+Every model loop in a requirement review runs on the Strands SDK through
+`search/database_searching/strands_harness.py`: Stage 1 (`run_evidence`) and Stage 2
+(`run_decision`). `build_agent` uses `create_harness` with every default off: no shell, file or web
+tools, no memory, no sessions. Stage 1 gets exactly two tools, `search_contract` and
+`lookup_definition`; Stage 2 gets none. Strands runs in this process, so both tools reach pgvector
+through backends injected from `agents.py` (`run_contract_search`, `run_definition_lookup`) and the
+shared asyncpg pool. `model_provider.strands_model()` builds one `BedrockModel` per settings
+dict (Stage 1: temperature 0; Stage 2: adds reasoning) and caches it. Each run gets a new `Agent` because an agent
+keeps history and refuses concurrent calls; models are shared. Agents must be called with
+`invoke_async`, because `agent(...)` runs on another event loop, where the asyncpg pool does not
+work.
+
+Stage 1 forces the `EvidenceAnalysis` schema, which costs one extra model turn per requirement.
+A run that fails the schema twice falls back to the usual parse-and-retry path. `evidence_goal`
+(a Strands `GoalLoop`) then checks the analysis in Python and sends it back once if a quote is not
+in its chunk, a chunk was never retrieved, or a definition requirement is left unaddressed. Stage 2 returns
+plain JSON text, because it runs with Nova reasoning on.
+
 ### Retrieval policy
 
-`search_contract` only retrieves. What an agent is *allowed* to retrieve lives in
-`review_hooks`, a pydantic-ai `Hooks` capability in
-`search/database_searching/agents.py` that both searching agents register, so a
-limit only has to be right in one place.
+`search_contract` and `lookup_definition` only retrieve. What Stage 1 is *allowed* to retrieve is
+decided around them:
 
-| Hook | Policy |
+| Where | Policy |
 |------|--------|
-| `charge_search_budget` (`before_tool_execute`) | `MAX_SEARCHES` per requirement, then `ToolFailed`. A model that keeps searching instead of committing to a status is told to decide on what it has. Charged before the search runs, so a backend failure costs a search rather than letting the same error be retried forever. |
-| `retry_failed_search` (`tool_execute_error`) | A psycopg or boto error becomes `ModelRetry("try a shorter query")`. The raw exception is logged, not handed to the model, which can do nothing with it. |
+| `run_evidence_stage` raises `SearchRefused` | `MAX_SEARCHES` (3) per requirement, then the tool call fails. A model that keeps searching instead of committing to a status is told to decide on what it has. Charged before the search runs, so a backend failure costs a search rather than letting the same error be retried forever. |
+| `run_definition_lookup` raises `SearchRefused` | `MAX_DEFINITION_LOOKUPS` (2) per requirement, a budget separate from searches: the term and one equivalent. Same exact-match query as the definition seed retrieval (`search_definition`), so short glossary entries that semantic search ranks low are still found. A blank term is refused without spending the budget. Returned chunks are recorded, so quotes from them verify like any other. |
+| `call_backend` catches the exception | A database or boto error becomes "try a shorter query" (search) or "use search_contract instead" (lookup). The raw exception is logged, not handed to the model, which can do nothing with it. |
 
-`ToolFailed` rather than returning a string that says the budget is gone: the call
-did not happen, so recording it as a successful tool result misleads both the
-model and the trace. The model still sees the reason and adapts, and it costs
-nothing from the retry budget.
+A failed tool result rather than a success message that says the budget is gone: the call did
+not happen, so recording it as successful misleads both the model and the trace. The model still
+sees the reason and adapts. Stage 1's turn limit is `6 + MAX_SEARCHES + MAX_DEFINITION_LOOKUPS`;
+Stage 2 gets 5.
 
 ### Model resilience
 
-`bedrock_hooks` in `search/database_searching/model_provider.py` is a second
-capability, registered on **all four** agents — the analyst and the question agent
-alongside `review_hooks`, and the challenger and adjudicator, which have no tools
-and so need nothing else.
+`ModelErrorRetry` in `strands_harness.py` is the retry strategy on every agent. It re-sends a
+request that came back as Bedrock's 424 `ModelErrorException`, up to `MODEL_ATTEMPTS` (3) with a
+backoff (`RETRY_DELAY_SECONDS`, 4). Nova answers a tool-use turn with a malformed block often
+enough to matter: on Nova Pro, three requirements out of 667 died on *"Model produced invalid
+sequence as part of ToolUse"* in a full CRT run, each one a row a reviewer then has to do by
+hand. botocore does not retry a 4xx, reasonably, but this particular one is not the caller's
+fault, and the request that failed was fine, so the retry sends it again unchanged.
 
-Its one hook, `retry_model_error` (`wrap_model_request`), re-sends a request that
-came back as Bedrock's 424 `ModelErrorException` — up to `MODEL_ATTEMPTS` (3) with
-a linear backoff. Nova Pro answers a tool-use turn with a malformed block often
-enough to matter: three requirements out of 667 died on *"Model produced invalid
-sequence as part of ToolUse"* in a full CRT run, each one a row a reviewer then has
-to do by hand. botocore does not retry a 4xx, reasonably — but this particular one
-is not the caller's fault, and the request that failed was fine, so the retry sends
-it again unchanged.
-
-Only that status is retried. A 400, an access denial, or an expired token would
-fail identically three times over, and the run is better off surfacing it at once.
-Throttling is already handled by botocore on the shared `bedrock-runtime` client.
-Nothing changes on the normal path — a request that succeeds is not retried, so
-the hook costs a run nothing until something breaks. Whatever still fails after
-three attempts lands in `RequirementReview.error` and the Error column as before.
+Throttling is also retried (Strands' default), with up to `THROTTLE_ATTEMPTS` (6) attempts in
+total. The 424 count is kept separately, so earlier throttles cannot use up the 424 attempts.
+Nothing else is retried. A 400, an access denial, or an expired token would
+fail identically three times over, and the run is better off surfacing it at once. Whatever still
+fails lands in `RequirementReview.error` and the Error column.
 
 ### What gets embedded
 
@@ -174,16 +231,15 @@ text. Where Found keeps citation order, because it pairs line for line with the
 quotes underneath it. Each quote is headed with the document name as well as the
 page, so a reviewer knows which file to open before turning to the page.
 
-Chunk ids are never sent to the model. It used to be given them to cite with and
-wrote them into its prose — "the contract text in chunk 3566 states" — which
-means nothing to a reviewer reading the spreadsheet. `format_evidence()` in
-`search/database_searching/agents.py` heads each passage with the page and
-document only, so the model has nothing else to cite by, and `quoted_chunk()`
-matches the quote it returns back to the passage it came from. That match is also
-what `verified` means: the wording really is in the contract rather than
-something the model composed. Reviews recorded before this change still carry
-ids in their prose, so `in_reviewer_terms()` swaps them for the pages they came
-from as the workbook is written.
+Stage 1 cites by chunk ID. `format_retrieved_chunks()` in
+`search/database_searching/agents.py` heads each passage with `[chunk N]`, the
+document and the page, and `EvidenceAnalysis.Evidence` pairs each quote with the
+`chunk_id` it came from. `locate_quote()` then matches the quote back to the
+retrieved text. That match is what `verified` means: the wording really is in the
+contract rather than something the model composed. Only verified evidence reaches
+Stage 2, Where Found and the quotes in the workbook. Chunk IDs mean nothing to a
+reviewer, so `in_reviewer_terms()` swaps any "chunk 3566" in the model's prose for
+the page it came from as the workbook is written.
 
 ## Running the service
 
@@ -226,17 +282,25 @@ python -m search.routes.endpoint
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /health` | Health check |
-| `GET /agent?query=…` | Agent answer (query string) |
-| `POST /agent` | Agent answer; body `{"query": "…"}` |
+| `GET /contracts` | `embeddings*` tables that exist in `aisuite_schema`, and the default |
+| `GET /agent?query=…&contract=…` | Agent answer (query string) |
+| `POST /agent` | Agent answer; body `{"query": "…", "contract": "…"}` |
 | `GET /docs` | OpenAPI UI |
+
+`contract` is an embeddings table name, for example `embeddings_ok_1`. It is
+optional but recommended: without it the request uses the active contract's
+table from the INI (or `EMBEDDINGS_TABLE_NAME`), which can change on the next
+redeploy. A name that is not one of the tables `GET /contracts` lists is a 400.
+The response includes `contract`, the table that actually answered.
 
 Example:
 
 ```sh
-curl -s "http://127.0.0.1:8001/agent?query=What+is+coverage+for+NEMT%3F"
+curl -s "http://127.0.0.1:8001/contracts"
+curl -s "http://127.0.0.1:8001/agent?query=What+is+coverage+for+NEMT%3F&contract=embeddings_ok_1"
 curl -s -X POST "http://127.0.0.1:8001/agent" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What is coverage for NEMT?"}'
+  -d '{"query":"What is coverage for NEMT?","contract":"embeddings_ok_1"}'
 ```
 
 ### Contract review run job
@@ -248,35 +312,30 @@ Drop the CMS Contract Review Tool workbook (`.xlsm` or `.xlsx`) into
 python search/excel_process/process_excel_with_rag.py
 ```
 
-Every requirement row goes through retrieval and three agents — an analyst that
-commits to a status, a challenger that argues the opposing case over the same
-evidence, and an adjudicator that settles it. Findings are written back into the
-columns a reviewer already works from (Status, Where Found, Follow-up Required,
-General Comments), and everything that does not fit a form field — both
-confidence scores, the verified quotes with the page number each came from — goes
-onto an added **RAG Analysis** sheet keyed by sheet and row.
+Every requirement row goes through the [two-stage review](#two-stage-review): an
+evidence analyst that finds and quotes the contract text, and a decision analyst
+that makes the final call on the verified evidence, read against 42 CFR Part 438
+and the CMS State Guide. Findings are written back into the columns a reviewer
+already works from, and everything that does not fit a form field goes onto an
+added **RAG Analysis** sheet keyed by sheet and row.
 
-General Comments is ordered finding first, caveats after: `AI recommended
-status:`, the adjudicated reasoning under `AI response:`, `Page number:`, the
-confidence scores, any note about them, then the quotes. The challenger's
-counter-argument is not printed in the workbook — it is the agent's working
-rather than a finding, and a paragraph arguing against the status directly under
-it reads as though the tool is recommending both. It stays on
-`RequirementReview.counter_argument` and in the sidecar for audit.
+| Column | What is written |
+|--------|-----------------|
+| Status | `MET with <band> Confidence` or `Unsure with <band> Confidence`. The band is Stage 2's decision confidence (High / Medium / Low), falling back to the retrieval band for older sidecar rows. The MET guardrails are applied again here. |
+| Where Found | Locations of the verified evidence |
+| General Comments | `AI Reasoning:` (Stage 1), `Decision rationale:` (Stage 2), then `Cited contract text:` with the verified quotes |
 
-Two notes can follow the confidence scores. One when a quote could not be matched
-back to the retrieved text, and one when the status has **no** quotes at all —
-`retrieval_confidence` falls back to the best chunk that came back when nothing
-was cited, so an evidence-free row still prints three scores and would otherwise
-read as a supported finding. On a full CRT run 100 of 667 rows cite nothing.
+Follow-up Required is not written for now (the code is commented out in
+`write_review`); follow-up and missing information are on the RAG Analysis
+sheet, along with the page numbers, the decision, retrieval and combined
+confidence, whether quotes verified, chunks retrieved, every quote, the model
+and any error.
 
 The cell is capped at `MAX_CELL_CHARS` (4000), and quotes are dropped **whole** to
 stay under it, with a line saying how many went missing and where to find them.
 Cutting the text at an arbitrary character left the last citation ending
 mid-sentence, still wrapped in quote marks — indistinguishable from the contract
-saying exactly that. Long exceptions get the same treatment: `Automated review
-failed:` keeps the first 220 characters, which is the message and the code, and
-leaves boto's `ResponseMetadata` to the Error column.
+saying exactly that.
 
 | Flag | Effect |
 |------|--------|
@@ -284,12 +343,13 @@ leaves boto's `ResponseMetadata` to the Error column.
 | `--sheet` | Only this sheet; repeatable |
 | `--limit` | Stop after N requirements, for a smoke test |
 | `--concurrency` | Requirements in flight at once (default 4) |
-| `--no-challenge` | Analyst only, skip the challenge and adjudication |
-| `--skip-answered` | Leave rows that already have a Status alone |
+| `--skip-answered` | Leave rows that already have a Status alone. By default every visible requirement row is reviewed and overwritten, including Met / Yes / N/A and gray rows |
+| `--include-hidden` | Also review hidden rows (for example collapsed CHIP sections); skipped by default |
 | `--fresh` | Discard the sidecar and review everything again |
 | `--render-only` | Rebuild the workbook from the sidecar without reviewing |
 
-A full CRT is 667 requirements at three model calls each, so each finding is
+A full CRT is 667 requirements, each a multi-turn Stage 1 loop plus a Stage 2
+call with extended thinking, so each finding is
 appended to a `<name>.xlsm.reviewed.jsonl` sidecar as it completes. Re-running
 resumes from that sidecar rather than paying for the same rows twice. The
 reviewed workbook is saved as `<name>.reviewed.xlsm`; the uploaded file is never
@@ -305,12 +365,11 @@ sidecar does not cover are named rather than left silently blank, since a workbo
 rendering 600 of 667 requirements looks finished. It refuses to run with `--fresh`,
 which would delete the sidecar it renders from.
 
-Two things to know about the output. Status is left blank when the verdict has no
-matching dropdown option — `A. Completeness` offers Yes/No and has nowhere to put
-an UNCLEAR — and the reason goes in General Comments. And openpyxl warns that it
-is dropping the workbook's conditional-formatting extension: macros, dropdowns
-and layout survive the round trip, the colour-scale rules on the Summary sheet do
-not.
+One thing to know about the output: openpyxl warns that it is dropping the
+workbook's conditional-formatting extension. Macros, dropdowns and layout survive
+the round trip; the colour-scale rules on the Summary sheet do not. If the
+reviewed workbook is open in Excel, it is saved as `<name>.reviewed-2.xlsm`
+instead.
 
 ### Cloud operation
 
@@ -326,8 +385,10 @@ not.
 
 Path, model, and table defaults live in
 [`common/utils/aws.properties.ini`](common/utils/aws.properties.ini). Comments
-at the top of that file list env → property mappings. `Helper` applies env
-overrides first, then `[default]`.
+at the top of that file list env → property mappings. `Helper.get_property`
+resolves an environment override first (`Helper.ENV_PROPERTY_OVERRIDES`), then
+the one `[contract:…]` section with `active = true`, then `[default]`. Zero or
+two active contracts is an error. See [Contracts](#contracts).
 
 ### Cloud (injected by CDK)
 
@@ -340,7 +401,7 @@ overrides first, then `[default]`.
 | `DB_SECRET_ARN` (or `DB_SECRET_NAME`) | Secrets Manager secret for app DB credentials (embeddings Lambda and search API) |
 | `BEDROCK_MODEL_ID` | Foundation LLM |
 | `BEDROCK_EMBED_MODEL_ID` | Embedding model |
-| `EMBEDDINGS_TABLE_NAME` | Table used by the search API (default `embeddings`) |
+| `EMBEDDINGS_TABLE_NAME` | Default table for the search API when a request names no `contract`; overrides the active contract's `embeddings_table_name` |
 
 **Bootstrap task only** (from Secrets Manager at task start; never put in task
 env plain text, workflow args, or logs):
@@ -403,11 +464,31 @@ Both Lambdas are standard Lambda functions in the VPC's private subnets with a
 scales to zero when idle. Uploads beyond that wait in Lambda's asynchronous
 event queue for up to 6 hours, and a failed invocation is retried twice.
 
+### Contracts
+
+Each `[contract:<name>]` section in `aws.properties.ini` overlays `[default]`
+with that contract's S3 prefixes (`input_prefix`, `output_prefix`, the
+`BDA*OutputFolder`s, `RagSplitOutPutFolder`) and its `embeddings_table_name`.
+Exactly one section has `active = true`; today that is `contract:ok_1`
+(`embeddings_ok_1`).
+
+### Shared regulations table
+
+`[contract:common_cms_regs]` (`embeddings_cms_regs`) holds 42 CFR Part 438 and the
+CMS State Guide. Stage 2 always reads it, whichever contract is active
+(`Helper.get_common_embeddings_table_name()` reads that section directly). It is
+interpretive context only and never contract evidence. Leave it `active = false`
+and set it `true` only while re-ingesting it. If the section is missing, Stage 2
+runs without a regulatory reference and logs that.
+
 ### Search (API)
 
-The agent accepts only a natural-language `query`. The search API reads the
-table named by `EMBEDDINGS_TABLE_NAME` (default `embeddings`); it does not yet
-search the per-file `emb_*` tables.
+The agent takes a natural-language `query` and an optional `contract`. The
+`contract` is validated against the `embeddings*` tables that exist in
+`aisuite_schema`, not against the INI, and an omitted `contract` falls back to
+`EMBEDDINGS_TABLE_NAME` or the active contract's table. The per-file `emb_*`
+tables written by the embeddings Lambda don't match `embeddings*`, so the API
+can't select them yet.
 
 ## Shared buckets (dev)
 

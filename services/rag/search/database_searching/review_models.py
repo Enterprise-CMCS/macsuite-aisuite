@@ -77,11 +77,8 @@ class RequirementReview(BaseModel):
 
     status: Status = "UNSURE"
     unsure_reason : Optional[UnsureReason] = None
-    debate_used: bool = False
-    debate_summary: str = ""
 
     argument: str = ""
-    counter_argument: str = ""
     follow_up: str = ""
     missing_information: str = ""
     # Stage 2 explanation, informed by 42 CFR Part 438 / CMS State Guide context.

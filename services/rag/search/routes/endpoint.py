@@ -45,7 +45,7 @@ class AgentResponse(BaseModel):
 # FastAPI application
 app = FastAPI(
     title="Agentic RAG API",
-    description="Production RAG system with pydantic-ai agent, AWS Bedrock NOVA Lite, and multi-strategy search",
+    description="Production RAG system with Strands agents, AWS Bedrock NOVA Lite, and multi-strategy search",
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -67,7 +67,7 @@ async def root():
         "service": "Agentic RAG API",
         "version": "2.0.0",
         "status": "operational",
-        "model": os.environ.get('BEDROCK_MODEL_ID', 'amazon.nova-pro-v1:0'),
+        "model": os.environ.get('BEDROCK_MODEL_ID', 'us.amazon.nova-2-lite-v1:0'),
         "endpoints": [
             {"path": "/agent", "methods": ["GET", "POST"], "description": "AI agent endpoint"},
             {"path": "/contracts", "methods": ["GET"], "description": "Configured embeddings tables and the default"},

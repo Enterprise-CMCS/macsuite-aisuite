@@ -4,17 +4,13 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Dict, Optional
 
-from pydantic_ai import Agent, ModelRetry, RunContext, ToolDefinition, ToolFailed
-from pydantic_ai.capabilities import ValidatedToolArgs
-from pydantic_ai.capabilities.hooks import Hooks
-from pydantic_ai.messages import ThinkingPart, ToolCallPart
-from pydantic_ai.usage import RunUsage, UsageLimits
  
 from common.utils.helper import Helper
 from common.utils.logger import log
-from search.database_searching.model_provider import (bedrock_hooks,bedrock_model,model_id,)
+from search.database_searching.model_provider import (model_id,strands_model,)
 from search.database_searching.review_models import (EvidenceRecord,RequirementReview,page_number,)
 from search.database_searching.search import SearchEngine
+from search.database_searching.strands_harness import (EvidenceAnalysis,SearchRefused,TokenUsage,run_decision,run_evidence,)
 from difflib import SequenceMatcher
  
 
@@ -28,6 +24,12 @@ MEDIUM_CONFIDENCE_THRESHOLD = 0.40
 # Shared regulatory reference (42 CFR Part 438 + CMS State Guide).
 # Used only as interpretive context for Stage 2, never as contract evidence.
 MAX_REFERENCE_CHUNKS = 5
+
+# How many passages the exact-match search adds for a definition requirement.
+MAX_DEFINITION_CHUNKS = 10
+# lookup_definition calls per requirement, separate from MAX_SEARCHES: enough for the term and one equivalent.
+MAX_DEFINITION_LOOKUPS = 2
+DEFINITION_TERM = re.compile(r"definition for the term\s+[\"\u201c](.+?)[\"\u201d]", re.IGNORECASE)
 MAX_REFERENCE_CHARS = 6000
 
 # Stage 2 decision confidence (HIGH/MEDIUM/LOW) sets the band shown in Status.
@@ -57,7 +59,8 @@ Your responsibilities are:
 
 1. Analyze the requirement carefully.
 2. Review the retrieved contract passages.
-3. Search for additional contract text when needed.
+3. Search for additional contract text when needed (search_contract), and look up
+   the contract's definition of a term it relies on (lookup_definition).
 4. Identify the strongest evidence relevant to the requirement.
 5. Explain what the retrieved evidence establishes.
 6. Identify any material information that remains missing.
@@ -83,6 +86,22 @@ EVIDENCE RULES:
   information is missing.
  
  
+DEFINITION REQUIREMENTS:
+
+When the requirement asks the MCP to use the state-developed definition of a term:
+
+- Look for the contract's own definition of that term, usually in its definitions section.
+  If it is not in the retrieved text, use lookup_definition with the term. If that finds
+  nothing, try lookup_definition once with an equivalent term.
+- Return that definition as evidence, along with any clause requiring state definitions.
+- The contract may use an equivalent term, for example "Prior Authorization" for
+  "preauthorization". Its definition counts.
+- A general clause about definitions does not define the term. If the contract does not
+  define the term, say so in MissingInformation.
+- This contract is issued by the state. Do not report a gap because it does not call its
+  own definition "state-developed".
+
+
 REASONING RULES:
 
 The Reasoning field should explain what the evidence establishes.
@@ -212,6 +231,19 @@ APPLICABILITY CONDITIONS ARE NOT CONTRACT ELEMENTS:
   not apply, or the State rather than the plan performs the function),
   return UNSURE with HIGH confidence and begin Response with
   "Possibly N/A because ...".
+
+STATE-DEVELOPED DEFINITIONS:
+- This contract is issued by the state, so a definition in the contract IS the
+  state-developed definition. Do not ask for proof of where it came from.
+- Return MET when VerifiedEvidence quotes the contract's definition of the
+  term, or of an equivalent term (for example "Prior Authorization" for
+  "preauthorization"). No separate clause requiring its use is needed.
+- Return UNSURE when VerifiedEvidence has no definition of the term, even if
+  it has a general clause about using state definitions. Name the term.
+
+THE CONTRACT'S OWN TERMS:
+- A contract term that plainly means the same thing as the requirement's term
+  is not a gap. For example, "Eligibles" are potential enrollees.
 
 WEIGH STAGE 1 GAPS, DO NOT COPY THEM:
 - MissingInformation lists what Stage 1 could not find. For each gap,
@@ -391,6 +423,9 @@ Return EXACTLY one JSON object:
     "DecisionConfidence": "HIGH | MEDIUM | LOW",
     "Response": "<concise explanation of the final decision>"
 }
+
+Every value keeps its surrounding double quotes. Do not put a double quote
+inside the text of a value: refer to contract terms without quoting them.
 """
  
 
@@ -406,6 +441,10 @@ class ContractDeps:
     chunks: Dict[int, dict] = field(default_factory=dict)
     max_searches: int = MAX_SEARCHES
     searches: int = 0
+    max_definition_lookups: int = MAX_DEFINITION_LOOKUPS
+    definition_lookups: int = 0
+    # locate_quote results for this requirement.
+    quote_locations: Dict[tuple, Optional[int]] = field(default_factory=dict)
 
 
 def build_deps(table_name=None):
@@ -426,6 +465,33 @@ def build_deps(table_name=None):
 # ==================================== RETRIEVAL=========================================
 async def retrieve(deps, query):
     return await deps.search_engine.semantic_search(query)
+
+
+def definition_term(requirement):
+    """The term a state-developed definition requirement is about, or None."""
+    match = DEFINITION_TERM.search(requirement or "")
+    return match.group(1).strip(" .,;:") if match else None
+
+
+async def search_definition(deps, term):
+    """
+    Exact-match a defined term. Glossary entries are short, so semantic search can rank them
+    below longer passages that merely mention the term. Raises on a backend failure.
+    """
+    return await deps.search_engine.hybrid_search(f"{term} definition", limit=MAX_DEFINITION_CHUNKS)
+
+
+async def retrieve_definition(deps, requirement):
+    """Seed retrieval for a definition requirement: its term's definition, or [] on any failure."""
+    term = definition_term(requirement)
+    if not term:
+        return []
+    try:
+        return await search_definition(deps, term)
+    except Exception as lclEx:
+        Helper.print_exception("retrieve_definition", lclEx, f"Definition lookup failed for '{term}'.")
+        log.warning(f"retrieve_definition() lookup failed for '{term}': {lclEx}")
+        return []
 
 
 async def retrieve_reference(deps, requirement, item="", legal_cite=""):
@@ -465,8 +531,6 @@ async def retrieve_reference(deps, requirement, item="", legal_cite=""):
 def record_chunks(deps, results):
     kept = []
     for result in results:
-        print('result_keys:', result.keys())
-        print('result:', result)
         chunk_id = result.get("id")
         if chunk_id is None:
             continue
@@ -546,6 +610,29 @@ def extract_json_object(output):
     return parsed
  
  
+DECISION_FIELDS = re.compile(
+    r'"Recommendation"\s*:\s*"(?P<recommendation>[^"]*)"\s*,\s*'
+    r'"DecisionConfidence"\s*:\s*"(?P<confidence>[^"]*)"\s*,\s*'
+    r'"Response"\s*:\s*["\'](?P<response>.*)["\']\s*}', re.DOTALL)
+RECOMMENDATION_KEY = re.compile(r'"Recommendation"\s*:')
+
+
+def extract_decision(output):
+    """Stage 2 output. The model quotes contract terms inside Response without escaping them, or
+    wraps Response in single quotes. Either breaks the JSON but leaves the three fields readable,
+    so they are read directly."""
+    try:
+        return extract_json_object(output)
+    except (ValueError, TypeError) as parse_err:
+        match = DECISION_FIELDS.search(str(output))
+        # Two verdicts mean a draft and a correction, and nothing here can tell which one stands.
+        if not match or len(RECOMMENDATION_KEY.findall(str(output))) > 1:
+            raise
+        log.warning(f"extract_decision() repaired Stage 2 output after: {parse_err}")
+        return {"Recommendation": match["recommendation"], "DecisionConfidence": match["confidence"],
+                "Response": match["response"].replace('\\"', '"').replace("\\'", "'")}
+
+
 RESULT_TAG = re.compile(r"\[result\s+\d+\]\s*",re.IGNORECASE,)
 
 def strip_result_tags(text):
@@ -554,6 +641,28 @@ def strip_result_tags(text):
 def normalize_text(text):
     return re.sub(r"\s+"," ",text or "",).strip()
 
+# Runs shorter than this are coincidence. Counting them lets a wrong quote score up to 0.79 on a
+# long chunk. At this length the worst wrong pair in a full CRT run scored 0.43.
+MIN_MATCH_BLOCK = 8
+
+
+def shared_coverage(quote, text):
+    """The share of the quote covered by MIN_MATCH_BLOCK-long runs that also occur in text.
+
+    Every character SequenceMatcher can count lies in such a run, so this is an upper bound on its
+    coverage, at linear cost. Chunks that cannot reach the threshold skip the quadratic matcher.
+    """
+    grams = {text[start:start + MIN_MATCH_BLOCK] for start in range(len(text) - MIN_MATCH_BLOCK + 1)}
+    covered = 0
+    reach = 0
+    for start in range(len(quote) - MIN_MATCH_BLOCK + 1):
+        if quote[start:start + MIN_MATCH_BLOCK] in grams:
+            end = start + MIN_MATCH_BLOCK
+            covered += end - max(start, reach)
+            reach = end
+    return covered / len(quote)
+
+
 def quote_matches(quote, text, threshold=0.95):
     normalized_quote = normalize_text(quote)
     normalized_text = normalize_text(text)
@@ -561,10 +670,27 @@ def quote_matches(quote, text, threshold=0.95):
         return False
     if normalized_quote in normalized_text:
         return True
-    matcher = SequenceMatcher(None, normalized_quote, normalized_text)
-    matched = sum(block.size for block in matcher.get_matching_blocks())
+    if shared_coverage(normalized_quote, normalized_text) < threshold:
+        return False
+    # autojunk off: on long text it ignores common characters, so a 99% match scored 0.77.
+    matcher = SequenceMatcher(None, normalized_quote, normalized_text, autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks() if block.size >= MIN_MATCH_BLOCK)
     coverage = matched / len(normalized_quote)
     return coverage >= threshold
+
+
+def locate_quote(quote, chunk_id, deps):
+    """The retrieved chunk holding this quote, or None. The cited chunk is tried first, then the
+    nearest ids, because the model usually cites the passage next to the right one.
+
+    Cached per chunk count: evidence_problems and build_verified_evidence ask the same question,
+    and only a new search can change the answer."""
+    key = (quote, chunk_id, len(deps.chunks))
+    if key not in deps.quote_locations:
+        deps.quote_locations[key] = next(
+            (candidate for candidate in sorted(deps.chunks, key=lambda other: abs(other - chunk_id))
+             if quote_matches(quote, deps.chunks[candidate].get("text") or "")), None)
+    return deps.quote_locations[key]
 
 # CONFIDENCE
 # =============================================================================
@@ -661,8 +787,7 @@ def format_review_display(review, deps):
 
 # SEARCH TOOL
 # =============================================================================
-async def search_contract(context: RunContext[ContractDeps],query: str,) -> str:
-    deps = context.deps
+async def run_contract_search(deps, query):
     if deps.searches >= deps.max_searches:
         return ("Search limit reached. Use the evidence already retrieved and complete the analysis.")
 
@@ -678,39 +803,91 @@ async def search_contract(context: RunContext[ContractDeps],query: str,) -> str:
                 "Try different wording or a broader phrase.")
     record_chunks(deps,results)
     return format_retrieved_chunks(results)
+
+
+def search_budget_message(deps):
+    return (f"Search budget for this requirement is used up after {deps.max_searches} searches. Decide from the text "
+        "you already have, and return UNSURE if it does not settle it.")
+
+
+def definition_budget_message(deps):
+    return (f"Definition lookups for this requirement are used up after {deps.max_definition_lookups}. If the "
+            "contract's definition is not in the text you have, say so in MissingInformation.")
+
+
+async def run_definition_lookup(deps, term):
+    """The lookup_definition backend. Refusals raise SearchRefused and never reach the database."""
+    term = (term or "").strip(" \t\n\"'“”‘’.,;:")
+    if not term:
+        raise SearchRefused("Give the term to look up, for example Prior Authorization.")
+    if deps.definition_lookups >= deps.max_definition_lookups:
+        raise SearchRefused(definition_budget_message(deps))
+
+    # Charged before the lookup runs, like a search, so a failing backend cannot be retried forever.
+    deps.definition_lookups += 1
+    results = await search_definition(deps, term)
+    log.debug(f"lookup_definition() call {deps.definition_lookups}/{deps.max_definition_lookups} "
+              f"for '{term[:120]}' returned {len(results)} chunks")
+
+    if not results:
+        return (f"No definition of '{term}' was found. Try an equivalent term, or say in MissingInformation "
+                "that the contract does not define it.")
+    record_chunks(deps, results)
+    return format_retrieved_chunks(results)
  
-# TOOL HOOKS
+# STAGE 1 RUN
 # =============================================================================
-review_hooks = Hooks()
-@review_hooks.on.before_tool_execute(tools=["search_contract"])
-async def charge_search_budget(context: RunContext[ContractDeps],*,call: ToolCallPart,
-    tool_def: ToolDefinition,args: ValidatedToolArgs,) -> ValidatedToolArgs:
-    deps = context.deps
-    if deps.searches >= deps.max_searches:
-        log.debug(f"charge_search_budget() refused search {deps.searches + 1}, the limit is {deps.max_searches}")
- 
-        raise ToolFailed(f"Search budget for this requirement is used up after {deps.max_searches} searches. Decide from the text "
-            "you already have, and return UNSURE if it does not settle it.")
-    deps.searches += 1
-    return args
- 
- 
-@review_hooks.on.tool_execute_error(tools=["search_contract"])
-async def retry_failed_search(context: RunContext[ContractDeps],*,call: ToolCallPart,
-    tool_def: ToolDefinition,args: ValidatedToolArgs,error: Exception,):
-    query = str(args.get("query", ""))[:120]
-    Helper.print_exception("search_contract",error,f"Retrieval failed for query '{query}'.",)
-    raise ModelRetry("The search backend failed. Try once more with a shorter query.")
- 
-# STAGE 1 AGENT
-# =============================================================================
-evidence_agent = Agent(bedrock_model(),deps_type=ContractDeps,system_prompt=EVIDENCE_SYSTEM_PROMPT,
-    model_settings={"temperature": 0.0,"top_p": 1.0,},
-    tools=[search_contract], capabilities=[review_hooks, bedrock_hooks,],
-    retries=3,
-    name="evidence_agent",)
- 
-# STAGE 2 AGENT
+DEFINITION_WORDING = re.compile(r"\b(means|shall mean|is defined as|refers to)\b", re.IGNORECASE)
+
+
+def mentions_term(term, text):
+    """Whether text names the term, ignoring case, spacing and hyphens ("pre-authorization")."""
+    letters = lambda value: re.sub(r"[^a-z0-9]", "", (value or "").lower())
+    return letters(term) in letters(text)
+
+
+def evidence_problems(analysis, deps, requirement):
+    """What Python can already see is wrong with a Stage 1 analysis, phrased for the model."""
+    problems = []
+    for item in analysis.Evidence:
+        # A real quote with the wrong chunk id is corrected by build_verified_evidence, at no model cost.
+        if locate_quote(item.quote, item.chunk_id, deps) is not None:
+            continue
+        if item.chunk_id not in deps.chunks:
+            problems.append(f"Chunk {item.chunk_id} was not retrieved. Cite only retrieved chunks.")
+        else:
+            problems.append(f"This quote is not word for word in chunk {item.chunk_id}: {item.quote[:200]!r}. "
+                            "Copy the exact text, with no ellipses.")
+
+    # Saying the term is not defined is a valid answer, so only silence on it is a problem. An
+    # equivalent term's definition also counts, and Python cannot judge equivalence, so any quote
+    # worded as a definition passes and Stage 2 decides.
+    term = (definition_term(requirement) or "").lower()
+    if (term and not mentions_term(term, analysis.MissingInformation)
+            and not any(mentions_term(term, item.quote) or DEFINITION_WORDING.search(item.quote)
+                        for item in analysis.Evidence)):
+        problems.append(f"Neither your evidence nor MissingInformation addresses the term {term!r}. Quote the "
+                        "definition of that term or an equivalent one. If the contract does not define it, "
+                        "say so in MissingInformation.")
+    return problems
+
+
+async def run_evidence_stage(prompt, deps, usage, request_limit, requirement=""):
+    """Stage 1 model loop. Returns the raw model output for extract_json_object."""
+    async def search(query):
+        if deps.searches >= deps.max_searches:
+            raise SearchRefused(search_budget_message(deps))
+        return await run_contract_search(deps, query)
+
+    async def lookup(term):
+        return await run_definition_lookup(deps, term)
+
+    return await run_evidence(prompt, model=strands_model(), system_prompt=EVIDENCE_SYSTEM_PROMPT,
+        search=search, lookup=lookup, max_turns=request_limit, usage=usage,
+        find_problems=lambda analysis: evidence_problems(analysis, deps, requirement),)
+
+
+# STAGE 2 SETTINGS
 # =============================================================================
 # Extended thinking (Nova 2 "reasoningConfig") for the Decision Analyst only.
 # Effort: "low" | "medium" | "high". Reasoning tokens count toward max_tokens.
@@ -718,19 +895,15 @@ evidence_agent = Agent(bedrock_model(),deps_type=ContractDeps,system_prompt=EVID
 # top_p and max_tokens below and try again.
 DECISION_REASONING_EFFORT = "medium"
 
-decision_agent = Agent(bedrock_model(), system_prompt=DECISION_SYSTEM_PROMPT,
-    model_settings={
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "max_tokens": 8000,
-        "bedrock_additional_model_requests_fields": {
-            "reasoningConfig": {"type": "enabled", "maxReasoningEffort": DECISION_REASONING_EFFORT},
-        },
+DECISION_MODEL_SETTINGS = {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_tokens": 8000,
+    "additional_request_fields": {
+        "reasoningConfig": {"type": "enabled", "maxReasoningEffort": DECISION_REASONING_EFFORT},
     },
-    capabilities=[bedrock_hooks,],
-    retries=3,
-    name="decision_agent",)
- 
+}
+
 # EVIDENCE VERIFICATION
 # =============================================================================
 def build_verified_evidence(evidence_items,deps,):
@@ -751,14 +924,22 @@ def build_verified_evidence(evidence_items,deps,):
             continue
 
         quote = (evidence_item.get("quote") or "").strip()
-        chunk = deps.chunks.get(chunk_id)
+        if not quote:
+            continue
+
+        # The page comes from the chunk, so a quote cited to the wrong chunk moves to the right one.
+        located = locate_quote(quote, chunk_id, deps)
+        if located not in (None, chunk_id):
+            log.info(f"build_verified_evidence() moved a quote from chunk {chunk_id} to chunk {located}.")
+            chunk_id = located
  
-        # Ignore invented IDs or empty quotations.
-        if not chunk or not quote:
+        # Ignore invented IDs.
+        chunk = deps.chunks.get(chunk_id)
+        if not chunk:
             continue
         text = chunk.get("text") or ""
         metadata = get_metadata(chunk)
-        verified = quote_matches(quote, text)
+        verified = located is not None
  
         records.append(EvidenceRecord(quote=quote, chunk_text=text, chunk_id=chunk_id, doc_id=metadata.get("doc_id","",),
                 page=metadata.get("page"),
@@ -821,33 +1002,35 @@ async def review_requirement(
         review.error = "Empty requirement text."
         return review
  
-    deps = replace(deps or build_deps(), chunks={}, searches=0,)
-    run_usage = usage if usage is not None else RunUsage()
+    deps = replace(deps or build_deps(), chunks={}, searches=0, definition_lookups=0, quote_locations={},)
+    run_usage = usage if usage is not None else TokenUsage()
  
     try:
         # Initial retrieval
-        seed = await retrieve(deps, requirement)
+        definitions = await retrieve_definition(deps, requirement)
+        seen = {chunk.get("id") for chunk in definitions}
+        seed = definitions + [chunk for chunk in await retrieve(deps, requirement) if chunk.get("id") not in seen]
         record_chunks(deps, seed)
         review.chunks_retrieved = len(deps.chunks)
 
         # Stage 1: Evidence Analysis
-        stage1_result = await evidence_agent.run(f"Requirement to verify:\n{requirement}\n\n"
+        stage1_output = await run_evidence_stage(f"Requirement to verify:\n{requirement}\n\n"
             "Retrieved contract context(each passage is identified by a persistent [chunk N] ID):\n"
             f"{format_retrieved_chunks(seed)}\n\n"
             "Analyze the requirement using only the retrieved contract context. "
-            "If additional evidence is needed, use search_contract. "
+            "If additional evidence is needed, use search_contract, or lookup_definition for a defined term. "
             "Return exactly one JSON object containing Reasoning, Evidence, and MissingInformation.",
-            deps=deps,
-            usage=run_usage,
-            usage_limits=UsageLimits(request_limit=6 + deps.max_searches),)
+            deps,
+            run_usage,
+            request_limit=6 + deps.max_searches + deps.max_definition_lookups, requirement=requirement,)
         review.chunks_retrieved = len(deps.chunks)
 
         try:
-            stage1 = extract_json_object(stage1_result.output)
+            stage1 = extract_json_object(stage1_output)
         except (ValueError, json.JSONDecodeError, TypeError) as exc:
-            log.warning(f"Stage 1 JSON parse failed, retrying once: {exc}")
+            log.warning(f"Stage 1 JSON parse failed, retrying once: {exc}. Model output: {str(stage1_output)[:1000]!r}")
         
-            retry_result = await evidence_agent.run(
+            retry_output = await run_evidence_stage(
                 (
                     f"Requirement to verify:\n{requirement}\n\n"
                     "Retrieved contract context:\n"
@@ -859,12 +1042,13 @@ async def review_requirement(
                     '"MissingInformation":"..."}\n'
                     "No markdown fences or text outside the JSON."
                 ),
-                deps=deps,
-                usage=run_usage,
-                usage_limits=UsageLimits(request_limit=5),
+                deps,
+                run_usage,
+                request_limit=5,
+                requirement=requirement,
             )
         
-            stage1 = extract_json_object(retry_result.output)
+            stage1 = extract_json_object(retry_output)
 
         if not isinstance(stage1, dict):
             raise TypeError(f"Stage 1 expected dict, got {type(stage1).__name__}")
@@ -904,25 +1088,24 @@ async def review_requirement(
             reference=reference,)
  
         # Stage 2: final MET/UNSURE decision
-        stage2_result = await decision_agent.run(
+        stage2_result = await run_decision(
             ("Make the final contract review decision using the following validated Stage-1 analysis.\n\n"
-            f"{json.dumps(decision_input, indent=2)}"), usage=run_usage, usage_limits=UsageLimits(request_limit=5),)
+            f"{json.dumps(decision_input, indent=2)}"), model=strands_model(DECISION_MODEL_SETTINGS),
+            system_prompt=DECISION_SYSTEM_PROMPT, max_turns=5, usage=run_usage,)
  
         # Confirm extended thinking actually ran (look for this line in the log).
-        thought = any(isinstance(part, ThinkingPart)
-                      for message in stage2_result.all_messages()
-                      for part in getattr(message, "parts", []))
+        thought = any("reasoningContent" in block for block in stage2_result.message.get("content", []))
         log.info(f"review_requirement() {sheet} item {item}: Stage 2 extended thinking used = {thought}")
 
         # Parse Stage 2
         try:
-            stage2 = extract_json_object(stage2_result.output)
+            stage2 = extract_decision(str(stage2_result))
             if not isinstance(stage2, dict):
                 raise TypeError(f"Stage 2 expected dict, got {type(stage2).__name__}")
             
         except (json.JSONDecodeError,ValueError,TypeError,) as parse_err:
             log.warning(f"review_requirement() " f"{sheet} item {item}: "
-                "Stage 2 output was not valid JSON: " f"{parse_err}")
+                "Stage 2 output was not valid JSON: " f"{parse_err}. Model output: {str(stage2_result)[:1000]!r}")
             review.status = "UNSURE"
             review.decision_confidence = "Low"
             review.error = (f"Stage 2 JSON error: {parse_err}")
