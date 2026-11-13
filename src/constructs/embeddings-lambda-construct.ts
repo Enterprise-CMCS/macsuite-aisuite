@@ -1,6 +1,8 @@
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecr_assets from "aws-cdk-lib/aws-ecr-assets";
+import * as events from "aws-cdk-lib/aws-events";
+import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
@@ -21,6 +23,10 @@ import {
 
 export const RAG_OUTPUT_PREFIX = "RAG_Output/";
 export const COMMON_RAG_OUTPUT_PREFIX = `${RAG_OUTPUT_PREFIX}${COMMON_INPUT_PREFIX}`;
+// Superseded embeddings_<state>_v<N> tables are dropped this many days after a newer
+// READY version replaced them. The schedule is monthly, so a table is actually dropped
+// 30-61 days after it was superseded.
+export const EMBEDDINGS_RETENTION_DAYS = 30;
 
 export interface EmbeddingsLambdaConstructProps {
   appSecurityGroup: ec2.ISecurityGroup;
@@ -77,6 +83,14 @@ export class EmbeddingsLambdaConstruct extends Construct {
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
     });
 
+    // Both triggers (S3 notifications and the expiry schedule) invoke asynchronously, so
+    // Lambda, not the caller, retries a function error. These are Lambda's defaults,
+    // pinned so the expiry run's "fails, then is retried" behaviour is explicit.
+    this.function.configureAsyncInvoke({
+      maxEventAge: cdk.Duration.hours(6),
+      retryAttempts: 2,
+    });
+
     props.postProcessingBucket.grantRead(this.function);
     props.dbSecret.grantRead(this.function);
 
@@ -97,5 +111,28 @@ export class EmbeddingsLambdaConstruct extends Construct {
       new s3n.LambdaDestination(this.function),
       { prefix: COMMON_RAG_OUTPUT_PREFIX, suffix: ".json" },
     );
+
+    // 06:00 UTC on the 1st of every month: drop expired embeddings versions.
+    new events.Rule(this, "ExpireVersionsSchedule", {
+      description: "Drop superseded embeddings versions past their retention period",
+      schedule: events.Schedule.cron({
+        day: "1",
+        hour: "6",
+        minute: "0",
+        month: "*",
+        year: "*",
+      }),
+      targets: [
+        new targets.LambdaFunction(this.function, {
+          event: events.RuleTargetInput.fromObject({
+            action: "expire",
+            retentionDays: EMBEDDINGS_RETENTION_DAYS,
+          }),
+          // Covers failed deliveries (e.g. throttling) only; function errors are
+          // retried by the async invoke config above.
+          retryAttempts: 2,
+        }),
+      ],
+    });
   }
 }

@@ -9,7 +9,7 @@ import os
 import sys
 import unittest
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Third-party packages are imported before the stubs so patch.dict keeps them in sys.modules.
@@ -48,6 +48,28 @@ TEMP_BUCKET = "aisuite-dev-llm-pipeline-temp"
 STATE_MACHINE_ARN = "arn:aws:states:us-east-1:123456789012:stateMachine:aisuite-dev-manifest-ingest"
 EXECUTION_ARN = f"arn:aws:states:us-east-1:123456789012:execution:aisuite-dev-manifest-ingest:{REQUEST_KEY}"
 RAG_KEY = "RAG_Output/SUB-123/ATT-001/DOC-001/amendment.json"
+NOW = datetime(2026, 12, 1, 6, 0, tzinfo=timezone.utc)
+
+
+class PgError(Exception):
+    def __init__(self, sqlstate):
+        super().__init__(sqlstate)
+        self.sqlstate = sqlstate
+
+
+def version_row(version, status, state="MD", created=None, completed=None, dropped=None):
+    created = created or NOW - timedelta(days=60)
+    if completed is None and status != "BUILDING":
+        completed = created
+    return {
+        "state": state,
+        "version": version,
+        "table_name": f"embeddings_{state.lower()}_v{version}",
+        "status": status,
+        "created_at": created,
+        "completed_at": completed,
+        "dropped_at": dropped,
+    }
 
 
 def requirement(index):
@@ -111,6 +133,22 @@ class EmbeddingVersionTests(unittest.IsolatedAsyncioTestCase):
         connection.fetchval = AsyncMock(side_effect=list(values))
         return connection
 
+    @staticmethod
+    def _expiry_connection(rows, current=None):
+        connection = EmbeddingVersionTests._connection(values=[NOW])
+        connection.fetch = AsyncMock(return_value=rows)
+        if current is None:
+            by_name = {row["table_name"]: row for row in rows}
+
+            async def fetchrow(sql, table_name, qualified):
+                row = by_name[table_name]
+                return {"status": row["status"], "dropped_at": None, "can_drop": True}
+
+            connection.fetchrow = AsyncMock(side_effect=fetchrow)
+        else:
+            connection.fetchrow = AsyncMock(return_value=current)
+        return connection
+
     def test_only_allocated_table_names_are_accepted(self):
         self.assertEqual(embedding_versions.versioned_table_name("md", 3), "embeddings_md_v3")
         self.assertEqual(embedding_versions.validate_versioned_table_name("embeddings_md_v3"), "embeddings_md_v3")
@@ -121,7 +159,9 @@ class EmbeddingVersionTests(unittest.IsolatedAsyncioTestCase):
             embedding_versions.versioned_table_name("Maryland", 1)
 
     async def test_retried_allocation_returns_the_version_the_request_holds(self):
-        connection = self._connection(existing={"state": "MD", "version": 2, "table_name": "embeddings_md_v2"})
+        connection = self._connection(
+            existing={"state": "MD", "version": 2, "table_name": "embeddings_md_v2", "dropped_at": None}
+        )
 
         version = await embedding_versions.allocate_version(connection, "md", REQUEST_KEY)
 
@@ -147,6 +187,142 @@ class EmbeddingVersionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await embedding_versions.mark_ready(connection, REQUEST_KEY, "embeddings_md_v4")
         connection.execute.assert_not_awaited()
+
+    def test_expiry_keeps_the_latest_ready_and_drops_only_versions_past_retention(self):
+        old, recent = NOW - timedelta(days=45), NOW - timedelta(days=10)
+        rows = [
+            # MD: v1 superseded by v2 45 days ago, v2 superseded by v3 only 10 days ago.
+            version_row(1, "READY", created=old, completed=old - timedelta(days=5)),
+            version_row(2, "READY", created=old, completed=old),
+            version_row(3, "READY", created=recent, completed=recent),
+            version_row(4, "FAILED", created=old, completed=old),
+            version_row(5, "FAILED", created=recent, completed=recent),
+            version_row(6, "BUILDING", created=old),
+            version_row(7, "BUILDING", created=recent),
+            version_row(8, "READY", created=old, completed=old, dropped=recent),
+            # TN: a single READY version, however old, is the latest and is kept.
+            version_row(1, "READY", state="TN", created=old, completed=old - timedelta(days=300)),
+            # NE: v2 is the newest READY but already dropped, so it supersedes nothing.
+            version_row(1, "READY", state="NE", created=old, completed=old - timedelta(days=5)),
+            version_row(2, "READY", state="NE", created=old, completed=old, dropped=recent),
+        ]
+
+        expired = embedding_versions.select_expired(rows, NOW, 30)
+
+        self.assertEqual(
+            [row["table_name"] for row in expired],
+            ["embeddings_md_v1", "embeddings_md_v4", "embeddings_md_v6"],
+        )
+
+    def test_expiry_retention_boundary_is_exclusive(self):
+        rows = [
+            version_row(1, "FAILED", completed=NOW - timedelta(days=30)),
+            version_row(2, "FAILED", completed=NOW - timedelta(days=30, seconds=1)),
+        ]
+
+        expired = embedding_versions.select_expired(rows, NOW, 30)
+
+        self.assertEqual([row["table_name"] for row in expired], ["embeddings_md_v2"])
+
+    async def test_expiry_drops_each_table_under_the_state_lock_with_a_lock_timeout(self):
+        connection = self._expiry_connection([version_row(4, "FAILED"), version_row(6, "BUILDING")])
+
+        result = await embedding_versions.expire_versions(connection, 30)
+
+        self.assertEqual(result, embedding_versions.ExpiryResult(["embeddings_md_v4", "embeddings_md_v6"], []))
+        statements = [call.args for call in connection.execute.await_args_list]
+        self.assertEqual(statements[0], ("SELECT pg_advisory_xact_lock(hashtext($1))", "aisuite-embedding-version:MD"))
+        self.assertEqual(statements[1], ("SET LOCAL lock_timeout = '5s'",))
+        self.assertEqual(statements[2], ("DROP TABLE IF EXISTS aisuite_schema.embeddings_md_v4",))
+        self.assertEqual(statements[3][1:], ("embeddings_md_v4",))
+        self.assertEqual(statements[6], ("DROP TABLE IF EXISTS aisuite_schema.embeddings_md_v6",))
+        self.assertEqual(connection.transaction.call_count, 2)
+
+    async def test_expiry_continues_past_a_lock_timeout_then_raises(self):
+        connection = self._expiry_connection([version_row(4, "FAILED"), version_row(6, "BUILDING")])
+
+        async def execute(statement, *args):
+            if statement == "DROP TABLE IF EXISTS aisuite_schema.embeddings_md_v4":
+                raise PgError(embedding_versions.LOCK_NOT_AVAILABLE)
+            return "OK"
+
+        connection.execute = AsyncMock(side_effect=execute)
+
+        with self.assertRaises(RuntimeError) as raised:
+            await embedding_versions.expire_versions(connection, 30)
+
+        self.assertIn("embeddings_md_v4", str(raised.exception))
+        self.assertNotIn("embeddings_md_v6", str(raised.exception))
+        self.assertIn(
+            ("DROP TABLE IF EXISTS aisuite_schema.embeddings_md_v6",),
+            [call.args for call in connection.execute.await_args_list],
+        )
+
+    async def test_expiry_reports_tables_owned_by_the_other_login_without_failing(self):
+        connection = self._expiry_connection(
+            [version_row(4, "FAILED")], current={"status": "FAILED", "dropped_at": None, "can_drop": False}
+        )
+
+        result = await embedding_versions.expire_versions(connection, 30)
+
+        self.assertEqual(result, embedding_versions.ExpiryResult([], ["embeddings_md_v4"]))
+        self.assertFalse(any("DROP TABLE" in call.args[0] for call in connection.execute.await_args_list))
+
+    async def test_expiry_skips_a_version_that_changed_since_selection(self):
+        # e.g. an abandoned BUILDING run was finalized while expiry was running.
+        connection = self._expiry_connection(
+            [version_row(6, "BUILDING")], current={"status": "READY", "dropped_at": None, "can_drop": True}
+        )
+
+        result = await embedding_versions.expire_versions(connection, 30)
+
+        self.assertEqual(result, embedding_versions.ExpiryResult([], []))
+        self.assertFalse(any("DROP TABLE" in call.args[0] for call in connection.execute.await_args_list))
+
+    async def test_expiry_records_a_version_whose_table_is_already_gone(self):
+        connection = self._expiry_connection(
+            [version_row(4, "FAILED")], current={"status": "FAILED", "dropped_at": None, "can_drop": None}
+        )
+
+        result = await embedding_versions.expire_versions(connection, 30)
+
+        self.assertEqual(result.dropped, ["embeddings_md_v4"])
+
+    async def test_a_dropped_version_is_never_reused_or_published(self):
+        connection = self._connection(
+            existing={"state": "MD", "version": 6, "table_name": "embeddings_md_v6", "dropped_at": NOW}
+        )
+        with self.assertRaises(RuntimeError):
+            await embedding_versions.allocate_version(connection, "md", REQUEST_KEY)
+
+        connection = self._connection(values=[12])
+        connection.execute = AsyncMock(return_value="UPDATE 0")
+        with self.assertRaises(LookupError):
+            await embedding_versions.mark_ready(connection, REQUEST_KEY, "embeddings_md_v6")
+        self.assertIn("dropped_at IS NULL", connection.execute.await_args.args[0])
+
+    async def test_registry_gains_dropped_at_only_when_missing(self):
+        connection = self._connection()
+        connection.fetchrow = AsyncMock(return_value={"present": True, "has_dropped_at": True})
+        await embedding_versions.ensure_registry(connection)
+        connection.execute.assert_not_awaited()
+
+        connection.fetchrow = AsyncMock(return_value={"present": True, "has_dropped_at": False})
+        await embedding_versions.ensure_registry(connection)
+        self.assertEqual(connection.execute.await_args.args, (embedding_versions._ADD_DROPPED_AT_SQL,))
+
+    async def test_registry_migration_refused_for_lack_of_ownership_says_how_to_fix_it(self):
+        connection = self._connection()
+        connection.fetchrow = AsyncMock(return_value={"present": True, "has_dropped_at": False})
+        connection.execute = AsyncMock(side_effect=PgError("42501"))
+
+        with self.assertRaises(RuntimeError) as raised:
+            await embedding_versions.ensure_registry(connection)
+
+        self.assertIn("bootstrap", str(raised.exception))
+
+    def test_new_registries_have_a_dropped_at_column(self):
+        self.assertIn("dropped_at   TIMESTAMPTZ", embedding_versions._CREATE_REGISTRY_SQL)
 
 
 class EmbeddingsActionTests(unittest.TestCase):
@@ -193,6 +369,26 @@ class EmbeddingsActionTests(unittest.TestCase):
             [doc["metadata"] for doc in stored],
             [{"page": 1, "rag_output_key": RAG_KEY}, {"rag_output_key": RAG_KEY}],
         )
+
+    def test_expire_drops_old_versions_with_the_requested_retention(self):
+        outcome = embedding_versions.ExpiryResult(["embeddings_md_v1"], ["embeddings_md_v2"])
+        with patch.object(embedding_versions, "ensure_registry", new=AsyncMock()),                 patch.object(embedding_versions, "expire_versions", new=AsyncMock(return_value=outcome)) as expire:
+            result = rag_process.handler({"action": "expire", "retentionDays": 30})
+
+        self.assertEqual(
+            result, {"retentionDays": 30, "dropped": ["embeddings_md_v1"], "notOwner": ["embeddings_md_v2"]}
+        )
+        expire.assert_awaited_once_with(self.connection, 30)
+        self.close_db.assert_awaited_once()
+
+    def test_expire_requires_a_whole_number_of_days(self):
+        with patch.object(embedding_versions, "expire_versions", new=AsyncMock()) as expire:
+            for invalid in (0, -1, True, 1.9, "30", None):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    rag_process.handler({"action": "expire", "retentionDays": invalid})
+            with self.assertRaises(ValueError):
+                rag_process.handler({"action": "expire"})
+        expire.assert_not_awaited()
 
     def test_rejects_unknown_actions_and_tables_it_did_not_allocate(self):
         with self.assertRaises(ValueError):

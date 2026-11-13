@@ -19,11 +19,6 @@ logger = structlog.get_logger(__name__)
 # AgentRequest.contract. process_agent_query() always resolves to a concrete
 # table name (never None) before this cache is touched.
 _deps_by_table = {}
-# Cached at first use and refreshed on a miss. The INI only declares a handful
-# of [contract:...] sections, but bootstrap pre-creates (and every manifest run
-# adds a versioned) embeddings_* table - the database itself, not the INI, is
-# the authoritative set of contracts a request is allowed to select.
-_known_table_names = None
 
 
 class AgentRequest(BaseModel):
@@ -96,19 +91,20 @@ async def health_check():
     return {"status": "healthy", "service": "agentic-rag-api", "version": "2.0.0"}
 
 
-async def _valid_table_names(refresh=False):
-    global _known_table_names
-    if _known_table_names is None or refresh:
-        connection = await get_connection()
-        try:
-            rows = await connection.fetch(
-                "SELECT tablename FROM pg_tables "
-                "WHERE schemaname = 'aisuite_schema' AND tablename LIKE 'embeddings%';"
-            )
-        finally:
-            await release_connection(connection)
-        _known_table_names = {row["tablename"] for row in rows}
-    return _known_table_names
+async def _valid_table_names():
+    # Read fresh on every request rather than cached: the INI only declares a
+    # handful of [contract:...] sections, while manifest runs add versioned
+    # embeddings_* tables and the monthly expiry drops them, so the database is
+    # the authoritative set. A catalog lookup is negligible next to the agent call.
+    connection = await get_connection()
+    try:
+        rows = await connection.fetch(
+            "SELECT tablename FROM pg_tables "
+            "WHERE schemaname = 'aisuite_schema' AND tablename LIKE 'embeddings%';"
+        )
+    finally:
+        await release_connection(connection)
+    return {row["tablename"] for row in rows}
 
 
 @app.get("/contracts", tags=["Info"])
@@ -118,7 +114,7 @@ async def list_contracts():
     `contract` explicitly rather than relying on this default - see
     AgentRequest.contract."""
     return {
-        "contracts": sorted(await _valid_table_names(refresh=True)),
+        "contracts": sorted(await _valid_table_names()),
         "default": Helper.get_embeddings_table_name(),
     }
 
@@ -141,8 +137,8 @@ async def process_agent_query(query: str, contract: Optional[str] = None) -> Age
             # resolve internally, so the response can say which table actually
             # answered instead of leaving that implicit.
             table_name = Helper.get_embeddings_table_name()
-        elif (table_name not in await _valid_table_names()
-              and table_name not in await _valid_table_names(refresh=True)):
+        elif table_name not in await _valid_table_names():
+            _deps_by_table.pop(table_name, None)  # e.g. a version the expiry job dropped
             # Inside try: a DB hiccup while checking membership (not "unknown
             # contract" itself, which still raises 400 below) should land in
             # the same graceful AgentResponse(success=False) path every other

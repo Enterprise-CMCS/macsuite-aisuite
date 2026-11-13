@@ -1,12 +1,14 @@
 import json
 import re
+from datetime import timedelta
 from typing import NamedTuple
 
+from common.utils.logger import log
 from data_embeddings_storage.database.embeddings_schema import (
     APP_SCHEMA,
     qualified_embeddings_table,
 )
-from data_embeddings_storage.database.table_objects import ensure_owner
+from data_embeddings_storage.database.table_objects import INSUFFICIENT_PRIVILEGE, ensure_owner
 
 REGISTRY_TABLE = "embedding_versions"
 QUALIFIED_REGISTRY_TABLE = f"{APP_SCHEMA}.{REGISTRY_TABLE}"
@@ -33,8 +35,37 @@ _CREATE_REGISTRY_SQL = f"""
         row_count    INTEGER,
         created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
         completed_at TIMESTAMPTZ,
+        dropped_at   TIMESTAMPTZ,
         PRIMARY KEY (state, version)
     )
+"""
+
+# Registries created before retention existed get the column from ensure_registry.
+# pg_attribute, unlike information_schema.columns, is not filtered by the login's privileges.
+_REGISTRY_STATE_SQL = """
+    SELECT to_regclass($1) IS NOT NULL AS present,
+           EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = to_regclass($1) AND attname = 'dropped_at' AND NOT attisdropped)
+               AS has_dropped_at
+"""
+_ADD_DROPPED_AT_SQL = f"ALTER TABLE {QUALIFIED_REGISTRY_TABLE} ADD COLUMN IF NOT EXISTS dropped_at TIMESTAMPTZ"
+
+# DROP TABLE needs ACCESS EXCLUSIVE; never queue live searches behind it for long.
+DROP_LOCK_TIMEOUT = "5s"
+LOCK_NOT_AVAILABLE = "55P03"
+
+_REGISTRY_ROWS_SQL = (
+    "SELECT state, version, table_name, status, created_at, completed_at, dropped_at "
+    f"FROM {QUALIFIED_REGISTRY_TABLE}"
+)
+# Re-read under the state lock: the version may have been published, failed or dropped
+# since it was selected. can_drop is NULL when the table no longer exists.
+_LOCK_VERSION_SQL = f"""
+    SELECT r.status, r.dropped_at, pg_has_role(c.relowner, 'MEMBER') AS can_drop
+    FROM {QUALIFIED_REGISTRY_TABLE} r
+    LEFT JOIN pg_class c ON c.oid = to_regclass($2)
+    WHERE r.table_name = $1
+    FOR UPDATE OF r
 """
 
 
@@ -69,8 +100,23 @@ async def _table_exists(connection, qualified_name):
     return await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", qualified_name)
 
 
+async def _add_dropped_at(connection):
+    try:
+        await connection.execute(_ADD_DROPPED_AT_SQL)
+    except Exception as exc:
+        if getattr(exc, "sqlstate", "") != INSUFFICIENT_PRIVILEGE:
+            raise
+        raise RuntimeError(
+            f"{QUALIFIED_REGISTRY_TABLE} is missing dropped_at and this login does not own it; "
+            "run the database bootstrap task to reassign ownership to the shared owner role."
+        ) from exc
+
+
 async def ensure_registry(connection):
-    if await _table_exists(connection, QUALIFIED_REGISTRY_TABLE):
+    registry = await connection.fetchrow(_REGISTRY_STATE_SQL, QUALIFIED_REGISTRY_TABLE)
+    if registry["present"]:
+        if not registry["has_dropped_at"]:
+            await _add_dropped_at(connection)
         return
     async with connection.transaction():
         await connection.execute("SELECT pg_advisory_xact_lock(hashtext($1))", _REGISTRY_LOCK)
@@ -87,10 +133,17 @@ async def allocate_version(connection, state, request_key):
             "SELECT pg_advisory_xact_lock(hashtext($1))", f"{_STATE_LOCK_PREFIX}{state}"
         )
         existing = await connection.fetchrow(
-            f"SELECT state, version, table_name FROM {QUALIFIED_REGISTRY_TABLE} WHERE request_key = $1",
+            f"SELECT state, version, table_name, dropped_at FROM {QUALIFIED_REGISTRY_TABLE} "
+            "WHERE request_key = $1",
             request_key,
         )
         if existing:
+            if existing["dropped_at"] is not None:
+                # Never recreate an expired table under a registry row that says it is gone.
+                raise RuntimeError(
+                    f"Embedding version {existing['table_name']} for request {request_key} expired and "
+                    "was dropped; submit the manifest again under a new requestKey."
+                )
             return EmbeddingVersion(existing["state"], existing["version"], existing["table_name"])
 
         version = await connection.fetchval(
@@ -131,14 +184,14 @@ async def mark_ready(connection, request_key, table_name):
 
     result = await connection.execute(
         f"UPDATE {QUALIFIED_REGISTRY_TABLE} SET status = $1, row_count = $2, completed_at = now() "
-        "WHERE request_key = $3 AND table_name = $4",
+        "WHERE request_key = $3 AND table_name = $4 AND dropped_at IS NULL",
         READY,
         row_count,
         request_key,
         table_name,
     )
     if result.endswith(" 0"):
-        raise LookupError(f"No embedding version {table_name} is registered for request {request_key}.")
+        raise LookupError(f"No live embedding version {table_name} is registered for request {request_key}.")
     return row_count
 
 
@@ -152,3 +205,97 @@ async def mark_failed(connection, request_key):
         BUILDING,
     )
     return not result.endswith(" 0")
+
+
+def select_expired(rows, now, retention_days):
+    """Registry rows whose table can be dropped, ordered by state and version.
+
+    The newest live READY version of a state is never selected: a READY version expires
+    only once a newer, live READY version of the same state has been published for the
+    retention period. FAILED versions expire from when they failed, and a version still
+    BUILDING after the retention period is abandoned.
+    """
+    cutoff = now - timedelta(days=retention_days)
+    published = {}
+    for row in rows:
+        if row["status"] == READY and row["dropped_at"] is None and row["completed_at"] is not None:
+            published.setdefault(row["state"], []).append(row)
+
+    def expired(row):
+        if row["dropped_at"] is not None:
+            return False
+        if row["status"] == READY:
+            return any(
+                newer["version"] > row["version"] and newer["completed_at"] < cutoff
+                for newer in published.get(row["state"], ())
+            )
+        if row["status"] == FAILED:
+            return row["completed_at"] is not None and row["completed_at"] < cutoff
+        if row["status"] == BUILDING:
+            return row["created_at"] < cutoff
+        return False
+
+    return sorted((row for row in rows if expired(row)), key=lambda row: (row["state"], row["version"]))
+
+
+class ExpiryResult(NamedTuple):
+    dropped: list
+    not_owner: list
+
+
+async def _drop_version(connection, row):
+    """Drop one version under its state lock; returns 'dropped', 'not_owner' or 'changed'."""
+    table_name = validate_versioned_table_name(row["table_name"])
+    qualified = qualified_embeddings_table(table_name)
+    async with connection.transaction():
+        # Same lock allocate_version takes, so a retried allocation cannot interleave.
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1))", f"{_STATE_LOCK_PREFIX}{row['state']}"
+        )
+        await connection.execute(f"SET LOCAL lock_timeout = '{DROP_LOCK_TIMEOUT}'")
+        current = await connection.fetchrow(_LOCK_VERSION_SQL, table_name, qualified)
+        if current is None or current["dropped_at"] is not None or current["status"] != row["status"]:
+            return "changed"
+        if current["can_drop"] is False:
+            return "not_owner"
+        await connection.execute(f"DROP TABLE IF EXISTS {qualified}")
+        await connection.execute(
+            f"UPDATE {QUALIFIED_REGISTRY_TABLE} SET dropped_at = now() WHERE table_name = $1",
+            table_name,
+        )
+    return "dropped"
+
+
+async def expire_versions(connection, retention_days):
+    """Drop version tables past the retention period.
+
+    Every expired table is attempted. Tables this login cannot drop because another
+    rotation login owns them are logged and reported but not retried: only the bootstrap
+    task can reassign them. Any other failure (e.g. lock_timeout behind a live query)
+    raises at the end so the invocation is retried.
+    """
+    now = await connection.fetchval("SELECT now()")
+    rows = select_expired(await connection.fetch(_REGISTRY_ROWS_SQL), now, retention_days)
+    dropped, not_owner, failed = [], [], []
+    for row in rows:
+        table_name = row["table_name"]
+        try:
+            outcome = await _drop_version(connection, row)
+        except Exception as exc:
+            timed_out = getattr(exc, "sqlstate", "") == LOCK_NOT_AVAILABLE
+            log.error(f"expire_versions() Could not drop {table_name}: {'lock timeout' if timed_out else exc}")
+            failed.append(table_name)
+            continue
+        if outcome == "dropped":
+            dropped.append(table_name)
+        elif outcome == "not_owner":
+            log.error(
+                f"expire_versions() Cannot drop {table_name}: owned by a role this login is not a "
+                "member of. Run the database bootstrap task to reassign it to the shared owner role."
+            )
+            not_owner.append(table_name)
+        else:
+            log.info(f"expire_versions() Skipping {table_name}: its registry row changed since selection")
+    if failed:
+        raise RuntimeError(f"Could not drop expired embeddings table(s): {', '.join(failed)}")
+    return ExpiryResult(dropped, not_owner)

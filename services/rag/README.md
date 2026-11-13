@@ -467,6 +467,34 @@ MuleSoft then calls `GET /manifest/<requestKey>/results` (`409` while the run is
 still processing, `404` if the key is unknown). The S3 uploads themselves no
 longer trigger any Lambda.
 
+**Version retention.** At 06:00 UTC on the 1st of each month, EventBridge
+invokes the embeddings Lambda with `{"action": "expire", "retentionDays": N}`,
+where `N` is `EMBEDDINGS_RETENTION_DAYS` in `embeddings-lambda-construct.ts`
+(30 days; the Lambda has no default of its own). `embedding_versions.expire_versions`
+drops these `embeddings_<state>_v<version>` tables and sets `dropped_at` on their
+registry rows:
+
+- a `READY` version, once a newer `READY` version of the same state has been
+  published for `N` days. The newest `READY` version of a state is never
+  dropped, however old it is.
+- a `FAILED` version, `N` days after it failed.
+- a version still `BUILDING` `N` days after it was allocated (an abandoned run).
+  A retried workflow for that `requestKey` then fails instead of recreating the
+  table, and `finalize` can never publish a dropped version.
+
+Because the schedule is monthly, a table is dropped `N`–`N + 31` days after it
+stopped being needed. Each drop runs under the state's advisory lock with a
+`lock_timeout` of 5s, so it gives up rather than stalling live searches on that
+table. The API checks `contract` against the database on every request, so a
+dropped version is rejected as an unknown contract.
+
+If a drop fails (for example a lock timeout), the run tries the rest and then
+fails; Lambda's async-invoke config retries it twice and the error shows in the
+Lambda's logs. A table owned by the *other* rotation login can't be dropped by
+this one: it is logged as an error and returned under `notOwner` without
+failing the run, and the next database bootstrap reassigns it to
+`aisuite_app_owner` so the following month's run drops it.
+
 Output for `<folder>/<file>.pdf` in the post-processing bucket:
 
 - `<folder>_bdaoutput/<file>/` raw BDA output

@@ -134,6 +134,8 @@ async def _finalize(event):
     request_key = _required(event, "requestKey")
     table_name = embedding_versions.validate_versioned_table_name(event.get("tableName"))
     async with pooled_connection() as connection:
+        # Adds dropped_at to a registry created before retention existed.
+        await embedding_versions.ensure_registry(connection)
         row_count = await embedding_versions.mark_ready(connection, request_key, table_name)
     log.info(f"Embeddings table {table_name} ready with {row_count} row(s) for request {request_key}")
     return {"tableName": table_name, "rowCount": row_count}
@@ -148,7 +150,20 @@ async def _fail(event):
     return {"requestKey": request_key, "markedFailed": marked}
 
 
-ACTIONS = {"allocate": _allocate, "embed": _embed, "finalize": _finalize, "fail": _fail}
+async def _expire(event):
+    # Invoked monthly by EventBridge, which always sends retentionDays
+    # (EMBEDDINGS_RETENTION_DAYS in embeddings-lambda-construct.ts).
+    retention_days = event.get("retentionDays")
+    if isinstance(retention_days, bool) or not isinstance(retention_days, int) or retention_days < 1:
+        raise ValueError(f"retentionDays must be a whole number of days >= 1, got {retention_days!r}.")
+    async with pooled_connection() as connection:
+        await embedding_versions.ensure_registry(connection)
+        result = await embedding_versions.expire_versions(connection, retention_days)
+    log.info(f"Dropped {len(result.dropped)} expired embeddings table(s): {result.dropped}")
+    return {"retentionDays": retention_days, "dropped": result.dropped, "notOwner": result.not_owner}
+
+
+ACTIONS = {"allocate": _allocate, "embed": _embed, "finalize": _finalize, "fail": _fail, "expire": _expire}
 
 
 async def _run_action(event):

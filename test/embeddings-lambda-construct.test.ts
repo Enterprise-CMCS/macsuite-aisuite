@@ -62,6 +62,22 @@ describe("EmbeddingsLambdaConstruct", () => {
         ],
       },
     });
-    template.resourceCountIs("AWS::Events::Rule", 0);
+    // The only schedule: monthly expiry of superseded embeddings versions.
+    template.resourceCountIs("AWS::Events::Rule", 1);
+    template.hasResourceProperties("AWS::Events::Rule", {
+      ScheduleExpression: "cron(0 6 1 * ? *)",
+      State: "ENABLED",
+      Targets: [
+        Match.objectLike({
+          Input: JSON.stringify({ action: "expire", retentionDays: 30 }),
+          RetryPolicy: { MaximumRetryAttempts: 2 },
+        }),
+      ],
+    });
+    // EventBridge's RetryPolicy only covers delivery; Lambda retries function errors.
+    template.hasResourceProperties("AWS::Lambda::EventInvokeConfig", {
+      MaximumEventAgeInSeconds: 21600,
+      MaximumRetryAttempts: 2,
+    });
   });
 });
