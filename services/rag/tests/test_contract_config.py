@@ -10,6 +10,8 @@ if str(_RAG_ROOT) not in sys.path:
     sys.path.insert(0, str(_RAG_ROOT))
 
 from common.utils.contract_config import (  # noqa: E402
+    common_embeddings_table_name,
+    common_input_prefix,
     get_config_property,
     list_embeddings_table_names_from_config,
     load_config,
@@ -44,7 +46,7 @@ class ActiveContractResolutionTests(unittest.TestCase):
             input_bucket_name = aisuite-dev-contract-rag
             input_prefix =
             embeddings_table_name = embeddings
-            code_bucket_name = aisuite-dev-llm-pipeline-code
+            temp_bucket_name = aisuite-dev-llm-pipeline-temp
 
             [contract:me_0002]
             active = false
@@ -67,8 +69,8 @@ class ActiveContractResolutionTests(unittest.TestCase):
             "embeddings_tn_6756_tenncare",
         )
         self.assertEqual(
-            get_config_property(config, "code_bucket_name"),
-            "aisuite-dev-llm-pipeline-code",
+            get_config_property(config, "temp_bucket_name"),
+            "aisuite-dev-llm-pipeline-temp",
         )
         self.assertEqual(
             list_embeddings_table_names_from_config(config),
@@ -125,19 +127,18 @@ class ActiveContractResolutionTests(unittest.TestCase):
         self.assertEqual(get_config_property(config, "embeddings_table_name"), "embeddings")
         self.assertIsNone(resolve_active_contract_section(config))
 
-    def test_shipped_dev_ini_defaults_to_tn_6756(self):
+    def test_shipped_dev_ini_configures_common_and_manifest_prefixes(self):
         shipped = _RAG_ROOT / "common" / "utils" / "aws.properties.ini"
         config = load_config(str(shipped))
+        self.assertEqual(get_config_property(config, "manifest_prefix"), "manifests/")
+        self.assertEqual(get_config_property(config, "results_prefix"), "manifest-results/")
+        self.assertEqual(common_input_prefix(config), "common/")
+        self.assertEqual(common_embeddings_table_name(config), "embeddings_cms_regs")
         self.assertEqual(
-            get_config_property(config, "input_prefix"),
-            "state_of_TN/MCCRS-TN-6756-TennCare/",
+            list_embeddings_table_names_from_config(config),
+            ["embeddings_cms_regs"],
         )
-        self.assertEqual(
-            get_config_property(config, "embeddings_table_name"),
-            "embeddings_tn_6756_tenncare",
-        )
-        self.assertEqual(len(list_embeddings_table_names_from_config(config)), 5)
-        self.assertEqual(resolve_active_contract_section(config), "contract:tn_6756")
+        self.assertIsNone(resolve_active_contract_section(config))
 
     def test_absolute_config_path_passthrough(self):
         path = self._write_ini(

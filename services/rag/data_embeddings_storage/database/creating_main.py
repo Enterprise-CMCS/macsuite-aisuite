@@ -1,5 +1,4 @@
 import asyncio
-import os
 import json
 import pathlib
 import sys
@@ -38,7 +37,7 @@ async def process_pg_vector_db():
     if not rag_split_out_put_folder.endswith('/'):
         rag_split_out_put_folder += '/'
     
-    s3_file_key = os.path.join(rag_split_out_put_folder, rag_split_out_put_file)
+    s3_file_key = f"{rag_split_out_put_folder}{rag_split_out_put_file}"
     
     log.info(f"Loading data from S3: Bucket={rag_split_out_put_bucket}, Key={s3_file_key}")
     print(f"Loading from S3: s3://{rag_split_out_put_bucket}/{s3_file_key}")

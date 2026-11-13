@@ -16,6 +16,10 @@ import {
   type DeploymentEnvironmentName,
 } from "../deployment-config";
 import { STUB_VPC_CONTEXT_KEY } from "./networking-construct";
+import {
+  BEDROCK_EMBED_MODEL_ID,
+  BEDROCK_MODEL_ID,
+} from "./pre-processing-lambda-construct";
 
 export const API_CONTAINER_PORT = 8001;
 
@@ -31,8 +35,16 @@ export const API_IMAGE_TAG_CONTEXT_KEY = "aisuite:apiImageTag";
 
 const DEFAULT_API_IMAGE_TAG = "latest";
 
-const BEDROCK_MODEL_ID = "us.amazon.nova-pro-v1:0";
-const BEDROCK_EMBED_MODEL_ID = "us.cohere.embed-v4:0";
+// The requirement review task runs `python -m search.manifest_review` from the API image.
+export const REVIEW_CONTAINER_NAME = "requirement-review";
+// Concurrent requirement reviews per task; bounded by Bedrock throughput, not task size.
+const REVIEW_CONCURRENCY = 4;
+const REVIEW_TASK_SIZE = { cpu: 1024, memoryLimitMiB: 2048 } as const;
+
+const RUNTIME_PLATFORM: ecs.RuntimePlatform = {
+  cpuArchitecture: ecs.CpuArchitecture.X86_64,
+  operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+};
 
 const TASK_SIZE_BY_ENVIRONMENT = {
   dev: { cpu: 256, memoryLimitMiB: 512 },
@@ -49,17 +61,18 @@ export interface ComputeConstructProps {
   dbSecret: secretsmanager.ISecret;
   deploymentConfig: DeploymentConfig;
   documentsBucket: s3.IBucket;
-  pipelineCodeBucket: s3.IBucket;
   pipelineTempBucket: s3.IBucket;
-  postProcessingBucket: s3.IBucket;
   taskRole: iam.IRole;
   vpc: ec2.IVpc;
 }
 
 export class ComputeConstruct extends Construct {
+  public readonly apiContainer: ecs.ContainerDefinition;
   public readonly cluster: ecs.Cluster;
   public readonly loadBalancer: elbv2.ApplicationLoadBalancer;
   public readonly repository: ecr.Repository;
+  public readonly reviewContainer: ecs.ContainerDefinition;
+  public readonly reviewTaskDefinition: ecs.FargateTaskDefinition;
   public readonly service: ecs.FargateService;
 
   public constructor(
@@ -92,7 +105,8 @@ export class ComputeConstruct extends Construct {
 
     const executionRole = new iam.Role(this, "ExecutionRole", {
       assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-      description: "Execution role for the AISuite RAG API service.",
+      description:
+        "Execution role for the AISuite RAG API service and requirement review task.",
     });
     this.repository.grantPull(executionRole);
 
@@ -110,10 +124,7 @@ export class ComputeConstruct extends Construct {
         ...TASK_SIZE_BY_ENVIRONMENT[name],
         executionRole,
         family: serviceName,
-        runtimePlatform: {
-          cpuArchitecture: ecs.CpuArchitecture.X86_64,
-          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
-        },
+        runtimePlatform: RUNTIME_PLATFORM,
         taskRole: props.taskRole,
       },
     );
@@ -128,26 +139,60 @@ export class ComputeConstruct extends Construct {
     const apiActivated =
       activationContext === true || activationContext === "true";
 
-    const container = taskDefinition.addContainer("Container", {
+    const image = ecs.ContainerImage.fromEcrRepository(this.repository, imageTag);
+    // Both containers read the database, Bedrock and the manifest run files in the temp bucket.
+    const sharedEnvironment = {
+      AWS_DEFAULT_REGION: region,
+      AWS_REGION: region,
+      BEDROCK_EMBED_MODEL_ID,
+      BEDROCK_MODEL_ID,
+      DB_SECRET_ARN: props.dbSecret.secretArn,
+      PIPELINE_TEMP_BUCKET: props.pipelineTempBucket.bucketName,
+    };
+
+    this.apiContainer = taskDefinition.addContainer("Container", {
       containerName: "rag-api",
       environment: {
-        AWS_DEFAULT_REGION: region,
-        AWS_REGION: region,
-        BEDROCK_EMBED_MODEL_ID,
-        BEDROCK_MODEL_ID,
-        DB_SECRET_ARN: props.dbSecret.secretArn,
+        ...sharedEnvironment,
+        // The manifest API checks that every submitted document exists here.
         DOCUMENTS_BUCKET: props.documentsBucket.bucketName,
-        PIPELINE_CODE_BUCKET: props.pipelineCodeBucket.bucketName,
-        PIPELINE_TEMP_BUCKET: props.pipelineTempBucket.bucketName,
-        POST_PROCESSING_BUCKET: props.postProcessingBucket.bucketName,
       },
-      image: ecs.ContainerImage.fromEcrRepository(this.repository, imageTag),
+      image,
       logging: ecs.LogDrivers.awsLogs({ logGroup, streamPrefix: "rag-api" }),
     });
-    container.addPortMappings({
+    this.apiContainer.addPortMappings({
       containerPort: API_CONTAINER_PORT,
       protocol: ecs.Protocol.TCP,
     });
+
+    // Started per manifest run by the ingest workflow, never as a service.
+    this.reviewTaskDefinition = new ecs.FargateTaskDefinition(
+      this,
+      "ReviewTaskDefinition",
+      {
+        ...REVIEW_TASK_SIZE,
+        executionRole,
+        family: `${APPLICATION_NAME}-${name}-requirement-review`,
+        runtimePlatform: RUNTIME_PLATFORM,
+        taskRole: props.taskRole,
+      },
+    );
+    this.reviewContainer = this.reviewTaskDefinition.addContainer(
+      "ReviewContainer",
+      {
+        command: ["python", "-m", "search.manifest_review"],
+        containerName: REVIEW_CONTAINER_NAME,
+        environment: {
+          ...sharedEnvironment,
+          REVIEW_CONCURRENCY: String(REVIEW_CONCURRENCY),
+        },
+        image,
+        logging: ecs.LogDrivers.awsLogs({
+          logGroup,
+          streamPrefix: REVIEW_CONTAINER_NAME,
+        }),
+      },
+    );
 
     this.service = new ecs.FargateService(this, "Service", {
       circuitBreaker: { enable: true, rollback: false },
@@ -242,7 +287,7 @@ export class ComputeConstruct extends Construct {
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [
         this.service.loadBalancerTarget({
-          containerName: container.containerName,
+          containerName: this.apiContainer.containerName,
           containerPort: API_CONTAINER_PORT,
         }),
       ],

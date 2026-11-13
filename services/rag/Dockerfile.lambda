@@ -1,0 +1,12 @@
+FROM public.ecr.aws/lambda/python:3.14-arm64
+
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY common ${LAMBDA_TASK_ROOT}/common
+COPY data_preprocessing ${LAMBDA_TASK_ROOT}/data_preprocessing
+
+COPY data_embeddings_storage ${LAMBDA_TASK_ROOT}/data_embeddings_storage
+
+# The CDK stack overrides CMD per function: pre_processing.handler or rag_process.handler.
+CMD ["data_preprocessing.pre_processing.handler"]

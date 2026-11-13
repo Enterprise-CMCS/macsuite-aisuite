@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 from botocore.config import Config
 
-from data_preprocessing.bedrock.bda_results import BDAResults
+from data_preprocessing.bedrock.bda_results import BDAResults, doc_output_prefix, per_doc_output_key
 from data_preprocessing.parsing.parsed_text_data import element_page, printed_page_map
 from common.utils.helper import Helper
 from common.utils.logger import log
@@ -144,11 +144,11 @@ def invoke_image_analysis_batch(image_strings):
     return asyncio.run(run_batch())
 
 
-def image_text_organization(data, elements, image_analysis_text, source_key,  doc_id, printed_pages=None):
+def image_text_organization(data, elements, image_analysis_text, source_key,  doc_name, printed_pages=None):
     log.debug("***************** Parsed_Images.image_text_organization start *****************************")
     log.debug(f"Passed (Decoded)image_analysis_text =  {image_analysis_text}".encode('cp1252', errors='ignore').decode('cp1252'))
-    log.debug(f"Passed (Decoded) source_key= {source_key}.encode('cp1252', errors='ignore').decode('cp1252')")
-    log.debug(f"Passed (Decoded) doc_id={doc_id}.encode('cp1252', errors='ignore').decode('cp1252')")
+    log.debug(f"Passed (Decoded) source_key= {source_key}".encode('cp1252', errors='ignore').decode('cp1252'))
+    log.debug(f"Passed (Decoded) doc_name={doc_name}".encode('cp1252', errors='ignore').decode('cp1252'))
     summary = elements.get("summary","")
     content_markdown = elements.get("representation",{}).get("markdown",None)
     if image_analysis_text:
@@ -166,9 +166,9 @@ def image_text_organization(data, elements, image_analysis_text, source_key,  do
     reading_order = elements.get("reading_order",float("inf"))
     images = {
         "text" : content,
-        "doc_id": f"{doc_id}::Order{reading_order}",
+        "doc_id": f"{doc_name}::Order{reading_order}",
         "metadata":{
-            "doc_name":doc_id,
+            "doc_id":doc_name,
             "page":page_number,
             "printed_page": (printed_pages or {}).get(page_number, ""),
             "element_type": "IMAGE",
@@ -186,9 +186,9 @@ def parsed_image_info(source_data):
     # Images are collected here first and then sent to Bedrock together, so the calls run concurrently.
     pending_analysis_items = []
     source_key = source_data.get("metadata", {}).get("s3_key")
-    log.debug(f"s3_akey from data. source_key={source_key}")
-    doc_id = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-    log.debug(f"Getting doc_id={doc_id}")
+    log.debug(f"s3_key from data. source_key={source_key}")
+    doc_name = source_key.rsplit("/", 1)[-1].rsplit(".", 1)[0].replace(" ", "_")
+    log.debug(f"Getting doc_name={doc_name}")
 
     printed_pages = printed_page_map(source_data.get("elements"))
 
@@ -196,6 +196,8 @@ def parsed_image_info(source_data):
         element_type = elements.get("type")
         if element_type == "FIGURE":
             sub_type = elements.get("sub_type")
+            if sub_type == "LOGO":
+                continue
             if sub_type in ["DIAGRAM","IMAGE","CHART"]:
                 #log.debug(f"Element type = {element_type} Sub element type ={sub_type}")
                 s3_keys = elements.get("crop_images")
@@ -217,7 +219,7 @@ def parsed_image_info(source_data):
                 continue
 
             image_analysis_text = ''
-            other_subtype_document = image_text_organization(source_data,elements,image_analysis_text,source_key,doc_id,printed_pages)
+            other_subtype_document = image_text_organization(source_data,elements,image_analysis_text,source_key,doc_name,printed_pages)
             total_images_analysed = total_images_analysed + 1
             image_data += [other_subtype_document]
 
@@ -227,18 +229,18 @@ def parsed_image_info(source_data):
         image_analysis_texts = image_batch_processing(image_strings)
 
         for (record_index, elements, str_encoded), image_analysis_text in zip(pending_analysis_items, image_analysis_texts):
-            image_data_temp = image_text_organization(source_data, elements, image_analysis_text, source_key, doc_id, printed_pages)
+            image_data_temp = image_text_organization(source_data, elements, image_analysis_text, source_key, doc_name, printed_pages)
             image_data[record_index] = image_data_temp
             total_images_analysed = total_images_analysed + 1
 
     log.info(f"parsed_image_info() Total Images for {source_key} document. totalImagesAnalysed={total_images_analysed}")
     return image_data
 
-def invoke_parsed_images_data():
+def invoke_parsed_images_data(source_key):
     try:
         log.info(f"invoke_parsed_images_data() Starts Parsed_Images File __main__={__name__}")
         output_bucket = Helper.get_property("output_bucket")
-        output_prefix = Helper.get_property("output_prefix")
+        output_prefix = doc_output_prefix(source_key)
         foundation_llm_model_id = Helper.get_property("foundation_llm_model_id")
         max_concurrent_image_calls = int(Helper.get_property("concurrent_bedrock_image_calls", default=5))
 
@@ -315,21 +317,13 @@ def invoke_parsed_images_data():
         for data in parsed_data:
             log.debug(f"Parsing data at counter = {i_count}")
             image_data_lcl = parsed_image_info(data)
-            source_key = data.get("metadata", {}).get("s3_key")
-            Helper.summary_file("IMAGE", f"\n{now}Processing file {source_key}")
+            bda_source_key = data.get("metadata", {}).get("s3_key")
+            Helper.summary_file("IMAGE", f"\n{now}Processing file {bda_source_key}")
             all_image.extend(image_data_lcl)
             i_count = i_count + 1
 
 
-        #BDAImageOutputFolder = os.getenv("BDAImageOutputFolder")
-        bda_image_output_folder = Helper.get_property("BDAImageOutputFolder")
-        #BDAImageOutputFilename = os.getenv("BDAImageOutputFilename")
-
-        bda_image_output_filename = os.path.join(bda_image_output_folder, Helper.get_property("BDAImageOutputFilename"))
-        log.debug(f"Output Table File Name={bda_image_output_filename}")
-
-        # BDAImagesOutputFilename = "Output-BDA-images.json"
-
+        bda_image_output_filename = per_doc_output_key(source_key, "image")
         log.debug(f"Output Image File Name={bda_image_output_filename}")
 
         s3_client = boto3.client('s3')

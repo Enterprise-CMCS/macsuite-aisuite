@@ -1,18 +1,48 @@
 import json
+import os
 from botocore.exceptions import ClientError
 
 from common.utils.helper import Helper
 from common.utils.logger import log
 
 
+def doc_name_for_key(key):
+    return os.path.splitext(os.path.basename(key))[0].replace(" ", "_")
+
+
+OUTPUT_FOLDERS = {"text": "BDATextOutput", "table": "BDATableOutput", "image": "BDAImageOutput"}
+
+
+def output_root(key):
+    parts = [part for part in os.path.dirname(key).split("/") if part] or ["root"]
+    return "/".join([f"{parts[0]}_bdaoutput", *parts[1:]]) + "/"
+
+
+def bda_output_prefix(key):
+    return f"{output_root(key)}bdaoutput/"
+
+
+def doc_output_prefix(key):
+    return f"{bda_output_prefix(key)}{doc_name_for_key(key)}/"
+
+
+def per_doc_output_key(key, kind):
+    return f"{output_root(key)}{OUTPUT_FOLDERS[kind]}/{doc_name_for_key(key)}-preprocessed-{kind}.json"
+
+
+RAG_OUTPUT_PREFIX = "RAG_Output/"
+
+
+def rag_output_key(key):
+    """state_of_TN/Contract/a.pdf -> RAG_Output/state_of_TN/Contract/a.json ; a.pdf -> RAG_Output/a.json"""
+    folder = os.path.dirname(key).strip("/")
+    return f"{RAG_OUTPUT_PREFIX}{folder + '/' if folder else ''}{doc_name_for_key(key)}.json"
+
 class BDAResults:
     def __init__(self):
 
         pass
 
-    """Look for object in list_objects_v2
-        Get paginator for given bucket and Prefix
-        Gets Body of files ending with result.json and creates Array of it and return to Callin function"""
 
     def fetch_parsed_bda_results(self, bucket, output_prefix,awsPClientS3, calledFrom=""):
         log.info(f"*********Bda_Parsed_file_Access.fetch_parsed_bda_results start ******************** called with bucket={bucket}, output_prefix={output_prefix}")

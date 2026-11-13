@@ -7,6 +7,11 @@ import re
 _CONTRACT_SECTION_PREFIX = "contract:"
 _EMBEDDINGS_TABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
+# Shared reference material (42 CFR Part 438, the CMS State Guide, ...) that
+# search should consult alongside whichever contract is active, not instead
+# of it. Unlike the per-state sections this one is never the active contract
+# except while it is being ingested.
+COMMON_CONTRACT_SECTION = "contract:common_cms_regs"
 
 def resolve_config_path(config_file="aws.properties.ini", *, ai_prop_file=None, utils_dir=None):
     if ai_prop_file is None:
@@ -46,6 +51,9 @@ def resolve_active_contract_section(config):
         if config.getboolean(section, "active", fallback=False)
     ]
     if len(active_sections) == 0:
+        state_sections = [s for s in sections if s != COMMON_CONTRACT_SECTION]
+        if not state_sections:
+            return None
         raise ValueError(
             "No active contract section: set active = true on exactly one "
             f"[contract:…] section (found: {sections})."
@@ -56,6 +64,13 @@ def resolve_active_contract_section(config):
             f"{active_sections}; only one may have active = true."
         )
     return active_sections[0]
+
+
+def normalize_s3_prefix(prefix):
+    if prefix is None:
+        return None
+    cleaned = str(prefix).strip().strip("/")
+    return f"{cleaned}/" if cleaned else None
 
 
 def validate_embeddings_table_name(table_name):
@@ -77,6 +92,34 @@ def get_config_property(config, str_property_name, *, default=None, raise_if_mis
         return default
     raise KeyError(str_property_name)
 
+
+def common_input_prefix(config, section=COMMON_CONTRACT_SECTION):
+    """The S3 prefix for shared common-table documents, normalized with a trailing slash."""
+    if config.has_section(section) and config.has_option(section, "input_prefix"):
+        prefix = normalize_s3_prefix(config.get(section, "input_prefix"))
+        if prefix:
+            return prefix
+    if config.has_option("default", "common_input_prefix"):
+        return normalize_s3_prefix(config.get("default", "common_input_prefix"))
+    return None
+
+
+def common_embeddings_table_name(config, section=COMMON_CONTRACT_SECTION):
+    """The shared-knowledge-base table name, or None if that section isn't configured.
+
+    Read directly off `section` (or `[default] common_embeddings_table_name`) rather than
+    through active-contract resolution, since this table is fixed and consulted across
+    every state contract review.
+    """
+    if config.has_section(section) and config.has_option(section, "embeddings_table_name"):
+        raw = config.get(section, "embeddings_table_name").strip()
+        if raw:
+            return validate_embeddings_table_name(raw)
+    if config.has_option("default", "common_embeddings_table_name"):
+        raw = config.get("default", "common_embeddings_table_name").strip()
+        if raw:
+            return validate_embeddings_table_name(raw)
+    return None
 
 def list_embeddings_table_names_from_config(config):
     names = []

@@ -3,7 +3,12 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-Status = Literal["MET", "NOT MET", "UNCLEAR"]
+Status = Literal["MET", "UNSURE"]
+
+UnsureReason =Literal["missing_evidence", 
+                  "conflicting_evidence", 
+                  "quote_not_verified", 
+                  "low_retrieval_confidence",]
 
 # "in chunk 3566", "from chunks 3733 and 3740" - how the model cites the search
 # results while it works. The reviewer reading the workbook never sees the chunks,
@@ -51,45 +56,9 @@ class CitedEvidence(BaseModel):
     )
 
 
-class RequirementAssessment(BaseModel):
-    status: Status
-    argument: str = Field(description="Why the contract text supports this status, referring to the quotes")
-    evidence: List[CitedEvidence] = Field(default_factory=list)
-    missing_information: str = Field(
-        default="",
-        description="For NOT MET or UNCLEAR, the specific language or provision that would settle it",
-    )
-    confidence: float = Field(ge=0.0, le=1.0, description="How likely this status is correct, 0.0 to 1.0")
-
-
-class Challenge(BaseModel):
-    """The opposing case, argued by a separate agent that has not committed to a view."""
-
-    counter_status: Status = Field(description="The status the evidence supports once the assessment is challenged")
-    counter_argument: str = Field(description="The strongest case against the assessment's status")
-    misread_evidence: List[str] = Field(
-        default_factory=list,
-        description="The exact words the reviewer stretched beyond what they actually say",
-    )
-    evidence_gaps: List[str] = Field(
-        default_factory=list,
-        description="What the assessment treated as settled but the retrieved text never states",
-    )
-    confidence: float = Field(ge=0.0, le=1.0, description="How strong the opposing case is, 0.0 to 1.0")
-
-
-class Adjudication(BaseModel):
-    """Final call, made after seeing both the assessment and the challenge."""
-
-    status: Status
-    argument: str = Field(description="Why this status is correct, addressing the challenge head on")
-    counter_argument: str = Field(description="The strongest remaining argument against this status")
-    follow_up: str = Field(default="", description="What the reviewer should ask the state for, if anything")
-    confidence: float = Field(ge=0.0, le=1.0, description="Calibrated likelihood this status is correct")
-
-
 class EvidenceRecord(BaseModel):
     quote: str
+    chunk_text: str = "" 
     chunk_id: Optional[int] = None
     doc_id: str = ""
     page: Optional[int] = None
@@ -99,7 +68,6 @@ class EvidenceRecord(BaseModel):
     retrieval_confidence: Optional[float] = None
     verified: bool = False
 
-
 class RequirementReview(BaseModel):
     requirement: str
     sheet: str = ""
@@ -107,11 +75,21 @@ class RequirementReview(BaseModel):
     legal_cite: str = ""
     row: Optional[int] = None
 
-    status: Status = "UNCLEAR"
+    status: Status = "UNSURE"
+    unsure_reason : Optional[UnsureReason] = None
+    debate_used: bool = False
+    debate_summary: str = ""
+
     argument: str = ""
     counter_argument: str = ""
     follow_up: str = ""
     missing_information: str = ""
+    # Stage 2 explanation, informed by 42 CFR Part 438 / CMS State Guide context.
+    # Defaults to "" so sidecar lines written before this field still load.
+    decision_response: str = ""
+    # Stage 2's own High/Medium/Low label. Kept separate from the numeric
+    # retrieval_confidence because the two measure different things.
+    decision_confidence: str = ""
 
     llm_confidence: Optional[float] = None
     retrieval_confidence: Optional[float] = None

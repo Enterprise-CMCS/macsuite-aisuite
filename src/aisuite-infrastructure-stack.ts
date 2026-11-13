@@ -3,11 +3,15 @@ import type * as ec2 from "aws-cdk-lib/aws-ec2";
 import { Construct } from "constructs";
 
 import { AppIamConstruct } from "./constructs/app-iam-construct";
-import { BatchConstruct } from "./constructs/batch-construct";
-import { BootstrapConstruct } from "./constructs/bootstrap-construct";
 import { ComputeConstruct } from "./constructs/compute-construct";
 import { DatabaseConstruct } from "./constructs/database-construct";
+import { EmbeddingsLambdaConstruct } from "./constructs/embeddings-lambda-construct";
+import {
+  IngestWorkflowConstruct,
+  MANIFEST_RUN_PREFIXES,
+} from "./constructs/ingest-workflow-construct";
 import { NetworkingConstruct } from "./constructs/networking-construct";
+import { PreProcessingLambdaConstruct } from "./constructs/pre-processing-lambda-construct";
 import { SecretsConstruct } from "./constructs/secrets-construct";
 import { StorageConstruct } from "./constructs/storage-construct";
 import type { DeploymentConfig } from "./deployment-config";
@@ -51,9 +55,27 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
 
     const appIam = new AppIamConstruct(this, "AppIam", {
       dbSecret: database.appDbSecret,
-      documentsBucket: storage.documentsBucket,
-      pipelineTempBucket: storage.pipelineTempBucket,
+    });
+
+    const preProcessing = new PreProcessingLambdaConstruct(
+      this,
+      "PreProcessingLambda",
+      {
+        appSecurityGroup: networking.appSecurityGroup,
+        deploymentConfig,
+        documentsBucket: storage.documentsBucket,
+        pipelineTempBucket: storage.pipelineTempBucket,
+        postProcessingBucket: storage.postProcessingBucket,
+        vpc: networking.vpc,
+      },
+    );
+
+    const embeddings = new EmbeddingsLambdaConstruct(this, "EmbeddingsLambda", {
+      appSecurityGroup: networking.appSecurityGroup,
+      dbSecret: database.appDbSecret,
+      deploymentConfig,
       postProcessingBucket: storage.postProcessingBucket,
+      vpc: networking.vpc,
     });
 
     const compute = new ComputeConstruct(this, "Compute", {
@@ -61,34 +83,32 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
       dbSecret: database.appDbSecret,
       deploymentConfig,
       documentsBucket: storage.documentsBucket,
-      pipelineCodeBucket: storage.pipelineCodeBucket,
       pipelineTempBucket: storage.pipelineTempBucket,
-      postProcessingBucket: storage.postProcessingBucket,
       taskRole: appIam.taskRole,
       vpc: networking.vpc,
     });
 
-    const batch = new BatchConstruct(this, "Batch", {
-      appSecurityGroup: networking.appSecurityGroup,
-      dbSecret: database.appDbSecret,
+    const ingestWorkflow = new IngestWorkflowConstruct(this, "IngestWorkflow", {
+      cluster: compute.cluster,
       deploymentConfig,
-      documentsBucket: storage.documentsBucket,
-      pipelineCodeBucket: storage.pipelineCodeBucket,
-      pipelineTempBucket: storage.pipelineTempBucket,
-      postProcessingBucket: storage.postProcessingBucket,
-      taskRole: appIam.taskRole,
-      vpc: networking.vpc,
+      embeddingsFunction: embeddings.function,
+      preProcessingFunction: preProcessing.function,
+      reviewContainer: compute.reviewContainer,
+      reviewSecurityGroup: networking.appSecurityGroup,
+      reviewTaskDefinition: compute.reviewTaskDefinition,
     });
+    compute.apiContainer.addEnvironment(
+      "INGEST_STATE_MACHINE_ARN",
+      ingestWorkflow.stateMachine.stateMachineArn,
+    );
 
-    const bootstrap = new BootstrapConstruct(this, "Bootstrap", {
-      appDbSecret: secrets.appDbSecret,
-      appSecurityGroup: networking.appSecurityGroup,
-      cluster: batch.cluster,
-      deploymentConfig,
-      masterDbSecret: secrets.dbSecret,
-      repository: batch.repository,
-      vpc: networking.vpc,
-    });
+    // Shared by the manifest API and the requirement review task.
+    storage.documentsBucket.grantRead(appIam.taskRole);
+    for (const prefix of MANIFEST_RUN_PREFIXES) {
+      storage.pipelineTempBucket.grantReadWrite(appIam.taskRole, `${prefix}*`);
+    }
+    ingestWorkflow.stateMachine.grantStartExecution(appIam.taskRole);
+    ingestWorkflow.stateMachine.grantRead(appIam.taskRole);
 
     new cdk.CfnOutput(this, "DeploymentEnvironment", {
       description: "AISuite deployment environment represented by this stack.",
@@ -114,13 +134,8 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, "AppDbSecretArn", {
       description:
-        "Secrets Manager ARN holding the app-scoped RAG database credentials used by ECS containers.",
+        "Secrets Manager ARN holding the app-scoped RAG database credentials.",
       value: database.appDbSecret.secretArn,
-    });
-
-    new cdk.CfnOutput(this, "AppTaskRoleArn", {
-      description: "ECS task role for the AISuite RAG application.",
-      value: appIam.taskRole.roleArn,
     });
 
     new cdk.CfnOutput(this, "DocumentsBucketName", {
@@ -143,6 +158,54 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
       value: storage.pipelineTempBucket.bucketName,
     });
 
+    new cdk.CfnOutput(this, "PreProcessingFunctionName", {
+      description:
+        "Lambda the manifest workflow invokes per document; writes RAG_Output/ JSON.",
+      value: preProcessing.function.functionName,
+    });
+
+    new cdk.CfnOutput(this, "EmbeddingsFunctionName", {
+      description:
+        "Lambda the manifest workflow invokes to build the versioned per-state embeddings table.",
+      value: embeddings.function.functionName,
+    });
+
+    new cdk.CfnOutput(this, "IngestStateMachineArn", {
+      description:
+        "Step Functions state machine running a manifest: pre-processing, embeddings, requirement review and MuleSoft notification.",
+      value: ingestWorkflow.stateMachine.stateMachineArn,
+    });
+
+    new cdk.CfnOutput(this, "RequirementReviewTaskDefinitionArn", {
+      description:
+        "Fargate task definition the manifest workflow runs to review legal requirements.",
+      value: compute.reviewTaskDefinition.taskDefinitionArn,
+    });
+
+    new cdk.CfnOutput(this, "ManifestNotificationQueueUrl", {
+      description:
+        "SQS queue MuleSoft polls for COMPLETED/FAILED manifest run notifications.",
+      value: ingestWorkflow.notificationQueue.queueUrl,
+    });
+
+    new cdk.CfnOutput(this, "ManifestNotificationQueueArn", {
+      description:
+        "ARN of the manifest notification queue, for granting MuleSoft consume access.",
+      value: ingestWorkflow.notificationQueue.queueArn,
+    });
+
+    new cdk.CfnOutput(this, "ManifestNotificationDeadLetterQueueUrl", {
+      description:
+        "Dead-letter queue for manifest notifications MuleSoft failed to process.",
+      value: ingestWorkflow.notificationDeadLetterQueue.queueUrl,
+    });
+
+    new cdk.CfnOutput(this, "AppTaskRoleArn", {
+      description:
+        "ECS task role shared by the RAG API and the requirement review task.",
+      value: appIam.taskRole.roleArn,
+    });
+
     new cdk.CfnOutput(this, "AlbDnsName", {
       description: "Internal ALB hostname fronting the RAG API.",
       value: compute.loadBalancer.loadBalancerDnsName,
@@ -161,57 +224,6 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
     new cdk.CfnOutput(this, "ApiEcrRepositoryUri", {
       description: "ECR repository holding the RAG API container image.",
       value: compute.repository.repositoryUri,
-    });
-
-    new cdk.CfnOutput(this, "BatchClusterName", {
-      description: "ECS cluster for on-demand RAG batch tasks.",
-      value: batch.cluster.clusterName,
-    });
-
-    new cdk.CfnOutput(this, "PreProcessingTaskDefinitionArn", {
-      description: "Task definition ARN for document pre-processing.",
-      value: batch.preProcessingTaskDefinition.taskDefinitionArn,
-    });
-
-    new cdk.CfnOutput(this, "PreProcessingTaskDefinitionFamily", {
-      description: "Task definition family for document pre-processing.",
-      value: batch.preProcessingTaskDefinition.family,
-    });
-
-    new cdk.CfnOutput(this, "RagProcessTaskDefinitionArn", {
-      description: "Task definition ARN for RAG embedding processing.",
-      value: batch.ragProcessTaskDefinition.taskDefinitionArn,
-    });
-
-    new cdk.CfnOutput(this, "RagProcessTaskDefinitionFamily", {
-      description: "Task definition family for RAG embedding processing.",
-      value: batch.ragProcessTaskDefinition.family,
-    });
-
-    new cdk.CfnOutput(this, "BatchEcrRepositoryUri", {
-      description: "ECR repository holding the RAG batch container image.",
-      value: batch.repository.repositoryUri,
-    });
-
-    new cdk.CfnOutput(this, "BootstrapClusterName", {
-      description: "ECS cluster for the one-shot database bootstrap task.",
-      value: bootstrap.cluster.clusterName,
-    });
-
-    new cdk.CfnOutput(this, "BootstrapTaskDefinitionArn", {
-      description: "Task definition ARN for the database bootstrap task.",
-      value: bootstrap.taskDefinition.taskDefinitionArn,
-    });
-
-    new cdk.CfnOutput(this, "BootstrapSecurityGroupId", {
-      description: "Security group for the database bootstrap task.",
-      value: bootstrap.securityGroup.securityGroupId,
-    });
-
-    new cdk.CfnOutput(this, "BootstrapSubnetIds", {
-      description:
-        "Comma-separated private subnet IDs for the database bootstrap task.",
-      value: cdk.Fn.join(",", bootstrap.subnetIds),
     });
   }
 }

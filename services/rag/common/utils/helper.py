@@ -14,13 +14,14 @@ class Helper:
         "input_bucket_name": ("DOCUMENTS_BUCKET",),
         "output_bucket": ("POST_PROCESSING_BUCKET",),
         "RagSplitOutPutBucket": ("POST_PROCESSING_BUCKET",),
-        "code_bucket_name": ("PIPELINE_CODE_BUCKET",),
         "temp_bucket_name": ("PIPELINE_TEMP_BUCKET",),
         "vector-db-admin-secret": ("DB_SECRET_ARN", "DB_SECRET_NAME"),
         "foundation_llm_model_id": ("BEDROCK_MODEL_ID",),
         "model_id_bedrock_profile_embed": ("BEDROCK_EMBED_MODEL_ID",),
         "model_id_bedrock_embeddings": ("BEDROCK_EMBED_MODEL_ID",),
         "embeddings_table_name": ("EMBEDDINGS_TABLE_NAME",),
+        "common_input_prefix": ("COMMON_INPUT_PREFIX",),
+        "common_embeddings_table_name": ("COMMON_EMBEDDINGS_TABLE_NAME",),
     }
 
     @staticmethod
@@ -72,6 +73,22 @@ class Helper:
             default=default,
         )
         return Helper.validate_embeddings_table_name(name.strip())
+
+    @staticmethod
+    def get_common_embeddings_table_name(config_file='aws.properties.ini'):
+        env_value = Helper.get_env_property("common_embeddings_table_name")
+        if env_value:
+            return contract_cfg.validate_embeddings_table_name(env_value)
+        config = Helper.load_config(config_file)
+        return contract_cfg.common_embeddings_table_name(config)
+
+    @staticmethod
+    def get_common_input_prefix(config_file='aws.properties.ini'):
+        env_value = Helper.get_env_property("common_input_prefix")
+        if env_value:
+            return contract_cfg.normalize_s3_prefix(env_value)
+        config = Helper.load_config(config_file)
+        return contract_cfg.common_input_prefix(config)
 
     @staticmethod
     def get_property(str_property_name, config_file='aws.properties.ini', default=_RAISE_IF_MISSING):
@@ -155,17 +172,17 @@ class Helper:
             str_summary_folder += '/'
 
         if str_file_name == "TEXT":
-            str_summary_file = os.path.join(str_summary_folder, "Text_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Text_SummaryFile.log"
         elif str_file_name == "TABLE":
-            str_summary_file = os.path.join(str_summary_folder, "Table_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Table_SummaryFile.log"
         elif str_file_name == "IMAGE":
-            str_summary_file = os.path.join(str_summary_folder, "Image_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Image_SummaryFile.log"
         elif str_file_name == "EXCELTABLE":
-            str_summary_file = os.path.join(str_summary_folder, "ExcelTable_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}ExcelTable_SummaryFile.log"
         elif str_file_name == "BEDROCK":
-            str_summary_file = os.path.join(str_summary_folder, "Bedrock_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Bedrock_SummaryFile.log"
         else:
-            str_summary_file = os.path.join(str_summary_folder, "Unknown_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Unknown_SummaryFile.log"
         s3_client = aws_client('s3')
 
         try:

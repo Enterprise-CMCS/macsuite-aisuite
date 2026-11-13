@@ -6,6 +6,7 @@ import { AisuiteInfrastructureStack } from "../src/aisuite-infrastructure-stack"
 import {
   API_CONTAINER_PORT,
   API_HEALTH_CHECK_PATH,
+  REVIEW_CONTAINER_NAME,
 } from "../src/constructs/compute-construct";
 import { STUB_VPC_CONTEXT_KEY } from "../src/constructs/networking-construct";
 import {
@@ -184,27 +185,50 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       });
     });
 
-    it("passes the bucket, database, and Bedrock contract to the container", () => {
+    it("passes the database, Bedrock and manifest contract to the API container", () => {
       const template = synthesize(environmentName);
       const environment = apiContainerEnvironment(template, serviceName);
 
       expect(environment.DOCUMENTS_BUCKET).toBe(
         `aisuite-${environmentName}-contract-rag`,
       );
-      expect(environment.POST_PROCESSING_BUCKET).toBe(
-        `aisuite-${environmentName}-contract-rag-post-processing`,
+      expect(environment.PIPELINE_TEMP_BUCKET).toBe(
+        `aisuite-${environmentName}-llm-pipeline-temp`,
       );
-      expect(environment.PIPELINE_CODE_BUCKET).toBe(
-        `aisuite-${environmentName}-llm-pipeline-code`,
-      );
+      expect(environment.POST_PROCESSING_BUCKET).toBeUndefined();
+      expect(environment.PIPELINE_CODE_BUCKET).toBeUndefined();
+      expect(environment.DB_SECRET_ARN).toBeDefined();
+      expect(environment.INGEST_STATE_MACHINE_ARN).toBeDefined();
+      expect(environment.BEDROCK_MODEL_ID).toBe("us.amazon.nova-2-lite-v1:0");
+      expect(environment.BEDROCK_EMBED_MODEL_ID).toBe("us.cohere.embed-v4:0");
+      expect(environment.AWS_REGION).toBe("us-east-1");
+      expect(environment.AWS_DEFAULT_REGION).toBe("us-east-1");
+    });
+
+    it("defines a Fargate requirement review task the workflow configures per run", () => {
+      const template = synthesize(environmentName);
+      const family = `aisuite-${environmentName}-requirement-review`;
+
+      template.hasResourceProperties("AWS::ECS::TaskDefinition", {
+        Family: family,
+        RequiresCompatibilities: ["FARGATE"],
+        ContainerDefinitions: [
+          Match.objectLike({
+            Command: ["python", "-m", "search.manifest_review"],
+            Name: REVIEW_CONTAINER_NAME,
+          }),
+        ],
+      });
+
+      const environment = apiContainerEnvironment(template, family);
       expect(environment.PIPELINE_TEMP_BUCKET).toBe(
         `aisuite-${environmentName}-llm-pipeline-temp`,
       );
       expect(environment.DB_SECRET_ARN).toBeDefined();
-      expect(environment.BEDROCK_MODEL_ID).toBe("us.amazon.nova-pro-v1:0");
-      expect(environment.BEDROCK_EMBED_MODEL_ID).toBe("us.cohere.embed-v4:0");
-      expect(environment.AWS_REGION).toBe("us-east-1");
-      expect(environment.AWS_DEFAULT_REGION).toBe("us-east-1");
+      expect(environment.REVIEW_CONCURRENCY).toBeDefined();
+      expect(environment.REQUEST_KEY).toBeUndefined();
+      expect(environment.EMBEDDINGS_TABLE_NAME).toBeUndefined();
+      expect(environment.DOCUMENTS_BUCKET).toBeUndefined();
     });
 
     it("exposes the compute output contract", () => {

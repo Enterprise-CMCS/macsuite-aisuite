@@ -4,7 +4,7 @@ import boto3
 import datetime
 import time
 
-from common.utils.aws_files_access import AwsFilesAccess
+from data_preprocessing.bedrock.bda_results import bda_output_prefix
 from common.utils.helper import Helper
 from common.utils.logger import log
 from common.utils.settings import aws_client,aws_session
@@ -238,15 +238,7 @@ def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da
     log.info("***************** bedrock_BDA.bda_invoke() start *****************************")
     log.info("bda_invoke() called with \n project_arn =" + project_arn + ", \n input_bucket=" + input_bucket + ", \n output_bucket=" + output_bucket + ", \n out_prefix=" + out_prefix + ", \n da_profile_arn=" + da_profile_arn + ",  \n ProjectStage=" + project_stage)
 
-    # Delete All file in output bucket
-    full_refresh = Helper.get_property("full_refresh")
-    full_refresh= (full_refresh == "True")
     s3_resource = boto3.resource('s3')
-    if full_refresh is True:
-        log.debug(f"full_refresh = {full_refresh}, if true delete all object before updates ")
-        Helper.delete_bucket_file_recursively(s3_resource, output_bucket, out_prefix)
-    else:
-        log.debug(f"full_refresh = {full_refresh}, if NOT True Dont delete all object before updates ")
 
     # Build the work list first. A file that already has an output is processed again after its old output is deleted.
     work_list = []
@@ -315,7 +307,7 @@ def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da
     return summary
 
 
-def invoke_bedrock_bda():
+def invoke_bedrock_bda(source_key):
     log.info(f"******************Start of Function invokeBedrockBDA() of file{__file__}")
     try:
 
@@ -371,9 +363,8 @@ def invoke_bedrock_bda():
         project_name = Helper.get_property("projectname")
         project_description = Helper.get_property("projectdescription")
         input_bucket_name = Helper.get_property("input_bucket_name")
-        input_prefix = Helper.get_property("input_prefix")
         output_bucket = Helper.get_property("output_bucket")
-        output_prefix = Helper.get_property("output_prefix")
+        output_prefix = bda_output_prefix(source_key)
         project_stage = Helper.get_property("ProjectStage")
         if project_stage and project_stage.strip().upper() == "DEVELOPMENT":
             project_stage = "DEVELOPMENT"
@@ -382,29 +373,24 @@ def invoke_bedrock_bda():
         data_automation_v = Helper.get_property("DataAutomationV")
 
         log.info(
-            f"projectname ={project_name} projectdescription={project_description }, input_bucket_name={ input_bucket_name} input_prefix={ input_prefix}, output_bucket={ output_bucket},  output_prefix={output_prefix}")
+            f"projectname ={project_name} projectdescription={project_description }, input_bucket_name={ input_bucket_name} source_key={source_key}, output_bucket={ output_bucket},  output_prefix={output_prefix}")
         log.debug(f"ProjectStage ={project_stage},  data_automation_v={ data_automation_v}")
 
         project_arn = create_bda_project(project_name, project_description, project_stage)
 
-        log.debug("Calling AwsFilesAccess")
-        aws_files_access = AwsFilesAccess(s3AwsClient)
-        log.debug(f"After Calling AwsFilesAccess. Now calling aws_file_lists")
-        data_files = aws_files_access.aws_file_lists(input_bucket_name, input_prefix)
+        data_files = [source_key] if source_key.lower().endswith((".docx", ".pdf")) else []
 
         now = datetime.datetime.now()
-        Helper.summary_file("BEDROCK",
-                           f"\n{now} Number of PDF or DOCX files that are present is {len(data_files)} in bucket {input_bucket_name} at prefix {input_prefix}")
-        Helper.summary_file("BEDROCK", f"\n{now} File Names are " + str(data_files))
-        log.info(
-            f"Number of PDF or DOCX files that are present is {len(data_files)} in bucket {input_bucket_name} at prefix {input_prefix}")
-        log.debug("File Names are " + str(data_files))
+        Helper.summary_file("BEDROCK", f"\n{now} Pre-processing {data_files} from bucket {input_bucket_name}")
+        log.info(f"Pre-processing {data_files} from bucket {input_bucket_name}")
 
         da_profile_arn = f'arn:aws:bedrock:{current_region}:{account_id}:data-automation-profile/{data_automation_v}'
         Helper.summary_file("BEDROCK", f"\n{now} Formatted da_profile_arn=" + str(da_profile_arn))
         print(f"Formatted da_profile_arn={da_profile_arn}")
         bda_results = bda_invoke(project_arn, input_bucket_name, data_files, output_bucket, output_prefix, da_profile_arn,
                                  project_stage)
+        if bda_results["failed_count"]:
+            return False
         Helper.summary_file("BEDROCK", f"\n{now} BDA batch summary=" + str(bda_results))
         log.info(f"BDA batch summary={bda_results}")
         log.info("***************** invokeParsedBDATable End. __name__=" + str(__name__))
