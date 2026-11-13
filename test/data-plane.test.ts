@@ -184,9 +184,9 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       expect(serialized).not.toContain("llm-pipeline-code");
       expect(serialized).not.toContain("foundation-model/*");
       expect(serialized).not.toContain("inference-profile/*");
-      expect(serialized).toContain("amazon.nova-pro-v1:0");
+      expect(serialized).toContain("amazon.nova-2-lite-v1:0");
       expect(serialized).toContain("cohere.embed-v4:0");
-      expect(serialized).toContain("us.amazon.nova-pro-v1:0");
+      expect(serialized).toContain("us.amazon.nova-2-lite-v1:0");
       expect(serialized).toContain("us.cohere.embed-v4:0");
       expect(serialized).toContain("cohere.rerank-v3-5:0");
       expect(bySid.BedrockRerank?.Action).toEqual("bedrock:Rerank");

@@ -6,12 +6,12 @@ import { Construct } from "constructs";
 const CROSS_REGION_INFERENCE_REGIONS = ["us-east-1", "us-east-2", "us-west-2"];
 
 const BEDROCK_FOUNDATION_MODELS = [
-  "amazon.nova-pro-v1:0",
+  "amazon.nova-2-lite-v1:0",
   "cohere.embed-v4:0",
 ] as const;
 
 const BEDROCK_INFERENCE_PROFILES = [
-  "us.amazon.nova-pro-v1:0",
+  "us.amazon.nova-2-lite-v1:0",
   "us.cohere.embed-v4:0",
 ] as const;
 

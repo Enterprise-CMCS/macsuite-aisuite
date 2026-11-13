@@ -27,7 +27,7 @@ _provider = None
 
 
 def model_id():
-    return Helper.get_property("foundation_llm_model_id", default="us.amazon.nova-pro-v1:0")
+    return Helper.get_property("foundation_llm_model_id", default="us.amazon.nova-2-lite-v1:0")
 
 
 def bedrock_model(model_name=None):

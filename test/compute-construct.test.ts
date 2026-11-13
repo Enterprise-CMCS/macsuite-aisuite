@@ -199,7 +199,7 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       expect(environment.PIPELINE_CODE_BUCKET).toBeUndefined();
       expect(environment.DB_SECRET_ARN).toBeDefined();
       expect(environment.INGEST_STATE_MACHINE_ARN).toBeDefined();
-      expect(environment.BEDROCK_MODEL_ID).toBe("us.amazon.nova-pro-v1:0");
+      expect(environment.BEDROCK_MODEL_ID).toBe("us.amazon.nova-2-lite-v1:0");
       expect(environment.BEDROCK_EMBED_MODEL_ID).toBe("us.cohere.embed-v4:0");
       expect(environment.AWS_REGION).toBe("us-east-1");
       expect(environment.AWS_DEFAULT_REGION).toBe("us-east-1");
