@@ -63,7 +63,7 @@ class AwsFilesAccess:
             return bucket_files
 
         except ClientError as lclEx:
-            Helper.print_exception("aws_file_lists", lclEx, f"Error while retrieving the Bucket file Bucket Name = {lcl_bucket_name}\{prefix}.")
+            Helper.print_exception("aws_file_lists", lclEx, f"Error while retrieving the Bucket file Bucket Name = {lcl_bucket_name}/{prefix}.")
             raise lclEx
 
     def aws_excel_file(self, lcl_bucket_name, prefix):
@@ -90,7 +90,7 @@ class AwsFilesAccess:
             return bucket_files
 
         except Exception as lclEx:
-            Helper.print_exception("aws_excel_file", lclEx, f"Error while retrieving the Bucket file Bucket Name = {lcl_bucket_name}\{prefix}.")
+            Helper.print_exception("aws_excel_file", lclEx, f"Error while retrieving the Bucket file Bucket Name = {lcl_bucket_name}/{prefix}.")
             raise lclEx
 
     def aws_file_with_extension(self, lcl_bucket_name, p_prefix, file_extension):

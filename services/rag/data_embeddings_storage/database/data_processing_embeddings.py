@@ -9,7 +9,7 @@ from common.utils.helper import Helper
 
 class EmbeddingProcessor:
 
-    def __init__(self, max_concurrent_requests=1, table_name=None):
+    def __init__(self, max_concurrent_requests=10, table_name=None):
         self.embedding_client = BedrockEmbeddingClient()
         self.max_concurrent_requests = max_concurrent_requests
         self.table_name = table_name or Helper.get_embeddings_table_name()
