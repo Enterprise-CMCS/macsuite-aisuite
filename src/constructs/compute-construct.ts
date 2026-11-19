@@ -167,7 +167,7 @@ export class ComputeConstruct extends Construct {
       "AlbSecurityGroup",
       {
         allowAllOutbound: false,
-        description: "AISuite RAG API internal ALB; ingress from the VPC only.",
+        description: "AISuite RAG API public ALB.",
         vpc: props.vpc,
       },
     );
@@ -180,7 +180,7 @@ export class ComputeConstruct extends Construct {
 
     this.loadBalancer = new elbv2.ApplicationLoadBalancer(this, "Alb", {
       internetFacing: true,
-      loadBalancerName: serviceName,
+      loadBalancerName: `${serviceName}-public`,
       securityGroup: loadBalancerSecurityGroup,
       vpc: props.vpc,
 
