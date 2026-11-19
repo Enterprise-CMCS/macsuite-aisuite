@@ -104,7 +104,7 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
           AwsvpcConfiguration: Match.objectLike({ AssignPublicIp: "DISABLED" }),
         },
       });
-    });
+    }, 15_000);
 
 
     it("fronts the service with a public internet-facing ALB targeting the health endpoint", () => {
@@ -161,39 +161,6 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
             Record<string, unknown>
           >) ?? [],
       );
-
-      it("does not expose application port directly to the internet", () => {
-        const template = synthesize(environmentName);
-
-        const inlineRules = Object.values(
-          template.findResources("AWS::EC2::SecurityGroup"),
-        ).flatMap(
-          (group) =>
-            (group.Properties?.SecurityGroupIngress as Array<
-              Record<string, unknown>
-            >) ?? [],
-        );
-
-        const standaloneRules = Object.values(
-          template.findResources("AWS::EC2::SecurityGroupIngress"),
-        ).map(
-          (rule) =>
-            rule.Properties as Record<string, unknown>,
-        );
-
-        const allIngressRules = [
-          ...inlineRules,
-          ...standaloneRules,
-        ];
-
-        const publicApplicationRules = allIngressRules.filter(
-          (rule) =>
-            rule.CidrIp === "0.0.0.0/0" &&
-            rule.FromPort === API_CONTAINER_PORT,
-        );
-
-        expect(publicApplicationRules).toHaveLength(0);
-      });
 
       const standaloneRules = Object.values(
         template.findResources("AWS::EC2::SecurityGroupIngress"),

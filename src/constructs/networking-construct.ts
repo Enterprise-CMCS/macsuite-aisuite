@@ -65,6 +65,8 @@ function stubVpc(scope: Construct): ec2.IVpc {
     isolatedSubnetRouteTableIds: ["rtb-0stubisolated1", "rtb-0stubisolated2"],
     privateSubnetIds: ["subnet-0stubprivate1", "subnet-0stubprivate2"],
     privateSubnetRouteTableIds: ["rtb-0stubprivate1", "rtb-0stubprivate2"],
+    publicSubnetIds: ["subnet-0stubpublic1", "subnet-0stubpublic2"],
+    publicSubnetRouteTableIds: ["rtb-0stubpublic1", "rtb-0stubpublic2"],
     vpcCidrBlock: "10.0.0.0/16",
     vpcId: "vpc-0stubaisuitevpc",
   });
