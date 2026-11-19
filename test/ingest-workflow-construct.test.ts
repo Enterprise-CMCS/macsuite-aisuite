@@ -40,9 +40,11 @@ const CAUGHT_STEPS = [
   "ReviewRequirements",
 ] as const;
 
-function synthesize(): Template {
+function synthesize(
+  environmentName: "dev" | "qa" = "dev",
+): Template {
   const app = new cdk.App();
-  const deploymentConfig = getDeploymentConfig("dev");
+  const deploymentConfig = getDeploymentConfig(environmentName);
   const stack = new cdk.Stack(app, "IngestWorkflowTestStack", {
     env: deploymentConfig.awsEnvironment,
   });
@@ -154,14 +156,45 @@ describe("IngestWorkflowConstruct", () => {
     expect(states.ManifestRunFailed?.Type).toBe("Fail");
   });
 
-  it("creates an encrypted notification queue with a dead-letter queue", () => {
-    template.hasResourceProperties("AWS::SQS::Queue", {
-      QueueName: "aisuite-dev-manifest-notifications",
+  it("imports the external MuleSoft notification queue and grants KMS access in dev", () => {
+    template.resourceCountIs("AWS::SQS::Queue", 0);
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Action: "sqs:SendMessage",
+            Effect: "Allow",
+            Resource: {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  { Ref: "AWS::Partition" },
+                  ":sqs:us-east-1:205501819586:macsuite-aisuite-dev-mulesoft-sqs-queue",
+                ],
+              ],
+            },
+          }),
+          Match.objectLike({
+            Action: ["kms:Decrypt", "kms:GenerateDataKey*"],
+            Effect: "Allow",
+            Resource:
+              "arn:aws:kms:us-east-1:205501819586:key/626ce0e6-6103-4699-a587-534db33232e2",
+          }),
+        ]),
+      },
+    });
+  });
+
+  it("creates an encrypted notification queue with a dead-letter queue when no external queue is configured", () => {
+    const qaTemplate = synthesize("qa");
+    qaTemplate.hasResourceProperties("AWS::SQS::Queue", {
+      QueueName: "aisuite-qa-manifest-notifications",
       RedrivePolicy: Match.objectLike({ maxReceiveCount: 5 }),
       SqsManagedSseEnabled: true,
     });
-    template.hasResourceProperties("AWS::SQS::Queue", {
-      QueueName: "aisuite-dev-manifest-notifications-dlq",
+    qaTemplate.hasResourceProperties("AWS::SQS::Queue", {
+      QueueName: "aisuite-qa-manifest-notifications-dlq",
       SqsManagedSseEnabled: true,
     });
   });

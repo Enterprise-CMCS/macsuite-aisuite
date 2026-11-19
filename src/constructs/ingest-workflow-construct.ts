@@ -1,6 +1,7 @@
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecs from "aws-cdk-lib/aws-ecs";
+import * as kms from "aws-cdk-lib/aws-kms";
 import type * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as sqs from "aws-cdk-lib/aws-sqs";
@@ -42,8 +43,8 @@ interface LambdaStepOptions {
 
 
 export class IngestWorkflowConstruct extends Construct {
-  public readonly notificationDeadLetterQueue: sqs.Queue;
-  public readonly notificationQueue: sqs.Queue;
+  public readonly notificationDeadLetterQueue: sqs.IQueue;
+  public readonly notificationQueue: sqs.IQueue;
   public readonly stateMachine: sfn.StateMachine;
 
   public constructor(
@@ -53,36 +54,65 @@ export class IngestWorkflowConstruct extends Construct {
   ) {
     super(scope, id);
 
-    const { name, protectedEnvironment } = props.deploymentConfig;
+    const { manifestNotificationQueue, name, protectedEnvironment } =
+      props.deploymentConfig;
     const prefix = `${APPLICATION_NAME}-${name}`;
     const stateMachineName = `${prefix}-manifest-ingest`;
     const removalPolicy = protectedEnvironment
       ? cdk.RemovalPolicy.RETAIN
       : cdk.RemovalPolicy.DESTROY;
 
-    this.notificationDeadLetterQueue = new sqs.Queue(
-      this,
-      "NotificationDeadLetterQueue",
-      {
+    const stack = cdk.Stack.of(this);
+    const externalNotificationKey = manifestNotificationQueue?.kmsKeyArn
+      ? kms.Key.fromKeyArn(
+          this,
+          "NotificationQueueKey",
+          manifestNotificationQueue.kmsKeyArn,
+        )
+      : undefined;
+
+    if (manifestNotificationQueue) {
+      this.notificationDeadLetterQueue = sqs.Queue.fromQueueArn(
+        this,
+        "NotificationDeadLetterQueue",
+        stack.formatArn({
+          resource: manifestNotificationQueue.deadLetterQueueName,
+          service: "sqs",
+        }),
+      );
+      this.notificationQueue = sqs.Queue.fromQueueArn(
+        this,
+        "NotificationQueue",
+        stack.formatArn({
+          resource: manifestNotificationQueue.queueName,
+          service: "sqs",
+        }),
+      );
+    } else {
+      this.notificationDeadLetterQueue = new sqs.Queue(
+        this,
+        "NotificationDeadLetterQueue",
+        {
+          encryption: sqs.QueueEncryption.SQS_MANAGED,
+          enforceSSL: true,
+          queueName: `${prefix}-manifest-notifications-dlq`,
+          removalPolicy,
+          retentionPeriod: cdk.Duration.days(14),
+        },
+      );
+      this.notificationQueue = new sqs.Queue(this, "NotificationQueue", {
+        deadLetterQueue: {
+          maxReceiveCount: 5,
+          queue: this.notificationDeadLetterQueue,
+        },
         encryption: sqs.QueueEncryption.SQS_MANAGED,
         enforceSSL: true,
-        queueName: `${prefix}-manifest-notifications-dlq`,
+        queueName: `${prefix}-manifest-notifications`,
         removalPolicy,
         retentionPeriod: cdk.Duration.days(14),
-      },
-    );
-    this.notificationQueue = new sqs.Queue(this, "NotificationQueue", {
-      deadLetterQueue: {
-        maxReceiveCount: 5,
-        queue: this.notificationDeadLetterQueue,
-      },
-      encryption: sqs.QueueEncryption.SQS_MANAGED,
-      enforceSSL: true,
-      queueName: `${prefix}-manifest-notifications`,
-      removalPolicy,
-      retentionPeriod: cdk.Duration.days(14),
-      visibilityTimeout: cdk.Duration.minutes(5),
-    });
+        visibilityTimeout: cdk.Duration.minutes(5),
+      });
+    }
 
     const logGroup = new logs.LogGroup(this, "LogGroup", {
       logGroupName: `/aws/vendedlogs/states/${stateMachineName}`,
@@ -292,6 +322,14 @@ export class IngestWorkflowConstruct extends Construct {
       timeout: WORKFLOW_TIMEOUT,
       tracingEnabled: true,
     });
+
+    if (externalNotificationKey) {
+      externalNotificationKey.grant(
+        this.stateMachine,
+        "kms:Decrypt",
+        "kms:GenerateDataKey*",
+      );
+    }
   }
 
   private invokeLambda(

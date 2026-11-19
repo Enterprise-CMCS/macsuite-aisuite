@@ -59,6 +59,28 @@ export const DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN: Partial<
 };
 
 /**
+ * Optional externally provisioned MuleSoft SQS queues (e.g. from
+ * `macsuite-aisuite-<env>-infra-mulesoft-kms-sqs-sns-stack`). When omitted for
+ * an environment, `IngestWorkflowConstruct` provisions its own queues.
+ */
+export interface ExternalNotificationQueueConfig {
+  deadLetterQueueName: string;
+  kmsKeyArn?: string;
+  queueName: string;
+}
+
+export const DEPLOYMENT_ENVIRONMENT_MANIFEST_NOTIFICATION_QUEUE: Partial<
+  Record<DeploymentEnvironmentName, ExternalNotificationQueueConfig>
+> = {
+  dev: {
+    deadLetterQueueName: "macsuite-aisuite-dev-mulesoft-sqs-dlq",
+    kmsKeyArn:
+      "arn:aws:kms:us-east-1:205501819586:key/626ce0e6-6103-4699-a587-534db33232e2",
+    queueName: "macsuite-aisuite-dev-mulesoft-sqs-queue",
+  },
+};
+
+/**
  * Explicit AISuite AWS account IDs (CloudTamer aisuite-non-prod / aisuite-prod).
  * Runtime env overrides (`AISUITE_NONPROD_ACCOUNT_ID` /
  * `AISUITE_PROD_ACCOUNT_ID`) win when set (CI / local override).
@@ -113,6 +135,8 @@ export interface DeploymentConfig {
   vpnSecurityGroupId?: string;
   /** Optional ARN of an ACM certificate to use for the ALB HTTPS listener. */
   albCertificateArn?: string;
+  /** Externally managed MuleSoft notification queue config, when pre-provisioned outside this stack. */
+  manifestNotificationQueue?: ExternalNotificationQueueConfig;
   /** Name of the central S3 bucket that receives server access logs (managed externally). */
   accessLogsBucketName: string;
 }
@@ -167,6 +191,8 @@ export function getDeploymentConfig(
     vpcName: DEPLOYMENT_ENVIRONMENT_VPC_NAME[environmentName],
     vpnSecurityGroupId: DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
     albCertificateArn: DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN[environmentName],
+    manifestNotificationQueue:
+      DEPLOYMENT_ENVIRONMENT_MANIFEST_NOTIFICATION_QUEUE[environmentName],
     accessLogsBucketName: `cms-cloud-${resolveAccountId(accountTier)}-${DEFAULT_REGION}-access-logs`,
   };
 }
