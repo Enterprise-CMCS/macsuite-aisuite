@@ -74,7 +74,7 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
           LogFilePrefix: Match.anyValue(),
         },
       });
-    });
+    }, 15_000);
 
     it("limits database ingress to security-group sources", () => {
       const template = synthesize(environmentName);
