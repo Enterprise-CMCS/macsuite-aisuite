@@ -213,11 +213,5 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
         "Comma-separated private subnet IDs for the database bootstrap task.",
       value: cdk.Fn.join(",", bootstrap.subnetIds),
     });
-
-    new cdk.CfnOutput(this, "BootstrapPublicSubnetIds", {
-      description: "Comma-separated public subnet IDs for the database bootstrap task.",
-      value: cdk.Fn.join(",", bootstrap.publicSubnetIds),
-    });
-    
   }
 }

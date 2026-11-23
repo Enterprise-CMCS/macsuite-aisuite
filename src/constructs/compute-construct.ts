@@ -167,45 +167,26 @@ export class ComputeConstruct extends Construct {
       "AlbSecurityGroup",
       {
         allowAllOutbound: false,
-        description: "AISuite RAG API public ALB.",
+        description: "AISuite RAG API internal ALB; ingress from the VPC only.",
         vpc: props.vpc,
       },
     );
 
+    // Allow HTTPS from the CMS Cloud VPN Prefix List (custom source)
     loadBalancerSecurityGroup.addIngressRule(
-      ec2.Peer.anyIpv4(),
+      ec2.Peer.prefixList("pl-006315be223e9c9a7"),
       ec2.Port.tcp(443),
-      "Allow HTTPS from the Internet",
+      "Allow Traffic from CMS Cloud VPN Prefix List",
     );
 
     this.loadBalancer = new elbv2.ApplicationLoadBalancer(this, "Alb", {
-      internetFacing: true,
-      loadBalancerName: `${serviceName}-public`,
+      internetFacing: false,
+      loadBalancerName: serviceName,
       securityGroup: loadBalancerSecurityGroup,
       vpc: props.vpc,
-
-      vpcSubnets: {
-        subnetType: ec2.SubnetType.PUBLIC,
-        onePerAz: true,
-      },
-
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       deletionProtection: protectedEnvironment,
     });
-
-    /*
-    * Since allowAllOutbound is false, explicitly permit ALB-to-task traffic.
-    */
-    props.appSecurityGroup.addIngressRule(
-      loadBalancerSecurityGroup,
-      ec2.Port.tcp(API_CONTAINER_PORT),
-      "Allow RAG API traffic from the ALB",
-    );
-
-    loadBalancerSecurityGroup.addEgressRule(
-      props.appSecurityGroup,
-      ec2.Port.tcp(API_CONTAINER_PORT),
-      "Allow ALB to reach RAG API Fargate tasks",
-    );
 
     // Configure ALB access logging to the central access-logs bucket under
     // the `ALB-Access-Logs` prefix. We reference the existing bucket by name.
@@ -242,22 +223,18 @@ export class ComputeConstruct extends Construct {
       certificates: [cert],
     });
 
-    // listener.connections.allowFrom(
-    //   ec2.Peer.ipv4(props.vpc.vpcCidrBlock),
-    //   ec2.Port.tcp(443),
-    //   "RAG API HTTPS (443) from inside the VPC",
-    // );
+    listener.connections.allowFrom(
+      ec2.Peer.ipv4(props.vpc.vpcCidrBlock),
+      ec2.Port.tcp(443),
+      "RAG API HTTPS (443) from inside the VPC",
+    );
 
     listener.addTargets("Targets", {
       deregistrationDelay: cdk.Duration.seconds(30),
       healthCheck: {
-        enabled: true,
-        healthyHttpCodes: "200-399",
         healthyThresholdCount: 2,
         interval: cdk.Duration.seconds(30),
         path: API_HEALTH_CHECK_PATH,
-        port: `${API_CONTAINER_PORT}`,
-        protocol: elbv2.Protocol.HTTP,
         timeout: cdk.Duration.seconds(5),
         unhealthyThresholdCount: 3,
       },

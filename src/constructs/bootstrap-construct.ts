@@ -27,7 +27,6 @@ export class BootstrapConstruct extends Construct {
   public readonly cluster: ecs.ICluster;
   public readonly securityGroup: ec2.ISecurityGroup;
   public readonly subnetIds: string[];
-  public readonly publicSubnetIds: string[];
   public readonly taskDefinition: ecs.FargateTaskDefinition;
 
   public constructor(
@@ -114,14 +113,8 @@ export class BootstrapConstruct extends Construct {
 
     this.cluster = props.cluster;
     this.securityGroup = props.appSecurityGroup;
-
     this.subnetIds = props.vpc.selectSubnets({
       subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
     }).subnetIds;
-
-    this.publicSubnetIds = props.vpc.selectSubnets({
-      subnetType: ec2.SubnetType.PUBLIC,
-    }).subnetIds;
-    
   }
 }

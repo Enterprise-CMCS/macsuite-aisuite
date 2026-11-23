@@ -104,18 +104,17 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
           AwsvpcConfiguration: Match.objectLike({ AssignPublicIp: "DISABLED" }),
         },
       });
-    }, 15_000);
+    });
 
-
-    it("fronts the service with a public internet-facing ALB targeting the health endpoint", () => {
+    it("fronts the service with an internal ALB targeting the health endpoint", () => {
       const template = synthesize(environmentName);
       const protectedEnvironment = environmentName !== "dev";
 
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::LoadBalancer",
         {
-          Name: `${serviceName}-public`,
-          Scheme: "internet-facing",
+          Name: serviceName,
+          Scheme: "internal",
           Type: "application",
           LoadBalancerAttributes: Match.arrayWith([
             {
@@ -125,7 +124,6 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
           ]),
         },
       );
-
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::Listener",
         {
@@ -133,13 +131,12 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
           Protocol: "HTTPS",
           Certificates: Match.arrayWith([
             Match.objectLike({
-              CertificateArn:
-                getDeploymentConfig(environmentName).albCertificateArn,
+              CertificateArn: getDeploymentConfig(environmentName)
+                .albCertificateArn,
             }),
           ]),
         },
       );
-
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::TargetGroup",
         {
@@ -151,7 +148,7 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       );
     });
 
-    it("allows public HTTPS access to the ALB", () => {
+    it("keeps every ingress rule off the public internet", () => {
       const template = synthesize(environmentName);
 
       const inlineRules = Object.values(
@@ -162,62 +159,15 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
             Record<string, unknown>
           >) ?? [],
       );
-
       const standaloneRules = Object.values(
         template.findResources("AWS::EC2::SecurityGroupIngress"),
-      ).map(
-        (rule) =>
-          rule.Properties as Record<string, unknown>,
-      );
+      ).map((rule) => rule.Properties as Record<string, unknown>);
 
-      const allIngressRules = [
-        ...inlineRules,
-        ...standaloneRules,
-      ];
-
-      expect(allIngressRules).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            IpProtocol: "tcp",
-            FromPort: 443,
-            ToPort: 443,
-            CidrIp: "0.0.0.0/0",
-          }),
-        ]),
-      );
-    });
-
-    it("does not expose application port directly to the internet", () => {
-      const template = synthesize(environmentName);
-
-      const inlineRules = Object.values(
-        template.findResources("AWS::EC2::SecurityGroup"),
-      ).flatMap(
-        (group) =>
-          (group.Properties?.SecurityGroupIngress as Array<
-            Record<string, unknown>
-          >) ?? [],
-      );
-
-      const standaloneRules = Object.values(
-        template.findResources("AWS::EC2::SecurityGroupIngress"),
-      ).map(
-        (rule) =>
-          rule.Properties as Record<string, unknown>,
-      );
-
-      const allIngressRules = [
-        ...inlineRules,
-        ...standaloneRules,
-      ];
-
-      const publicApplicationRules = allIngressRules.filter(
-        (rule) =>
-          rule.CidrIp === "0.0.0.0/0" &&
-          rule.FromPort === API_CONTAINER_PORT,
-      );
-
-      expect(publicApplicationRules).toHaveLength(0);
+      expect(inlineRules.length).toBeGreaterThan(0);
+      for (const rule of [...inlineRules, ...standaloneRules]) {
+        expect(rule).not.toHaveProperty("CidrIp", "0.0.0.0/0");
+        expect(rule).not.toHaveProperty("CidrIpv6", "::/0");
+      }
     });
 
     it("allows ALB traffic to the application tier on the container port only", () => {
