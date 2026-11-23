@@ -3,6 +3,7 @@ import type * as ec2 from "aws-cdk-lib/aws-ec2";
 import { Construct } from "constructs";
 
 import { AppIamConstruct } from "./constructs/app-iam-construct";
+import { ApiGatewayConstruct } from "./constructs/api-gateway-construct";
 import { BatchConstruct } from "./constructs/batch-construct";
 import { BootstrapConstruct } from "./constructs/bootstrap-construct";
 import { ComputeConstruct } from "./constructs/compute-construct";
@@ -65,6 +66,13 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
       pipelineTempBucket: storage.pipelineTempBucket,
       postProcessingBucket: storage.postProcessingBucket,
       taskRole: appIam.taskRole,
+      vpc: networking.vpc,
+    });
+
+    const apiGateway = new ApiGatewayConstruct(this, "ApiGateway", {
+      deploymentConfig,
+      loadBalancer: compute.loadBalancer,
+      loadBalancerSecurityGroup: compute.loadBalancerSecurityGroup,
       vpc: networking.vpc,
     });
 
@@ -146,6 +154,16 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
     new cdk.CfnOutput(this, "AlbDnsName", {
       description: "Internal ALB hostname fronting the RAG API.",
       value: compute.loadBalancer.loadBalancerDnsName,
+    });
+
+    new cdk.CfnOutput(this, "ApiGatewayUrl", {
+      description: "WAF-protected API Gateway endpoint for the RAG API.",
+      value: apiGateway.api.url,
+    });
+
+    new cdk.CfnOutput(this, "WebAclArn", {
+      description: "WAFv2 web ACL associated with the API Gateway stage.",
+      value: apiGateway.webAcl.attrArn,
     });
 
     new cdk.CfnOutput(this, "ApiClusterName", {
