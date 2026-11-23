@@ -58,7 +58,9 @@ export interface ComputeConstructProps {
 
 export class ComputeConstruct extends Construct {
   public readonly cluster: ecs.Cluster;
+  public readonly listener: elbv2.ApplicationListener;
   public readonly loadBalancer: elbv2.ApplicationLoadBalancer;
+  public readonly loadBalancerSecurityGroup: ec2.ISecurityGroup;
   public readonly repository: ecr.Repository;
   public readonly service: ecs.FargateService;
 
@@ -179,6 +181,8 @@ export class ComputeConstruct extends Construct {
       "Allow Traffic from CMS Cloud VPN Prefix List",
     );
 
+    this.loadBalancerSecurityGroup = loadBalancerSecurityGroup;
+
     this.loadBalancer = new elbv2.ApplicationLoadBalancer(this, "Alb", {
       internetFacing: false,
       loadBalancerName: serviceName,
@@ -222,6 +226,7 @@ export class ComputeConstruct extends Construct {
       protocol: elbv2.ApplicationProtocol.HTTPS,
       certificates: [cert],
     });
+    this.listener = listener;
 
     listener.connections.allowFrom(
       ec2.Peer.ipv4(props.vpc.vpcCidrBlock),

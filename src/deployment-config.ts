@@ -113,6 +113,14 @@ export interface DeploymentConfig {
   vpnSecurityGroupId?: string;
   /** Optional ARN of an ACM certificate to use for the ALB HTTPS listener. */
   albCertificateArn?: string;
+  /**
+   * Hostname covered by the ALB certificate. API Gateway validates the ALB TLS
+   * certificate against the integration URI host, so set this when the ALB DNS
+   * name is not on the certificate. Defaults to
+   * `alb.<env>.macsuite.aisuite.internal.cms.gov`; override with
+   * `AISUITE_ALB_HOST_NAME`.
+   */
+  albHostName: string;
   /** Name of the central S3 bucket that receives server access logs (managed externally). */
   accessLogsBucketName: string;
 }
@@ -168,6 +176,9 @@ export function getDeploymentConfig(
     vpnSecurityGroupId: DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
     albCertificateArn: DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN[environmentName],
     accessLogsBucketName: `cms-cloud-${resolveAccountId(accountTier)}-${DEFAULT_REGION}-access-logs`,
+    albHostName:
+      process.env.AISUITE_ALB_HOST_NAME?.trim() ||
+      `alb.${environmentName}.macsuite.aisuite.internal.cms.gov`,
   };
 }
 
