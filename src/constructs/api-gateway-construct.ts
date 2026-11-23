@@ -211,7 +211,7 @@ export class ApiGatewayConstruct extends Construct {
 
     const stageArn = cdk.Stack.of(this).formatArn({
       account: "",
-      resource: "restapis",
+      resource: "/restapis",
       resourceName: `${this.api.restApiId}/stages/${this.api.deploymentStage.stageName}`,
       service: "apigateway",
     });
