@@ -1,6 +1,8 @@
 import json
 import numpy as np
-from data_embeddings_storage.database.connection import get_connection, release_connection
+import asyncio
+import asyncpg
+from data_embeddings_storage.database.connection import get_connection, release_connection, expire_idle_connections
 from search.database_searching.aws_embedding_client import BedrockEmbeddingClient
 from search.database_searching.reranker import CohereReranker
 from common.utils.helper import Helper
@@ -15,6 +17,49 @@ def _parse_metadata(metadata):
         except (json.JSONDecodeError, TypeError):
             return {}
     return metadata if isinstance(metadata, dict) else {}
+
+# A pooled connection can be closed by the network or server while idle, or the
+# network can drop while reconnecting. Retry on a new connection when that happens.
+_DROPPED_CONNECTION_ERRORS = (
+    asyncpg.ConnectionDoesNotExistError,
+    asyncpg.InterfaceError,
+    asyncpg.CannotConnectNowError,
+    asyncpg.PostgresConnectionError,
+    ConnectionError,          # ConnectionReset / Aborted / Refused, BrokenPipe
+    OSError,                  # network errors such as WinError 64
+    TimeoutError,
+    asyncio.TimeoutError,
+)
+_QUERY_ATTEMPTS = 4
+
+async def _run_query(run, description):
+    """Run `run(connection)` on a pooled connection. If the connection drops (or
+    cannot be opened), wait and retry on a new one: up to 4 attempts, waiting
+    2, 4 and 8 seconds between them."""
+    for attempt in range(1, _QUERY_ATTEMPTS + 1):
+        connection = None
+        try:
+            connection = await get_connection()
+            return await run(connection)
+        except _DROPPED_CONNECTION_ERRORS as lclEx:
+            if attempt == _QUERY_ATTEMPTS:
+                raise
+            log.warning(f"{description}: database connection dropped ({type(lclEx).__name__}); "
+                        f"retrying on a new connection (attempt {attempt + 1}/{_QUERY_ATTEMPTS}).")
+            # Other idle connections in the pool are usually dead as well; discard them
+            # and wait briefly so the retry opens a genuinely new connection.
+            try:
+                await expire_idle_connections()
+            except Exception:
+                pass
+            await asyncio.sleep(2 ** attempt)
+        finally:
+            if connection is not None:
+                try:
+                    await release_connection(connection)
+                except Exception:
+                    # A dead connection may fail to release cleanly; the pool replaces it.
+                    pass
 
 
 class SearchEngine:
@@ -31,9 +76,8 @@ class SearchEngine:
         return np.array(embedding.get('float', [])).flatten()
 
     async def fulltext_search(self, query: str, limit: int = 30):
-        connection = await get_connection()
-        try:
-            results = await connection.fetch(f"""
+        async def run(connection):
+            return await connection.fetch(f"""
                 SELECT
                     id,
                     text,
@@ -46,16 +90,14 @@ class SearchEngine:
                 LIMIT $2
             """, query, limit)
 
-            return [dict(row) for row in results] if results else []
-        finally:
-            await release_connection(connection)
+        results = await _run_query(run, "fulltext_search")
+        return [dict(row) for row in results] if results else []
 
     async def semantic_search(self, query_text, limit=100):
         embedding_flattened = await self.embed_query(query_text)
 
-        connection = await get_connection()
-        try:
-            results = await connection.fetch(f"""
+        async def run(connection):
+            return await connection.fetch(f"""
                 SELECT
                     id,
                     text,
@@ -67,19 +109,16 @@ class SearchEngine:
                 LIMIT $2
             """, embedding_flattened, limit)
 
-            return [dict(row) for row in results] if results else []
-        finally:
-            await release_connection(connection)
+        results = await _run_query(run, "semantic_search")
+        return [dict(row) for row in results] if results else []
 
     async def hybrid_search(self, query_text, limit=20, dense_limit=60, lexical_limit=60,
                              dense_weight=0.7, lexical_weight=0.3, rrf_k=60):
         embedding_flattened = await self.embed_query(query_text)
 
-        connection = await get_connection()
-        try:
+        async def run(connection):
             async with connection.transaction():
-
-                results = await connection.fetch(f"""
+                return await connection.fetch(f"""
                     WITH dense AS (
                         SELECT
                             id,
@@ -124,6 +163,5 @@ class SearchEngine:
                     LIMIT $6
                 """, embedding_flattened, query_text, dense_limit, lexical_limit, rrf_k, limit)
 
-            return [dict(row, metadata=_parse_metadata(row["metadata"])) for row in results] if results else []
-        finally:
-            await release_connection(connection)
+        results = await _run_query(run, "hybrid_search")
+        return [dict(row, metadata=_parse_metadata(row["metadata"])) for row in results] if results else []

@@ -16,7 +16,6 @@ async def register_vector_init(conn):
         pass
     await conn.execute(SEARCH_PATH_SQL)
 
-
 async def initialization_db():
     global postgres_pool
     async with _pool_lock:
@@ -29,6 +28,9 @@ async def initialization_db():
                 port=DB_PORT,
                 min_size=1,
                 max_size=5,
+                # Replace connections idle > 60 s, before server timeout
+                # silently closes them ("connection was closed in the middle of operation").
+                max_inactive_connection_lifetime=60,
                 init=register_vector_init,
                 ssl="require",
             )
@@ -41,7 +43,6 @@ async def register_vector_types(conn):
     await register_vector(conn)
     await conn.execute(SEARCH_PATH_SQL)
 
-
 async def get_connection():
     global postgres_pool
     if postgres_pool is None:
@@ -50,13 +51,17 @@ async def get_connection():
         raise RuntimeError("Failed to initialize database pool")
     return await postgres_pool.acquire()
 
-
 async def release_connection(connection):
     global postgres_pool
     if postgres_pool is None:
         raise RuntimeError("Database pool is not initialized")
     await postgres_pool.release(connection)
 
+async def expire_idle_connections():
+    """Discard every pooled connection so the next acquire opens a new one.
+    Called after a dropped connection: its idle siblings are often dead too."""
+    if postgres_pool is not None:
+        await postgres_pool.expire_connections()
 
 @asynccontextmanager
 async def pooled_connection():
@@ -65,7 +70,6 @@ async def pooled_connection():
         yield connection
     finally:
         await release_connection(connection)
-
 
 async def close_db():
     global postgres_pool

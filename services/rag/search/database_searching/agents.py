@@ -722,7 +722,7 @@ decision_agent = Agent(bedrock_model(), system_prompt=DECISION_SYSTEM_PROMPT,
     model_settings={
         "temperature": 0.0,
         "top_p": 1.0,
-        "max_tokens": 8000,
+        "max_tokens": 16000,
         "bedrock_additional_model_requests_fields": {
             "reasoningConfig": {"type": "enabled", "maxReasoningEffort": DECISION_REASONING_EFFORT},
         },
