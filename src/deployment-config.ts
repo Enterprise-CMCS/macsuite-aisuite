@@ -176,7 +176,9 @@ export function getDeploymentConfig(
     vpnSecurityGroupId: DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID[environmentName],
     albCertificateArn: DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN[environmentName],
     accessLogsBucketName: `cms-cloud-${resolveAccountId(accountTier)}-${DEFAULT_REGION}-access-logs`,
-    albHostName: `*.${environmentName}.macsuite.aisuite.internal.cms.gov`,
+    albHostName:
+      process.env.AISUITE_ALB_HOST_NAME?.trim() ||
+      `alb.${environmentName}.macsuite.aisuite.internal.cms.gov`,
   };
 }
 
