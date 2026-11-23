@@ -135,6 +135,10 @@ export class ApiGatewayConstruct extends Construct {
 
     const proxyResource = this.api.root.addResource("{proxy+}");
     const methodOptions: apigateway.MethodOptions = {
+      authorizationType: apigateway.AuthorizationType.IAM,
+    };
+    const proxyMethodOptions: apigateway.MethodOptions = {
+      ...methodOptions,
       requestParameters: { "method.request.path.proxy": true },
     };
     const integrationOptions: apigateway.IntegrationOptions = {
@@ -155,7 +159,7 @@ export class ApiGatewayConstruct extends Construct {
             proxy: true,
           },
         ),
-        isProxy ? methodOptions : {},
+        isProxy ? proxyMethodOptions : methodOptions,
       );
 
       // VPC Link V2 + ALB target is not modelled by the L2 constructs yet.

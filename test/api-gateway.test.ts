@@ -30,11 +30,23 @@ describe("api gateway + waf", () => {
 
   it("routes methods through the VPC link to the internal ALB", () => {
     template.hasResourceProperties("AWS::ApiGateway::Method", {
+      AuthorizationType: "AWS_IAM",
       Integration: Match.objectLike({
         ConnectionType: "VPC_LINK",
         IntegrationTarget: Match.anyValue(),
       }),
     });
+  });
+
+  it("requires IAM authorization on both root and proxy methods", () => {
+    const methods = Object.values(
+      template.findResources("AWS::ApiGateway::Method"),
+    );
+
+    expect(methods).toHaveLength(2);
+    expect(
+      methods.map(({ Properties }) => Properties.AuthorizationType),
+    ).toEqual(["AWS_IAM", "AWS_IAM"]);
   });
 
   it("creates a regional web ACL associated with the stage", () => {
