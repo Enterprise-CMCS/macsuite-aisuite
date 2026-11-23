@@ -99,7 +99,6 @@ export class ApiGatewayConstruct extends Construct {
           "service-role/AmazonAPIGatewayPushToCloudWatchLogs",
         ),
       ],
-      roleName: `${baseName}-apigw-cloudwatch`,
     });
     cloudWatchRole.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
     const apiAccount = new apigateway.CfnAccount(this, "ApiAccount", {
