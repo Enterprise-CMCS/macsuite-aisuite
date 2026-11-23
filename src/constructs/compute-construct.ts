@@ -180,8 +180,8 @@ export class ComputeConstruct extends Construct {
     );
 
     this.loadBalancer = new elbv2.ApplicationLoadBalancer(this, "Alb", {
-      internetFacing: false,
-      loadBalancerName: serviceName,
+      internetFacing: true,
+      loadBalancerName: `${serviceName}-public`,
       securityGroup: loadBalancerSecurityGroup,
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
