@@ -114,6 +114,7 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
       template.hasResourceProperties(
         "AWS::ElasticLoadBalancingV2::LoadBalancer",
         {
+          Name: serviceName,
           Scheme: "internal",
           Type: "application",
           LoadBalancerAttributes: Match.arrayWith([

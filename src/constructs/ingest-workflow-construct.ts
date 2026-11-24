@@ -133,47 +133,35 @@ export class IngestWorkflowConstruct extends Construct {
       "FAILED",
       `"error": $failure.Error, "statusPath": "/manifest/" & ${REQUEST_KEY}`,
     );
-    
+
     notifyFailed.addCatch(runFailed, { errors: [sfn.Errors.ALL] });
-    const markVersionFailed = this.invokeLambda(
-      "MarkEmbeddingVersionFailed",
-      props.embeddingsFunction,
-      {
-        comment:
-          "Flag this run's unfinished embeddings version as FAILED so it is never searched.",
-        payload: { action: "fail", requestKey: jsonata(REQUEST_KEY) },
-      },
-    );
-    
-    markVersionFailed.addCatch(notifyFailed, { errors: [sfn.Errors.ALL] });
-    markVersionFailed.next(notifyFailed).next(runFailed);
+    notifyFailed.next(runFailed);
 
     const preProcessDocuments = sfn.Map.jsonata(this, "PreProcessDocuments", {
       assign: { ragOutputKeys: jsonata("[$states.result.rag_output]") },
       comment:
-        "Pre-process every manifest document; embedding starts only after all of them succeed.",
+        "Pre-process the document files.",
       items: sfn.ProvideItems.jsonata(jsonata("$states.input.documents")),
       maxConcurrency: INGEST_MAX_CONCURRENCY,
     });
     preProcessDocuments.itemProcessor(
       this.invokeLambda("PreProcessDocument", props.preProcessingFunction, {
         comment:
-          "Run Bedrock Data Automation for one document and write its RAG_Output JSON.",
+          "Run Bedrock Data Automation.",
       }),
     );
 
-    const allocateVersion = this.invokeLambda(
-      "AllocateEmbeddingVersion",
+    const createEmbeddingsTable = this.invokeLambda(
+      "CreateEmbeddingsTable",
       props.embeddingsFunction,
       {
         assign: {
-          embeddingVersion: jsonata("$states.result.Payload.version"),
           embeddingsTable: jsonata("$states.result.Payload.tableName"),
         },
         comment:
-          "Reserve and create this run's embeddings_<state>_v<version> table.",
+          "Create this embeddings table.",
         payload: {
-          action: "allocate",
+          action: "create_table",
           requestKey: jsonata(REQUEST_KEY),
           state: jsonata(`${RUN_INPUT}.state`),
         },
@@ -181,7 +169,7 @@ export class IngestWorkflowConstruct extends Construct {
     );
 
     const embedDocuments = sfn.Map.jsonata(this, "EmbedDocuments", {
-      comment: "Embed every RAG_Output JSON into this run's versioned table.",
+      comment: "Embed every RAG_Output JSON into this run's embeddings table.",
       itemSelector: {
         action: "embed",
         key: jsonata("$states.context.Map.Item.Value"),
@@ -189,6 +177,9 @@ export class IngestWorkflowConstruct extends Construct {
       },
       items: sfn.ProvideItems.jsonata(jsonata("$ragOutputKeys")),
       maxConcurrency: INGEST_MAX_CONCURRENCY,
+      outputs: {
+        embeddedCount: jsonata("$sum([$states.result.embedded])"),
+      },
     });
     embedDocuments.itemProcessor(
       this.invokeLambda("EmbedDocument", props.embeddingsFunction, {
@@ -197,19 +188,21 @@ export class IngestWorkflowConstruct extends Construct {
       }),
     );
 
-    const finalizeVersion = this.invokeLambda(
-      "FinalizeEmbeddingVersion",
-      props.embeddingsFunction,
+    const noEmbeddingsProduced = sfn.Pass.jsonata(
+      this,
+      "NoEmbeddingsProduced",
       {
-        comment:
-          "Publish the version as READY; an empty table fails the run.",
-        payload: {
-          action: "finalize",
-          requestKey: jsonata(REQUEST_KEY),
-          tableName: jsonata("$embeddingsTable"),
+        assign: {
+          failure: {
+            Cause: jsonata(
+              "'Embeddings table ' & $embeddingsTable & ' is empty; no document produced searchable text.'",
+            ),
+            Error: "NoEmbeddingsProduced",
+          },
         },
       },
     );
+    noEmbeddingsProduced.next(notifyFailed);
 
     const { containerName } = props.reviewContainer;
     const reviewRequirements = tasks.EcsRunTask.jsonata(
@@ -218,7 +211,7 @@ export class IngestWorkflowConstruct extends Construct {
       {
         cluster: props.cluster,
         comment:
-          "Review every legal requirement against this run's table and write the results to S3.",
+          "Running requirement for CRT document.",
         containerOverrides: [
           {
             containerDefinition: props.reviewContainer,
@@ -254,6 +247,13 @@ export class IngestWorkflowConstruct extends Construct {
       maxAttempts: 2,
     });
 
+    const hasEmbeddings = sfn.Choice.jsonata(this, "HasEmbeddings")
+      .when(
+        sfn.Condition.jsonata(jsonata("$states.input.embeddedCount > 0")),
+        reviewRequirements,
+      )
+      .otherwise(noEmbeddingsProduced);
+
     const reviewExitedWithError = sfn.Pass.jsonata(
       this,
       "ReviewExitedWithError",
@@ -268,7 +268,7 @@ export class IngestWorkflowConstruct extends Construct {
         },
       },
     );
-    reviewExitedWithError.next(markVersionFailed);
+    reviewExitedWithError.next(notifyFailed);
 
     const notifyCompleted = this.notify(
       "NotifyCompleted",
@@ -276,7 +276,6 @@ export class IngestWorkflowConstruct extends Construct {
       [
         `"requirementCount": ${RUN_INPUT}.requirementCount`,
         `"embeddingsTable": $embeddingsTable`,
-        `"embeddingVersion": $embeddingVersion`,
         `"resultsPath": "/manifest/" & ${REQUEST_KEY} & "/results"`,
       ].join(", "),
     );
@@ -291,23 +290,22 @@ export class IngestWorkflowConstruct extends Construct {
 
     for (const step of [
       preProcessDocuments,
-      allocateVersion,
+      createEmbeddingsTable,
       embedDocuments,
-      finalizeVersion,
       reviewRequirements,
     ]) {
-      step.addCatch(markVersionFailed, {
+      step.addCatch(notifyFailed, {
         assign: { failure: jsonata("$states.errorOutput") },
         errors: [sfn.Errors.ALL],
       });
     }
 
+    reviewRequirements.next(reviewSucceeded);
+
     const definition = preProcessDocuments
-      .next(allocateVersion)
+      .next(createEmbeddingsTable)
       .next(embedDocuments)
-      .next(finalizeVersion)
-      .next(reviewRequirements)
-      .next(reviewSucceeded);
+      .next(hasEmbeddings);
 
     this.stateMachine = new sfn.StateMachine(this, "StateMachine", {
       definitionBody: sfn.DefinitionBody.fromChainable(definition),

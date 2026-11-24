@@ -137,6 +137,14 @@ export interface DeploymentConfig {
   albCertificateArn?: string;
   /** Externally managed MuleSoft notification queue config, when pre-provisioned outside this stack. */
   manifestNotificationQueue?: ExternalNotificationQueueConfig;
+  /**
+   * Hostname covered by the ALB certificate. API Gateway validates the ALB TLS
+   * certificate against the integration URI host, so set this when the ALB DNS
+   * name is not on the certificate. Defaults to
+   * `alb.<env>.macsuite.aisuite.internal.cms.gov`; override with
+   * `AISUITE_ALB_HOST_NAME`.
+   */
+  albHostName: string;
   /** Name of the central S3 bucket that receives server access logs (managed externally). */
   accessLogsBucketName: string;
 }
@@ -194,6 +202,9 @@ export function getDeploymentConfig(
     manifestNotificationQueue:
       DEPLOYMENT_ENVIRONMENT_MANIFEST_NOTIFICATION_QUEUE[environmentName],
     accessLogsBucketName: `cms-cloud-${resolveAccountId(accountTier)}-${DEFAULT_REGION}-access-logs`,
+    albHostName:
+      process.env.AISUITE_ALB_HOST_NAME?.trim() ||
+      `alb.${environmentName}.macsuite.aisuite.internal.cms.gov`,
   };
 }
 
