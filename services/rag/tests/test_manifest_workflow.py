@@ -1,6 +1,6 @@
 """Unit tests for the MuleSoft manifest workflow (no AWS, Bedrock or Postgres).
 
-Covers the manifest contract, versioned per-state embeddings tables, the
+Covers the manifest contract, per-request embeddings tables, the
 embeddings Lambda actions, the requirement review runner and the manifest API.
 """
 
@@ -35,9 +35,13 @@ _IMPORT_STUBS = {
     )
 }
 with patch.dict(sys.modules, _IMPORT_STUBS):
-    from common.utils.manifest import Manifest, RequirementResult
+    from common.utils.manifest import (
+        MAX_TABLE_NAME_LEN,
+        Manifest,
+        RequirementResult,
+        manifest_embeddings_table_name,
+    )
     from data_embeddings_storage import rag_process
-    from data_embeddings_storage.database import embedding_versions
     from search import manifest_review
     from search.database_searching.review_models import EvidenceRecord, RequirementReview
     from search.routes import manifest_api
@@ -102,51 +106,38 @@ class ManifestContractTests(unittest.TestCase):
                 self.assertIn(message, str(raised.exception))
 
 
-class EmbeddingVersionTests(unittest.IsolatedAsyncioTestCase):
-    @staticmethod
-    def _connection(existing=None, values=()):
-        connection = MagicMock()
-        connection.execute = AsyncMock(return_value="UPDATE 1")
-        connection.fetchrow = AsyncMock(return_value=existing)
-        connection.fetchval = AsyncMock(side_effect=list(values))
-        return connection
+class ManifestTableNameTests(unittest.TestCase):
+    def test_short_request_key_uses_embeddings_requestkey_state(self):
+        self.assertEqual(
+            manifest_embeddings_table_name("REQ-123", "MD"),
+            "embeddings_req_123_md",
+        )
+        self.assertEqual(
+            manifest_embeddings_table_name("12345", "tn"),
+            "embeddings_12345_tn",
+        )
 
-    def test_only_allocated_table_names_are_accepted(self):
-        self.assertEqual(embedding_versions.versioned_table_name("md", 3), "embeddings_md_v3")
-        self.assertEqual(embedding_versions.validate_versioned_table_name("embeddings_md_v3"), "embeddings_md_v3")
-        for invalid in ("embeddings_md", "embeddings_md_v0", "embeddings_tn_6756_tenncare", "embeddings_md_v1; --", None):
-            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                embedding_versions.validate_versioned_table_name(invalid)
-        with self.assertRaises(ValueError):
-            embedding_versions.versioned_table_name("Maryland", 1)
+    def test_long_request_key_is_truncated_with_deterministic_hash(self):
+        table_uuid = manifest_embeddings_table_name(REQUEST_KEY, "MD")
+        self.assertTrue(table_uuid.startswith("embeddings_3f6c1e2a_8b4d_4c1e_"))
+        self.assertTrue(table_uuid.endswith("_md"))
+        self.assertLessEqual(len(table_uuid), MAX_TABLE_NAME_LEN)
+        self.assertEqual(table_uuid, manifest_embeddings_table_name(REQUEST_KEY, "md"))
 
-    async def test_retried_allocation_returns_the_version_the_request_holds(self):
-        connection = self._connection(existing={"state": "MD", "version": 2, "table_name": "embeddings_md_v2"})
+        # Two long keys sharing a 79-char prefix still get distinct table names.
+        first = manifest_embeddings_table_name("a" * 79 + "1", "MD")
+        second = manifest_embeddings_table_name("a" * 79 + "2", "MD")
+        self.assertNotEqual(first, second)
+        self.assertLessEqual(len(first), MAX_TABLE_NAME_LEN)
+        self.assertLessEqual(len(second), MAX_TABLE_NAME_LEN)
 
-        version = await embedding_versions.allocate_version(connection, "md", REQUEST_KEY)
-
-        self.assertEqual(version, embedding_versions.EmbeddingVersion("MD", 2, "embeddings_md_v2"))
-        connection.fetchval.assert_not_awaited()
-        self.assertEqual(connection.execute.await_count, 1)  # only the advisory lock
-
-    async def test_allocation_takes_the_next_version_and_skips_unregistered_tables(self):
-        # Next registry version is 3, but embeddings_md_v3 already exists outside the registry.
-        connection = self._connection(values=[3, True, False])
-
-        version = await embedding_versions.allocate_version(connection, "MD", REQUEST_KEY)
-
-        self.assertEqual(version, embedding_versions.EmbeddingVersion("MD", 4, "embeddings_md_v4"))
-        lock, insert = connection.execute.await_args_list
-        self.assertEqual(lock.args[1], "aisuite-embedding-version:MD")
-        self.assertIn("INSERT INTO aisuite_schema.embedding_versions", insert.args[0])
-        self.assertEqual(insert.args[1:], ("MD", 4, "embeddings_md_v4", REQUEST_KEY))
-
-    async def test_an_empty_table_is_never_published(self):
-        connection = self._connection(values=[0])
-
-        with self.assertRaises(RuntimeError):
-            await embedding_versions.mark_ready(connection, REQUEST_KEY, "embeddings_md_v4")
-        connection.execute.assert_not_awaited()
+    def test_rejects_invalid_request_key_or_state(self):
+        for bad_key in ("", "bad;drop", "a" * 81, None):
+            with self.subTest(bad_key=bad_key), self.assertRaises(ValueError):
+                manifest_embeddings_table_name(bad_key, "MD")
+        for bad_state in ("", "Maryland", "12", None):
+            with self.subTest(bad_state=bad_state), self.assertRaises(ValueError):
+                manifest_embeddings_table_name("REQ-1", bad_state)
 
 
 class EmbeddingsActionTests(unittest.TestCase):
@@ -165,41 +156,41 @@ class EmbeddingsActionTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_allocate_creates_the_versioned_table(self):
-        version = embedding_versions.EmbeddingVersion("MD", 4, "embeddings_md_v4")
-        with patch.object(embedding_versions, "ensure_registry", new=AsyncMock()), \
-                patch.object(embedding_versions, "allocate_version", new=AsyncMock(return_value=version)) as allocate, \
-                patch.object(rag_process, "create_embedding_table", new=AsyncMock()) as create_table:
-            result = rag_process.handler({"action": "allocate", "state": "MD", "requestKey": REQUEST_KEY})
+    def test_create_table_builds_request_key_state_table(self):
+        expected_table = manifest_embeddings_table_name(REQUEST_KEY, "MD")
+        with patch.object(rag_process, "create_embedding_table", new=AsyncMock()) as create_table:
+            result = rag_process.handler({"action": "create_table", "state": "md", "requestKey": REQUEST_KEY})
 
-        self.assertEqual(result, {"state": "MD", "version": 4, "tableName": "embeddings_md_v4"})
-        allocate.assert_awaited_once_with(self.connection, "MD", REQUEST_KEY)
-        create_table.assert_awaited_once_with("embeddings_md_v4")
+        self.assertEqual(result, {"state": "MD", "tableName": expected_table})
+        create_table.assert_awaited_once_with(expected_table)
         self.close_db.assert_awaited_once()
 
     def test_embed_replaces_earlier_rows_of_the_same_file(self):
+        table = manifest_embeddings_table_name(REQUEST_KEY, "MD")
         documents = [{"text": "chunk one", "metadata": {"page": 1}}, {"text": "chunk two"}]
         with patch.object(rag_process, "_load_rag_documents", return_value=documents), \
-                patch.object(embedding_versions, "delete_source_rows", new=AsyncMock()) as delete_rows, \
+                patch.object(rag_process, "delete_source_rows", new=AsyncMock()) as delete_rows, \
                 patch.object(rag_process, "_store_embeddings",
                              new=AsyncMock(return_value={"postgres_processed": 2})) as store:
-            result = rag_process.handler({"action": "embed", "key": RAG_KEY, "tableName": "embeddings_md_v4"})
+            result = rag_process.handler({"action": "embed", "key": RAG_KEY, "tableName": table})
 
-        self.assertEqual(result, {"key": RAG_KEY, "tableName": "embeddings_md_v4", "embedded": 2})
-        delete_rows.assert_awaited_once_with(self.connection, "embeddings_md_v4", RAG_KEY)
+        self.assertEqual(result, {"key": RAG_KEY, "tableName": table, "embedded": 2})
+        delete_rows.assert_awaited_once_with(self.connection, table, RAG_KEY)
         stored, table_name, _ = store.await_args.args
-        self.assertEqual(table_name, "embeddings_md_v4")
+        self.assertEqual(table_name, table)
         self.assertEqual(
             [doc["metadata"] for doc in stored],
             [{"page": 1, "rag_output_key": RAG_KEY}, {"rag_output_key": RAG_KEY}],
         )
 
-    def test_rejects_unknown_actions_and_tables_it_did_not_allocate(self):
+    def test_rejects_unknown_actions_and_invalid_table_names(self):
         with self.assertRaises(ValueError):
             rag_process.handler({"action": "drop"})
         with self.assertRaises(ValueError):
-            rag_process.handler({"action": "embed", "key": RAG_KEY, "tableName": "embeddings_tn_6756_tenncare"})
-        self.close_db.assert_awaited_once()
+            rag_process.handler({"action": "embed", "key": RAG_KEY, "tableName": "other_table"})
+        with self.assertRaises(ValueError):
+            rag_process.handler({"action": "embed", "key": RAG_KEY, "tableName": "embeddings_" + "a" * 40})
+        self.assertEqual(self.close_db.await_count, 2)
 
 
 class ResultMappingTests(unittest.TestCase):

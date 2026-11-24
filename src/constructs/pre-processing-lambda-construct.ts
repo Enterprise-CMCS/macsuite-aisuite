@@ -63,7 +63,7 @@ export class PreProcessingLambdaConstruct extends Construct {
         platform: ecr_assets.Platform.LINUX_ARM64,
       }),
       description:
-        "Pre-processes one manifest document with Bedrock Data Automation and writes its RAG_Output JSON; invoked by the manifest workflow.",
+        "Pre-processes document with Bedrock Data Automation.",
       environment: {
         BEDROCK_EMBED_MODEL_ID,
         BEDROCK_MODEL_ID,

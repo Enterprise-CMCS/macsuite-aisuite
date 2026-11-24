@@ -231,7 +231,7 @@ class InvokeRagProcessTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(rag_process, "create_embedding_table", new=AsyncMock()) as create_table, \
                 patch.object(rag_process, "pooled_connection", return_value=pooled_ctx), \
                 patch.object(rag_process, "close_db", new=AsyncMock()) as close_db, \
-                patch.object(rag_process.embedding_versions, "delete_source_rows", new=AsyncMock()) as delete_rows, \
+                patch.object(rag_process, "delete_source_rows", new=AsyncMock()) as delete_rows, \
                 patch.object(rag_process, "EmbeddingProcessor", return_value=processor) as processor_cls:
             result = await rag_process.invoke_rag_process("RAG_Output/common/cfr_438.json")
 

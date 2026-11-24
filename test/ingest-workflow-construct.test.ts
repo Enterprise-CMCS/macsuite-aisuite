@@ -34,9 +34,8 @@ interface DefinitionJson {
 
 const CAUGHT_STEPS = [
   "PreProcessDocuments",
-  "AllocateEmbeddingVersion",
+  "CreateEmbeddingsTable",
   "EmbedDocuments",
-  "FinalizeEmbeddingVersion",
   "ReviewRequirements",
 ] as const;
 
@@ -109,17 +108,22 @@ describe("IngestWorkflowConstruct", () => {
     expect(definition.QueryLanguage).toBe("JSONata");
   });
 
-  it("embeds only after every document is pre-processed, then reviews on Fargate", () => {
+  it("embeds only after every document is pre-processed, checks non-empty output, then reviews on Fargate", () => {
     expect(definition.StartAt).toBe("PreProcessDocuments");
     expect(states.PreProcessDocuments?.MaxConcurrency).toBe(5);
     expect(states.PreProcessDocuments?.ItemProcessor?.StartAt).toBe(
       "PreProcessDocument",
     );
-    expect(states.PreProcessDocuments?.Next).toBe("AllocateEmbeddingVersion");
-    expect(states.AllocateEmbeddingVersion?.Next).toBe("EmbedDocuments");
+    expect(states.PreProcessDocuments?.Next).toBe("CreateEmbeddingsTable");
+    expect(states.CreateEmbeddingsTable?.Next).toBe("EmbedDocuments");
     expect(states.EmbedDocuments?.ItemProcessor?.StartAt).toBe("EmbedDocument");
-    expect(states.EmbedDocuments?.Next).toBe("FinalizeEmbeddingVersion");
-    expect(states.FinalizeEmbeddingVersion?.Next).toBe("ReviewRequirements");
+    expect(states.EmbedDocuments?.Output?.embeddedCount).toBe(
+      "{% $sum([$states.result.embedded]) %}",
+    );
+    expect(states.EmbedDocuments?.Next).toBe("HasEmbeddings");
+    expect(states.HasEmbeddings?.Choices?.[0]?.Next).toBe("ReviewRequirements");
+    expect(states.HasEmbeddings?.Default).toBe("NoEmbeddingsProduced");
+    expect(states.NoEmbeddingsProduced?.Next).toBe("NotifyFailed");
     expect(states.ReviewRequirements?.Resource).toContain("ecs:runTask.sync");
     expect(states.ReviewRequirements?.Output?.exitCode).toContain(
       `Containers[Name = '${REVIEW_CONTAINER_NAME}'].ExitCode`,
@@ -130,27 +134,22 @@ describe("IngestWorkflowConstruct", () => {
   it("notifies MuleSoft only when the review task exits cleanly", () => {
     expect(states.ReviewSucceeded?.Choices?.[0]?.Next).toBe("NotifyCompleted");
     expect(states.ReviewSucceeded?.Default).toBe("ReviewExitedWithError");
-    expect(states.ReviewExitedWithError?.Next).toBe(
-      "MarkEmbeddingVersionFailed",
-    );
+    expect(states.ReviewExitedWithError?.Next).toBe("NotifyFailed");
     expect(states.NotifyCompleted?.Resource).toContain("sqs:sendMessage");
     expect(states.NotifyCompleted?.End).toBe(true);
   });
 
-  it("routes every failure through version cleanup and a FAILED notification", () => {
+  it("routes every failure directly to a FAILED notification", () => {
     for (const step of CAUGHT_STEPS) {
       expect(states[step]?.Catch).toEqual([
         {
           Assign: { failure: "{% $states.errorOutput %}" },
           ErrorEquals: ["States.ALL"],
-          Next: "MarkEmbeddingVersionFailed",
+          Next: "NotifyFailed",
         },
       ]);
     }
-    expect(states.MarkEmbeddingVersionFailed?.Next).toBe("NotifyFailed");
-    expect(states.MarkEmbeddingVersionFailed?.Catch?.[0]?.Next).toBe(
-      "NotifyFailed",
-    );
+    expect(states.MarkEmbeddingVersionFailed).toBeUndefined();
     expect(states.NotifyFailed?.Next).toBe("ManifestRunFailed");
     expect(states.NotifyFailed?.Catch?.[0]?.Next).toBe("ManifestRunFailed");
     expect(states.ManifestRunFailed?.Type).toBe("Fail");

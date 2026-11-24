@@ -13,6 +13,7 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from common.utils.aws_files_access import stream_s3_object, write_s3_json
 from common.utils.manifest import (
     REQUEST_KEY_PATTERN,
     SUPPORTED_DOCUMENT_EXTENSIONS,
@@ -23,7 +24,6 @@ from common.utils.manifest import (
     ReviewResults,
     manifest_object_key,
     results_object_key,
-    results_path,
 )
 from common.utils.helper import Helper
 from common.utils.settings import aws_client
@@ -192,11 +192,11 @@ def submit_manifest(manifest: Manifest):
         )
 
     with _upstream(request_key, "store the manifest"):
-        _client("s3").put_object(
-            Bucket=_run_bucket(),
-            Key=manifest_object_key(request_key),
-            Body=manifest.model_dump_json(),
-            ContentType="application/json",
+        write_s3_json(
+            _client("s3"),
+            _run_bucket(),
+            manifest_object_key(request_key),
+            manifest.model_dump_json(),
         )
 
     sfn = _client("stepfunctions")
@@ -229,7 +229,7 @@ def get_manifest_status(request_key: RequestKey):
         status=run_status,
         startedAt=started.isoformat() if started else None,
         stoppedAt=stopped.isoformat() if stopped else None,
-        resultsPath=results_path(request_key) if run_status == "COMPLETED" else None,
+        resultsPath=f"/manifest/{request_key}/results" if run_status == "COMPLETED" else None,
         error=execution.get("error"),
         cause=execution.get("cause"),
     )
@@ -237,12 +237,8 @@ def get_manifest_status(request_key: RequestKey):
 
 @router.get("/{request_key}/results", response_model=ReviewResults, responses=_ERROR_RESPONSES)
 def get_manifest_results(request_key: RequestKey):
-    s3 = _client("s3")
     with _upstream(request_key, "read the results"):
-        try:
-            body = s3.get_object(Bucket=_run_bucket(), Key=results_object_key(request_key))["Body"]
-        except s3.exceptions.NoSuchKey:
-            body = None
+        body = stream_s3_object(_client("s3"), _run_bucket(), results_object_key(request_key))
     if body is not None:
         return StreamingResponse(body.iter_chunks(), media_type="application/json")
 

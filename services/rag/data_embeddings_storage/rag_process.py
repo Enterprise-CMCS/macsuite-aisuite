@@ -1,18 +1,21 @@
 import asyncio
 import hashlib
+import json
 import re
 
+from common.utils.aws_files_access import object_keys
+from common.utils.contract_config import validate_embeddings_table_name
 from common.utils.helper import Helper
 from common.utils.logger import log
-from common.utils.aws_files_access import object_keys
+from common.utils.manifest import MAX_TABLE_NAME_LEN, manifest_embeddings_table_name
 from data_preprocessing.bedrock.bda_results import RAG_OUTPUT_PREFIX
-from data_embeddings_storage.database import embedding_versions
 from data_embeddings_storage.database.connection import close_db, pooled_connection
 from data_embeddings_storage.database.data_processing_embeddings import EmbeddingProcessor
+from data_embeddings_storage.database.embeddings_schema import qualified_embeddings_table
 from data_embeddings_storage.database.table_setup import create_embedding_table
 
-MAX_TABLE_NAME_LEN = 41
 EMBED_BATCH_SIZE = 30
+SOURCE_METADATA_KEY = "rag_output_key"
 
 
 def is_rag_output_key(key):
@@ -65,6 +68,22 @@ async def _store_embeddings(documents, table_name, key):
     return status
 
 
+async def delete_source_rows(connection, table_name, rag_output_key):
+    """Remove rows previously embedded from one RAG_Output file (uses the metadata GIN index)."""
+    await connection.execute(
+        f"DELETE FROM {qualified_embeddings_table(table_name)} WHERE metadata @> $1::jsonb",
+        json.dumps({SOURCE_METADATA_KEY: rag_output_key}),
+    )
+
+
+def _validate_manifest_table(table_name):
+    if not isinstance(table_name, str) or not table_name.startswith("embeddings_"):
+        raise ValueError(f"Invalid manifest embeddings table '{table_name}'.")
+    if len(table_name) > MAX_TABLE_NAME_LEN:
+        raise ValueError(f"Embeddings table '{table_name}' exceeds {MAX_TABLE_NAME_LEN} characters.")
+    return validate_embeddings_table_name(table_name)
+
+
 async def invoke_rag_process(key):
     documents = _load_rag_documents(key)
     is_common = is_common_rag_output_key(key)
@@ -72,14 +91,14 @@ async def invoke_rag_process(key):
 
     if is_common:
         documents = [
-            {**doc, "metadata": {**(doc.get("metadata") or {}), embedding_versions.SOURCE_METADATA_KEY: key}}
+            {**doc, "metadata": {**(doc.get("metadata") or {}), SOURCE_METADATA_KEY: key}}
             for doc in documents
         ]
         log.info(f"invoke_rag_process() Using common embeddings table {table_name} for {key}")
         await create_embedding_table(table_name)
         try:
             async with pooled_connection() as connection:
-                await embedding_versions.delete_source_rows(connection, table_name, key)
+                await delete_source_rows(connection, table_name, key)
         finally:
             await close_db()
         if not documents:
@@ -101,28 +120,27 @@ def _required(event, field):
     return value
 
 
-async def _allocate(event):
+async def _create_table(event):
     request_key = _required(event, "requestKey")
-    async with pooled_connection() as connection:
-        await embedding_versions.ensure_registry(connection)
-        version = await embedding_versions.allocate_version(connection, _required(event, "state"), request_key)
-    await create_embedding_table(version.table_name)
-    log.info(f"Allocated {version.table_name} (version {version.version}) for request {request_key}")
-    return version.as_payload()
+    state = _required(event, "state")
+    table_name = manifest_embeddings_table_name(request_key, state)
+    await create_embedding_table(table_name)
+    log.info(f"Created embeddings table {table_name} for request {request_key}")
+    return {"state": state.strip().upper(), "tableName": table_name}
 
 
 async def _embed(event):
     key = _required(event, "key")
-    table_name = embedding_versions.validate_versioned_table_name(event.get("tableName"))
+    table_name = _validate_manifest_table(event.get("tableName"))
     if not is_rag_output_key(key):
         raise ValueError(f"'{key}' is not a {RAG_OUTPUT_PREFIX} JSON object.")
 
     documents = [
-        {**doc, "metadata": {**(doc.get("metadata") or {}), embedding_versions.SOURCE_METADATA_KEY: key}}
+        {**doc, "metadata": {**(doc.get("metadata") or {}), SOURCE_METADATA_KEY: key}}
         for doc in _load_rag_documents(key)
     ]
     async with pooled_connection() as connection:
-        await embedding_versions.delete_source_rows(connection, table_name, key)
+        await delete_source_rows(connection, table_name, key)
     if not documents:
         return {"key": key, "tableName": table_name, "embedded": 0}
 
@@ -130,25 +148,7 @@ async def _embed(event):
     return {"key": key, "tableName": table_name, "embedded": status["postgres_processed"]}
 
 
-async def _finalize(event):
-    request_key = _required(event, "requestKey")
-    table_name = embedding_versions.validate_versioned_table_name(event.get("tableName"))
-    async with pooled_connection() as connection:
-        row_count = await embedding_versions.mark_ready(connection, request_key, table_name)
-    log.info(f"Embeddings table {table_name} ready with {row_count} row(s) for request {request_key}")
-    return {"tableName": table_name, "rowCount": row_count}
-
-
-async def _fail(event):
-    request_key = _required(event, "requestKey")
-    async with pooled_connection() as connection:
-        # The run may have failed before the registry was ever created.
-        await embedding_versions.ensure_registry(connection)
-        marked = await embedding_versions.mark_failed(connection, request_key)
-    return {"requestKey": request_key, "markedFailed": marked}
-
-
-ACTIONS = {"allocate": _allocate, "embed": _embed, "finalize": _finalize, "fail": _fail}
+ACTIONS = {"create_table": _create_table, "embed": _embed}
 
 
 async def _run_action(event):

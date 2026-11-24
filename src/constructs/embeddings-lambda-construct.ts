@@ -59,7 +59,7 @@ export class EmbeddingsLambdaConstruct extends Construct {
         platform: ecr_assets.Platform.LINUX_ARM64,
       }),
       description:
-        "Allocates, fills and publishes the versioned per-state embeddings table in RDS PostgreSQL; invoked by the manifest workflow.",
+        "Creates embeddings table in RDS PostgreSQL.",
       environment: {
         BEDROCK_EMBED_MODEL_ID,
         COMMON_EMBEDDINGS_TABLE_NAME,

@@ -174,7 +174,7 @@ export class AisuiteInfrastructureStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, "EmbeddingsFunctionName", {
       description:
-        "Lambda the manifest workflow invokes to build the versioned per-state embeddings table.",
+        "Creates request embeddings table.",
       value: embeddings.function.functionName,
     });
 

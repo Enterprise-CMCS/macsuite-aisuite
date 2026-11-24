@@ -21,7 +21,7 @@ logger = structlog.get_logger(__name__)
 _deps_by_table = {}
 # Cached at first use and refreshed on a miss. The INI only declares a handful
 # of [contract:...] sections, but bootstrap pre-creates (and every manifest run
-# adds a versioned) embeddings_* table - the database itself, not the INI, is
+# adds a per-request) embeddings_* table - the database itself, not the INI, is
 # the authoritative set of contracts a request is allowed to select.
 _known_table_names = None
 

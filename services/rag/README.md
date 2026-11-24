@@ -49,8 +49,8 @@ flowchart LR
    Data Automation, parses the text/table/image outputs, splits text into
    chunks, and writes one combined JSON per file to `RAG_Output/` in the
    post-processing bucket. Embedding starts only after every document succeeds.
-3. **RAG process** creates a new `embeddings_<state>_v<version>` table for the
-   run, embeds every `RAG_Output/` JSON into it, and publishes it as READY.
+3. **RAG process** creates a new `embeddings_<requestKey>_<state>` table for the
+   run and embeds every `RAG_Output/` JSON into it.
 4. **Requirement review** (Fargate) reviews every `legalRequirements` item
    against that table and writes the results to S3.
 5. **Notification**: an SQS message tells MuleSoft the run finished, and
@@ -213,8 +213,8 @@ VPN/bastion).
 |------|---------------|--------|
 | Query API | `python -m search.routes.endpoint` (or Docker image `CMD` → uvicorn) | Always-on ECS Fargate service on port `8001` |
 | Pre-process (one file) | `python -m data_preprocessing.pre_processing <source-key>` | Lambda, invoked by the manifest workflow once per document |
-| Embeddings (one file) | `python -m data_embeddings_storage.rag_process RAG_Output/<folders>/<file>.json` | Lambda, invoked by the manifest workflow (`allocate`, `embed`, `finalize`, `fail`) |
-| Requirement review | `REQUEST_KEY=<key> EMBEDDINGS_TABLE_NAME=embeddings_md_v1 python -m search.manifest_review` | Fargate task run by the manifest workflow |
+| Embeddings (one file) | `python -m data_embeddings_storage.rag_process RAG_Output/<folders>/<file>.json` | Lambda, invoked by the manifest workflow (`create_table`, `embed`) |
+| Requirement review | `REQUEST_KEY=<key> EMBEDDINGS_TABLE_NAME=embeddings_req_123_md python -m search.manifest_review` | Fargate task run by the manifest workflow |
 | Contract review | `python search/excel_process/process_excel_with_rag.py` | not deployed yet; run it on demand |
 | DB bootstrap | usually not local (needs master secret) | One-shot Fargate task: `python -m data_embeddings_storage.database.bootstrap` |
 
@@ -436,13 +436,12 @@ The Step Functions execution, named after `requestKey`, then:
 
 1. **Pre-processes** every document with the pre-processing Lambda
    (`data_preprocessing.pre_processing.handler`), at most 5 at once.
-2. **Allocates** the next version for the state and creates
-   `embeddings_<state>_v<version>` (for example `embeddings_md_v3`). Each run
-   gets a new table; versions are tracked in
-   `aisuite_schema.embedding_versions` as `BUILDING`, `READY` or `FAILED`.
+2. **Creates** this run's embeddings table `embeddings_<requestKey>_<state>`
+   (sanitized to lowercase/underscores, truncated with an 8-char SHA-256 hash
+   when over 41 chars to fit Postgres's 63-byte index-name limit).
 3. **Embeds** every `RAG_Output` JSON into that table with the embeddings Lambda
-   (`data_embeddings_storage.rag_process.handler`), then **finalizes** the
-   version as `READY` (it fails if the table is empty).
+   (`data_embeddings_storage.rag_process.handler`) and fails the run if 0 chunks
+   were produced across all documents.
 4. **Reviews** every requirement in a Fargate task
    (`python -m search.manifest_review`) against that table and writes
    `manifest-results/<requestKey>/results.json`. Each item echoes `id`,
@@ -455,11 +454,11 @@ The Step Functions execution, named after `requestKey`, then:
 
    ```json
    {"requestKey": "…", "state": "MD", "reviewType": "STREAMLINED", "status": "COMPLETED",
-    "requirementCount": 2, "embeddingsTable": "embeddings_md_v3", "embeddingVersion": 3,
+    "requirementCount": 2, "embeddingsTable": "embeddings_req_123_md",
     "resultsPath": "/manifest/<requestKey>/results"}
    ```
 
-   Any failed step marks the version `FAILED` and sends `"status": "FAILED"`
+   Any failed step sends `"status": "FAILED"`
    with `error` and `statusPath` (`/manifest/<requestKey>`) instead. Delivery is
    at least once, so consumers should dedupe on `requestKey` + `status`.
 
@@ -488,10 +487,10 @@ failed calls twice.
 
 ### Search (API)
 
-The agent accepts only a natural-language `query`. The search API reads the
-table named by `EMBEDDINGS_TABLE_NAME` (default `embeddings`); it does not yet
-search the versioned `embeddings_<state>_v<version>` tables, which only the
-requirement review reads.
+The agent accepts a natural-language `query` and an optional `contract` table
+name. When `contract` is omitted, the search API reads the table named by
+`EMBEDDINGS_TABLE_NAME` (default `embeddings`); passing a manifest run's
+`embeddings_<requestKey>_<state>` table name searches that run's embeddings.
 
 ## Shared buckets (dev)
 
