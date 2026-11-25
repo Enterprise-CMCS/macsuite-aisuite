@@ -206,13 +206,13 @@ VPN/bastion).
 
 | Mode | Local command | Cloud |
 |------|---------------|--------|
-| Query API | `python -m search.routes.endpoint` (or Docker image `CMD` → uvicorn) | Always-on ECS Fargate service on port `8001` |
+| API | `python -m search.routes.endpoint` (or Docker image `CMD` → uvicorn) | Always-on ECS Fargate service on port `8001` |
 | Pre-process | `data_preprocessing.pre_processing.handler` | Lambda, invoked by the manifest workflow (and `common/` S3 uploads) |
 | Embeddings | `data_embeddings_storage.rag_process.handler` | Lambda, invoked by the manifest workflow (`create_table`, `embed`) and `RAG_Output/common/` S3 notifications |
 | Requirement review | `REQUEST_KEY=<key> EMBEDDINGS_TABLE_NAME=embeddings_req_123_5fde4fd5_md python -m search.manifest_review` | Fargate task run by the manifest workflow |
 | DB bootstrap | usually not local (needs master secret) | One-shot Fargate task: `python -m data_embeddings_storage.database.bootstrap` |
 
-### Query API (local)
+### API (local)
 
 ```sh
 export API_HOST=0.0.0.0
@@ -224,21 +224,10 @@ python -m search.routes.endpoint
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /health` | Health check |
-| `GET /agent?query=…` | Agent answer (query string) |
-| `POST /agent` | Agent answer; body `{"query": "…"}` |
 | `POST /manifest` | Validate a MuleSoft manifest and start its run (see [Ingest](#ingest-manifest-workflow)) |
 | `GET /manifest/{requestKey}` | Run status: `PROCESSING`, `COMPLETED` or `FAILED` |
 | `GET /manifest/{requestKey}/results` | Reviewed requirements once the run completes |
 | `GET /docs` | OpenAPI UI |
-
-Example:
-
-```sh
-curl -s "http://127.0.0.1:8001/agent?query=What+is+coverage+for+NEMT%3F"
-curl -s -X POST "http://127.0.0.1:8001/agent" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"What is coverage for NEMT?"}'
-```
 
 ### Cloud operation
 

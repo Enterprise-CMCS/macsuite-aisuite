@@ -8,30 +8,30 @@ from data_preprocessing.parsing import parsed_text_data
 from data_preprocessing.parsing import parsed_bda_table
 
 
-def process(source_key):
+def process(source_key, namespace=None):
 
-    ret_value = bda.invoke_bedrock_bda(source_key)
+    ret_value = bda.invoke_bedrock_bda(source_key, namespace=namespace)
     if not ret_value:
         print(f"Value Returned by function invoke_bedrock_bda() is {ret_value}. Please check.")
         raise Exception(f"Value Returned by function invoke_bedrock_bda() is {ret_value}. Please check.")
     else:
         print(f"Value Returned by function invoke_bedrock_bda() is {ret_value}.")
 
-    ret_value = parsed_text_data.invoke_parsed_text_data(source_key)
+    ret_value = parsed_text_data.invoke_parsed_text_data(source_key, namespace=namespace)
     if not ret_value:
         print(f"Value Returned by function invoke_parsed_text_data() is {ret_value}. Please check.")
         raise Exception(f"Value Returned by function invoke_parsed_text_data() is {ret_value}. Please check.")
     else:
         print(f"Value Returned by function invoke_parsed_text_data() is {ret_value}.")
 
-    ret_value = parsed_bda_table.invoke_parsed_bda_data(source_key)
+    ret_value = parsed_bda_table.invoke_parsed_bda_data(source_key, namespace=namespace)
     if not ret_value:
         print(f"Value Returned by function invoke_parsed_bda_data() is {ret_value}. Please check.")
         raise Exception(f"Value Returned by function invoke_parsed_bda_data() is {ret_value}. Please check.")
     else:
         print(f"Value Returned by function invoke_parsed_bda_data() is {ret_value}.")
 
-    ret_value = parsed_images.invoke_parsed_images_data(source_key)
+    ret_value = parsed_images.invoke_parsed_images_data(source_key, namespace=namespace)
     if not ret_value:
         print(f"Value Returned by function invoke_parsed_images_data() is {ret_value}. Please check.")
         raise Exception(f"Value Returned by function invoke_parsed_images_data() is {ret_value}. Please check.")
@@ -41,10 +41,10 @@ def process(source_key):
     return ret_value
 
 
-def merge_outputs_to_rag_output(source_key):
+def merge_outputs_to_rag_output(source_key, namespace=None):
 
     bucket = Helper.get_property("output_bucket")
-    output_keys = [per_doc_output_key(source_key, kind) for kind in OUTPUT_FOLDERS]
+    output_keys = [per_doc_output_key(source_key, kind, namespace=namespace) for kind in OUTPUT_FOLDERS]
 
     all_docs = []
     for output_key in output_keys:
@@ -55,19 +55,20 @@ def merge_outputs_to_rag_output(source_key):
         if doc and doc.get("text")
     ]
 
-    rag_key = rag_output_key(source_key)
+    rag_key = rag_output_key(source_key, namespace=namespace)
     Helper.create_file(bucket, rag_key, documents)
     print(f"Wrote {len(documents)} RAG document(s) for {source_key} to s3://{bucket}/{rag_key}")
     return rag_key
 
 
 def handler(event, context=None):
+    namespace = event.get("requestKey") if isinstance(event, dict) else None
     rag_outputs = []
     for key in object_keys(event):
         if not key.lower().endswith(SUPPORTED_DOCUMENT_EXTENSIONS):
             continue
-        process(key)
-        rag_outputs.append(merge_outputs_to_rag_output(key))
+        process(key, namespace=namespace)
+        rag_outputs.append(merge_outputs_to_rag_output(key, namespace=namespace))
 
     if not rag_outputs:
         print(f"No PDF or DOCX objects in event. Skipping. Event={event}")

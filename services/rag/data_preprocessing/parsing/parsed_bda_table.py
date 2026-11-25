@@ -138,13 +138,13 @@ def parse_table_elements_simple(source_data):
     return results
 
 
-def invoke_parsed_bda_data(source_key):
+def invoke_parsed_bda_data(source_key, namespace=None):
     try:
         log.info(f"***************** invoke_parsed_bda_data Starts. __name__={__name__}")
         awsClientS3 = aws_client("s3")
 
         output_bucket = Helper.get_property("output_bucket")
-        output_prefix = doc_output_prefix(source_key)
+        output_prefix = doc_output_prefix(source_key, namespace=namespace)
 
         log.info(f"output_bucket={output_bucket}, output_prefix={output_prefix}")
         log.debug(f"Calling fetch_parsed_bda_results")
@@ -158,7 +158,7 @@ def invoke_parsed_bda_data(source_key):
             table_data = parse_table_elements_simple(dataObj)
             test_table.extend(table_data)
 
-        bda_table_output_filename = per_doc_output_key(source_key, "table")
+        bda_table_output_filename = per_doc_output_key(source_key, "table", namespace=namespace)
         log.debug(f"Output Table File Name={bda_table_output_filename}")
 
         s3_client = boto3.client('s3')

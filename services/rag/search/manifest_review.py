@@ -80,6 +80,7 @@ def document_labels(manifest):
     for doc in manifest.documents:
         by_exact_key[doc.s3.path] = doc.documentId
         by_exact_key[rag_output_key(doc.s3.path)] = doc.documentId
+        by_exact_key[rag_output_key(doc.s3.path, namespace=manifest.requestKey)] = doc.documentId
         base = simplify_doc_id(os.path.basename(doc.s3.path))
         counts[base] = counts.get(base, 0) + 1
         by_basename[base] = doc.documentId

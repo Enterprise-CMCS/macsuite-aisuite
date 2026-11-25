@@ -51,7 +51,6 @@ with patch.dict(sys.modules, _IMPORT_STUBS):
     )
     from data_embeddings_storage import rag_process
     from search import manifest_review
-    from search.database_searching import agents as review_agents
     from search.database_searching.review_models import EvidenceRecord, RequirementReview, simplify_doc_id
     from search.routes import endpoint, manifest_api
 
@@ -156,8 +155,21 @@ class ManifestTableNameTests(unittest.TestCase):
 
 class EmbeddingsActionTests(unittest.TestCase):
     def setUp(self):
+        self.events = []
         self.connection = MagicMock()
         self.connection.execute = AsyncMock()
+
+        @asynccontextmanager
+        async def transaction():
+            self.events.append(("tx_begin",))
+            try:
+                yield
+            except BaseException:
+                self.events.append(("tx_rollback",))
+                raise
+            self.events.append(("tx_commit",))
+
+        self.connection.transaction = transaction
 
         @asynccontextmanager
         async def pooled_connection():
@@ -183,43 +195,74 @@ class EmbeddingsActionTests(unittest.TestCase):
     def test_embed_replaces_earlier_rows_of_the_same_file(self):
         table = manifest_embeddings_table_name(REQUEST_KEY, "MD")
         documents = [{"text": "chunk one", "metadata": {"page": 1}}, {"text": "chunk two"}]
-        events = []
+        processor = MagicMock()
+        records = [("chunk one", "{}", [0.1]), ("chunk two", "{}", [0.2])]
 
         async def record_execute(sql, *args):
-            if "pg_advisory_lock" in sql:
-                events.append(("lock", args[0]))
-            elif "pg_advisory_unlock" in sql:
-                events.append(("unlock", args[0]))
+            if "pg_advisory_xact_lock" in sql:
+                self.events.append(("lock", args[0]))
+
+        async def record_generate(docs, tbl, key):
+            self.events.append(("generate", tbl, key))
+            return processor, records
 
         async def record_delete(conn, tbl, key):
-            events.append(("delete", tbl, key))
+            self.events.append(("delete", conn is self.connection, tbl, key))
 
-        async def record_store(docs, tbl, key):
-            events.append(("store", tbl, key))
-            return {"postgres_processed": len(docs)}
+        async def record_store(conn, proc, recs):
+            self.events.append(("store", conn is self.connection, proc is processor, len(recs)))
+            return len(recs)
 
         self.connection.execute.side_effect = record_execute
         with patch.object(rag_process, "_load_rag_documents", return_value=documents), \
+                patch.object(rag_process, "_generate_embeddings", side_effect=record_generate) as generate, \
                 patch.object(rag_process, "delete_source_rows", side_effect=record_delete) as delete_rows, \
                 patch.object(rag_process, "_store_embeddings", side_effect=record_store) as store:
             result = rag_process.handler({"action": "embed", "key": RAG_KEY, "tableName": table})
 
         self.assertEqual(result, {"key": RAG_KEY, "tableName": table, "embedded": 2})
         delete_rows.assert_called_once_with(self.connection, table, RAG_KEY)
-        stored, table_name, _ = store.call_args.args
+        store.assert_called_once_with(self.connection, processor, records)
+        stamped, table_name, _ = generate.call_args.args
         self.assertEqual(table_name, table)
         self.assertEqual(
-            [doc["metadata"] for doc in stored],
+            [doc["metadata"] for doc in stamped],
             [{"page": 1, "rag_output_key": RAG_KEY}, {"rag_output_key": RAG_KEY}],
         )
         lock_id = f"{table}:{RAG_KEY}"
         self.assertEqual(
-            events,
+            self.events,
             [
+                ("generate", table, RAG_KEY),
+                ("tx_begin",),
                 ("lock", lock_id),
-                ("delete", table, RAG_KEY),
-                ("store", table, RAG_KEY),
-                ("unlock", lock_id),
+                ("delete", True, table, RAG_KEY),
+                ("store", True, True, 2),
+                ("tx_commit",),
+            ],
+        )
+
+    def test_embed_empty_documents_deletes_rows_atomically_without_generating(self):
+        table = manifest_embeddings_table_name(REQUEST_KEY, "MD")
+
+        async def record_delete(conn, tbl, key):
+            self.events.append(("delete", conn is self.connection, tbl, key))
+
+        with patch.object(rag_process, "_load_rag_documents", return_value=[]), \
+                patch.object(rag_process, "_generate_embeddings", new=AsyncMock()) as generate, \
+                patch.object(rag_process, "delete_source_rows", side_effect=record_delete), \
+                patch.object(rag_process, "_store_embeddings", new=AsyncMock()) as store:
+            result = rag_process.handler({"action": "embed", "key": RAG_KEY, "tableName": table})
+
+        self.assertEqual(result, {"key": RAG_KEY, "tableName": table, "embedded": 0})
+        generate.assert_not_awaited()
+        store.assert_not_awaited()
+        self.assertEqual(
+            self.events,
+            [
+                ("tx_begin",),
+                ("delete", True, table, RAG_KEY),
+                ("tx_commit",),
             ],
         )
 
@@ -276,11 +319,16 @@ class ResultMappingTests(unittest.TestCase):
             manifest_review.found_in(
                 [
                     evidence(2, doc_id="contract", source_key="RAG_Output/DOC-001/a/contract.json"),
+                    evidence(
+                        4,
+                        doc_id="contract",
+                        source_key=f"RAG_Output/runs/{REQUEST_KEY}/DOC-002/b/contract.json",
+                    ),
                     evidence(8, doc_id="addendum", source_key="DOC-003/c/addendum.pdf"),
                 ],
                 labels,
             ),
-            "DOC-001: Page 3; DOC-003: Page 9",
+            "DOC-001: Page 3; DOC-002: Page 5; DOC-003: Page 9",
         )
         review = RequirementReview(
             requirement="Shared basename check",
@@ -478,6 +526,45 @@ class ManifestApiTests(unittest.TestCase):
         self.assertEqual((workflow_input["state"], workflow_input["requirementCount"]), ("MD", 2))
         self.assertNotIn("legalRequirements", workflow_input)
 
+    def test_accepts_manifest_larger_than_8kib_within_app_limit(self):
+        large_payload = manifest_payload(legalRequirements=[requirement(i) for i in range(120)])
+        raw = json.dumps(large_payload).encode("utf-8")
+        self.assertGreater(len(raw), 8192)
+
+        response = self.client.post("/manifest", content=raw, headers={"Content-Type": "application/json"})
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["requirementCount"], 120)
+
+    def test_rejects_manifest_body_exceeding_app_limit_via_content_length_and_stream(self):
+        raw = json.dumps(manifest_payload(legalRequirements=[requirement(i) for i in range(25)])).encode("utf-8")
+        limit = len(raw) - 1
+
+        with patch.dict(os.environ, {"MAX_MANIFEST_BODY_BYTES": str(limit)}):
+            by_header = self.client.post(
+                "/manifest",
+                content=raw,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(by_header.status_code, 413)
+            self.assertEqual(by_header.json()["status"], "PAYLOAD_TOO_LARGE")
+
+            def chunked_body():
+                midpoint = len(raw) // 2
+                yield raw[:midpoint]
+                yield raw[midpoint:]
+
+            by_stream = self.client.post(
+                "/manifest",
+                content=chunked_body(),
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(by_stream.status_code, 413)
+            self.assertEqual(by_stream.json()["status"], "PAYLOAD_TOO_LARGE")
+
+        self.s3.put_object.assert_not_called()
+        self.sfn.start_execution.assert_not_called()
+
     def test_rejects_documents_that_are_missing_or_in_another_bucket(self):
         self.s3.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
         payload = manifest_payload()
@@ -594,64 +681,20 @@ class ManifestApiTests(unittest.TestCase):
         )
 
 
-class AgentEndpointErrorTests(unittest.TestCase):
-    def setUp(self):
-        endpoint._deps_by_table.clear()
-        endpoint._known_table_names = {"embeddings_tn_6756"}
-        self.client = TestClient(endpoint.app)
+class RemovedEndpointTests(unittest.TestCase):
+    def test_removed_routes_are_unavailable_and_not_advertised(self):
+        client = TestClient(endpoint.app)
+        for method, path in (("GET", "/agent"), ("POST", "/agent"), ("GET", "/contracts")):
+            with self.subTest(method=method, path=path):
+                self.assertEqual(client.request(method, path).status_code, 404)
 
-    def tearDown(self):
-        endpoint._deps_by_table.clear()
-        endpoint._known_table_names = None
-
-    def test_agent_endpoint_marks_review_error_unsuccessful(self):
-        failed_review = RequirementReview(
-            requirement="Must cover NEMT",
-            status="UNSURE",
-            argument="Automated review did not complete cleanly; manual review is required.",
-            error="ClientError: ThrottlingException",
-        )
-        with (
-            patch.object(endpoint, "build_deps", return_value=object()),
-            patch.object(endpoint, "answer_question_formatted", wraps=review_agents.answer_question_formatted),
-            patch.object(review_agents, "review_requirement", AsyncMock(return_value=failed_review)),
-        ):
-            res = self.client.post(
-                "/agent",
-                json={"query": "Must cover NEMT", "contract": "embeddings_tn_6756"},
-            )
-
-        self.assertEqual(res.status_code, 200)
-        body = res.json()
-        self.assertFalse(body["success"])
-        self.assertEqual(body["contract"], "embeddings_tn_6756")
-        self.assertIn("Error: ClientError: ThrottlingException", body["response"])
-
-    def test_agent_endpoint_marks_clean_review_successful(self):
-        ok_review = RequirementReview(
-            requirement="Must cover NEMT",
-            status="MET",
-            decision_confidence="HIGH",
-            argument="Contract covers NEMT in Section 4.",
-            decision_response="Verified evidence establishes NEMT coverage.",
-            error="",
-        )
-        with (
-            patch.object(endpoint, "build_deps", return_value=object()),
-            patch.object(endpoint, "answer_question_formatted", wraps=review_agents.answer_question_formatted),
-            patch.object(review_agents, "review_requirement", AsyncMock(return_value=ok_review)),
-        ):
-            res = self.client.post(
-                "/agent",
-                json={"query": "Must cover NEMT", "contract": "embeddings_tn_6756"},
-            )
-
-        self.assertEqual(res.status_code, 200)
-        body = res.json()
-        self.assertTrue(body["success"])
-        self.assertIn("AI Recommendation: MET", body["response"])
-        self.assertIn("Contract covers NEMT in Section 4.", body["response"])
-        self.assertNotIn("Error:", body["response"])
+        paths = client.get("/openapi.json").json()["paths"]
+        advertised = [item["path"] for item in client.get("/").json()["endpoints"]]
+        for path in ("/agent", "/contracts"):
+            self.assertNotIn(path, paths)
+            self.assertNotIn(path, advertised)
+        self.assertIn("/manifest", paths)
+        self.assertEqual(client.get("/health").status_code, 200)
 
 
 if __name__ == "__main__":

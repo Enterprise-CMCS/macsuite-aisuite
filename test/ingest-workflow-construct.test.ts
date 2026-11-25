@@ -25,6 +25,7 @@ interface StateJson {
   Default?: string;
   End?: boolean;
   ItemProcessor?: { StartAt: string };
+  ItemSelector?: Record<string, unknown>;
   MaxConcurrency?: number;
   Next?: string;
   Output?: Record<string, unknown>;
@@ -117,6 +118,11 @@ describe("IngestWorkflowConstruct", () => {
   it("embeds only after every document is pre-processed, checks non-empty output, then reviews on Fargate", () => {
     expect(definition.StartAt).toBe("PreProcessDocuments");
     expect(states.PreProcessDocuments?.MaxConcurrency).toBe(5);
+    expect(states.PreProcessDocuments?.ItemSelector).toEqual({
+      documentId: "{% $states.context.Map.Item.Value.documentId %}",
+      requestKey: "{% $states.context.Execution.Input.requestKey %}",
+      s3: "{% $states.context.Map.Item.Value.s3 %}",
+    });
     expect(states.PreProcessDocuments?.ItemProcessor?.StartAt).toBe(
       "PreProcessDocument",
     );
@@ -204,7 +210,12 @@ describe("IngestWorkflowConstruct", () => {
     });
   });
 
-  it("routes TIMED_OUT and ABORTED executions through an EventBridge terminal-status notifier", () => {
+  it("routes FAILED, TIMED_OUT, and ABORTED executions through an EventBridge terminal-status notifier", () => {
+    expect(TERMINAL_EXECUTION_STATUSES).toEqual([
+      "FAILED",
+      "TIMED_OUT",
+      "ABORTED",
+    ]);
     template.hasResourceProperties("AWS::Events::Rule", {
       EventPattern: {
         detail: {
@@ -235,7 +246,7 @@ describe("IngestWorkflowConstruct", () => {
     });
   });
 
-  it("publishes FAILED MuleSoft notifications for TIMED_OUT and ABORTED executions", async () => {
+  it("publishes FAILED MuleSoft notifications for FAILED, TIMED_OUT, and ABORTED executions", async () => {
     const sendSfn = vi.fn();
     const sendSqs = vi.fn().mockResolvedValue({});
 
@@ -336,5 +347,79 @@ describe("IngestWorkflowConstruct", () => {
       status: "FAILED",
       statusPath: "/manifest/req-aborted-2",
     });
+
+    sendSfn.mockClear();
+    sendSqs.mockClear();
+    sendSfn.mockResolvedValueOnce({
+      error: "SQS.SdkClientException",
+      status: "FAILED",
+    });
+
+    await handler({
+      detail: {
+        executionArn:
+          "arn:aws:states:us-east-1:123456789012:execution:aisuite-dev-manifest-ingest:req-failed-3",
+        input: JSON.stringify({
+          requestKey: "req-failed-3",
+          reviewType: "STREAMLINED",
+          state: "TN",
+        }),
+        inputDetails: { included: true },
+        name: "req-failed-3",
+        status: "FAILED",
+      },
+    });
+
+    expect(sendSfn).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(sendSqs.mock.calls[0]?.[0]?.input?.MessageBody)).toEqual({
+      error: "SQS.SdkClientException",
+      requestKey: "req-failed-3",
+      reviewType: "STREAMLINED",
+      state: "TN",
+      status: "FAILED",
+      statusPath: "/manifest/req-failed-3",
+    });
+
+    sendSfn.mockClear();
+    sendSqs.mockClear();
+    await handler({
+      detail: {
+        error: "States.Runtime",
+        executionArn:
+          "arn:aws:states:us-east-1:123456789012:execution:aisuite-dev-manifest-ingest:req-failed-4",
+        input: JSON.stringify({
+          requestKey: "req-failed-4",
+          reviewType: "FULL",
+          state: "ME",
+        }),
+        inputDetails: { included: true },
+        name: "req-failed-4",
+        status: "FAILED",
+      },
+    });
+
+    expect(sendSfn).not.toHaveBeenCalled();
+    expect(JSON.parse(sendSqs.mock.calls[0]?.[0]?.input?.MessageBody)).toEqual({
+      error: "States.Runtime",
+      requestKey: "req-failed-4",
+      reviewType: "FULL",
+      state: "ME",
+      status: "FAILED",
+      statusPath: "/manifest/req-failed-4",
+    });
+
+    sendSfn.mockClear();
+    sendSqs.mockClear();
+    const skipped = await handler({
+      detail: {
+        executionArn:
+          "arn:aws:states:us-east-1:123456789012:execution:aisuite-dev-manifest-ingest:req-ok-5",
+        name: "req-ok-5",
+        status: "SUCCEEDED",
+      },
+    });
+    expect(skipped).toEqual({ skipped: true, status: "SUCCEEDED" });
+    expect(sendSfn).not.toHaveBeenCalled();
+    expect(sendSqs).not.toHaveBeenCalled();
   });
 });

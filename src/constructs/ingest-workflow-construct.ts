@@ -16,13 +16,18 @@ import { INGEST_MAX_CONCURRENCY } from "./pre-processing-lambda-construct";
 
 
 export const MANIFEST_RUN_PREFIXES = ["manifests/", "manifest-results/"] as const;
-export const TERMINAL_EXECUTION_STATUSES = ["TIMED_OUT", "ABORTED"] as const;
+export const TERMINAL_EXECUTION_STATUSES = [
+  "FAILED",
+  "TIMED_OUT",
+  "ABORTED",
+] as const;
 
 export const TERMINAL_NOTIFICATION_HANDLER = `const { DescribeExecutionCommand, SFNClient } = require("@aws-sdk/client-sfn");
 const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
 
 const DEFAULT_ERRORS = {
   ABORTED: "ExecutionAborted",
+  FAILED: "ExecutionFailed",
   TIMED_OUT: "States.Timeout",
 };
 
@@ -35,7 +40,13 @@ exports.handler = async (event) => {
   let status = detail.status;
   let error = detail.error;
 
-  if ((!rawInput || detail.inputDetails?.included === false) && detail.executionArn) {
+  if (status && !DEFAULT_ERRORS[status]) {
+    return { skipped: true, status };
+  }
+
+  const missingInput = !rawInput || detail.inputDetails?.included === false;
+  const missingFailureDetails = !status || (status === "FAILED" && !error);
+  if (detail.executionArn && (missingInput || missingFailureDetails)) {
     const described = await sfn.send(
       new DescribeExecutionCommand({ executionArn: detail.executionArn }),
     );
@@ -44,7 +55,7 @@ exports.handler = async (event) => {
     error = error || described.error;
   }
 
-  if (status !== "TIMED_OUT" && status !== "ABORTED") {
+  if (!DEFAULT_ERRORS[status]) {
     return { skipped: true, status };
   }
 
@@ -213,6 +224,11 @@ export class IngestWorkflowConstruct extends Construct {
       assign: { ragOutputKeys: jsonata("[$states.result.rag_output]") },
       comment:
         "Pre-process the document files.",
+      itemSelector: {
+        documentId: jsonata("$states.context.Map.Item.Value.documentId"),
+        requestKey: jsonata(REQUEST_KEY),
+        s3: jsonata("$states.context.Map.Item.Value.s3"),
+      },
       items: sfn.ProvideItems.jsonata(jsonata("$states.input.documents")),
       maxConcurrency: INGEST_MAX_CONCURRENCY,
     });
@@ -411,7 +427,7 @@ export class IngestWorkflowConstruct extends Construct {
         architecture: lambda.Architecture.ARM_64,
         code: lambda.Code.fromInline(TERMINAL_NOTIFICATION_HANDLER),
         description:
-          "Sends a FAILED MuleSoft SQS notification when a manifest workflow execution ends in TIMED_OUT or ABORTED.",
+          "Sends a FAILED MuleSoft SQS notification when a manifest workflow execution ends in FAILED, TIMED_OUT, or ABORTED.",
         environment: {
           NOTIFICATION_QUEUE_URL: this.notificationQueue.queueUrl,
         },
@@ -443,7 +459,7 @@ export class IngestWorkflowConstruct extends Construct {
       "TerminalExecutionRule",
       {
         description:
-          "Routes TIMED_OUT and ABORTED manifest workflow executions to the MuleSoft failure notifier.",
+          "Routes FAILED, TIMED_OUT, and ABORTED manifest workflow executions to the MuleSoft failure notifier.",
         eventPattern: {
           detail: {
             stateMachineArn: [this.stateMachine.stateMachineArn],

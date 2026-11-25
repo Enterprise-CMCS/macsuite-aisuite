@@ -35,6 +35,7 @@ router = APIRouter(prefix="/manifest", tags=["Manifest"])
 
 _HEAD_OBJECT_WORKERS = 16
 _MAX_REPORTED_ERRORS = 50
+DEFAULT_MAX_MANIFEST_BODY_BYTES = 5 * 1024 * 1024
 
 _RUN_STATUS = {"RUNNING": "PROCESSING", "PENDING_REDRIVE": "PROCESSING", "SUCCEEDED": "COMPLETED"}
 _TERMINAL_DEFAULT_ERROR = {"TIMED_OUT": "States.Timeout", "ABORTED": "ExecutionAborted"}
@@ -44,11 +45,99 @@ _ERROR_RESPONSES = {
         status.HTTP_400_BAD_REQUEST,
         status.HTTP_404_NOT_FOUND,
         status.HTTP_409_CONFLICT,
+        status.HTTP_413_CONTENT_TOO_LARGE,
         status.HTTP_502_BAD_GATEWAY,
         status.HTTP_503_SERVICE_UNAVAILABLE,
     )
 }
 RequestKey = Annotated[str, Path(pattern=REQUEST_KEY_PATTERN)]
+
+
+def _max_manifest_body_bytes() -> int:
+    raw = os.environ.get("MAX_MANIFEST_BODY_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_MANIFEST_BODY_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_MANIFEST_BODY_BYTES
+    return value if value > 0 else DEFAULT_MAX_MANIFEST_BODY_BYTES
+
+
+def _payload_too_large_response(limit: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        content=ManifestError(
+            requestKey=None,
+            status="PAYLOAD_TOO_LARGE",
+            errors=[f"Manifest request body exceeds the {limit} byte limit."],
+        ).model_dump(),
+    )
+
+
+class _ManifestBodyLimitMiddleware:
+    """Enforce an explicit payload ceiling on POST /manifest.
+
+    WAF exempts POST /v1/manifest from SizeRestrictions_BODY so large manifests
+    are not blocked at 8 KiB; this middleware enforces the application limit
+    before Pydantic parses the request body.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path", "").rstrip("/") != router.prefix:
+            await self.app(scope, receive, send)
+            return
+
+        limit = _max_manifest_body_bytes()
+        content_length = None
+        for name, value in scope.get("headers", ()):
+            if name.lower() == b"content-length":
+                try:
+                    content_length = int(value.decode("ascii").strip())
+                except (UnicodeDecodeError, ValueError):
+                    content_length = None
+                break
+        if content_length is not None and content_length > limit:
+            response = _payload_too_large_response(limit)
+            await response(scope, receive, send)
+            return
+
+        chunks = []
+        received = 0
+        while True:
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                return
+            if message.get("type") != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            if chunk:
+                received += len(chunk)
+                if received > limit:
+                    response = _payload_too_large_response(limit)
+                    await response(scope, receive, send)
+                    return
+                chunks.append(chunk)
+            if not message.get("more_body", False):
+                break
+
+        body = b"".join(chunks)
+        body_sent = False
+
+        async def replay_receive():
+            nonlocal body_sent
+            if not body_sent:
+                body_sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
 
 
 class ManifestApiError(Exception):
@@ -132,7 +221,9 @@ def _document_errors(manifest):
     # a.pdf and a.docx in one folder pre-process to the same RAG_Output file.
     by_output = {}
     for document in manifest.documents:
-        by_output.setdefault(rag_output_key(document.s3.path), []).append(document.documentId)
+        by_output.setdefault(
+            rag_output_key(document.s3.path, namespace=manifest.requestKey), []
+        ).append(document.documentId)
     errors.extend(
         f"Documents {', '.join(ids)} share a folder and file name, so their pre-processing output would collide."
         for ids in by_output.values()
@@ -338,6 +429,7 @@ async def _validation_error(request: Request, exc: RequestValidationError):
 
 
 def install(app: FastAPI):
+    app.add_middleware(_ManifestBodyLimitMiddleware)
     app.include_router(router)
     app.add_exception_handler(ManifestApiError, _manifest_api_error)
     app.add_exception_handler(RequestValidationError, _validation_error)

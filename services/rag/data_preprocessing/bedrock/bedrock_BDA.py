@@ -250,7 +250,7 @@ def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da
         log.debug(f"rename_file_info={rename_file_info}, Setting rename file info variable. Replacing  empty string in name of file with _")
         rename_file_info = rename_file_info.replace(" ", "_")
 
-        prefix_check = f"{out_prefix.rstrip('/')}/{rename_file_info}"
+        prefix_check = f"{out_prefix.rstrip('/')}/{rename_file_info}/"
         log.info(f"strBasename={str_basename}, rename_file_info={rename_file_info}, Setting prefix_check variable. prefix_check={ prefix_check} ")
 
         if is_already_processed(output_bucket, prefix_check, rename_file_info):
@@ -307,7 +307,7 @@ def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da
     return summary
 
 
-def invoke_bedrock_bda(source_key):
+def invoke_bedrock_bda(source_key, namespace=None):
     log.info(f"******************Start of Function invokeBedrockBDA() of file{__file__}")
     try:
 
@@ -364,7 +364,7 @@ def invoke_bedrock_bda(source_key):
         project_description = Helper.get_property("projectdescription")
         input_bucket_name = Helper.get_property("input_bucket_name")
         output_bucket = Helper.get_property("output_bucket")
-        output_prefix = bda_output_prefix(source_key)
+        output_prefix = bda_output_prefix(source_key, namespace=namespace)
         project_stage = Helper.get_property("ProjectStage")
         if project_stage and project_stage.strip().upper() == "DEVELOPMENT":
             project_stage = "DEVELOPMENT"

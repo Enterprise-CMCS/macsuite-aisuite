@@ -237,11 +237,11 @@ def parsed_image_info(source_data):
     log.info(f"parsed_image_info() Total Images for {source_key} document. totalImagesAnalysed={total_images_analysed}")
     return image_data
 
-def invoke_parsed_images_data(source_key):
+def invoke_parsed_images_data(source_key, namespace=None):
     try:
         log.info(f"invoke_parsed_images_data() Starts Parsed_Images File __main__={__name__}")
         output_bucket = Helper.get_property("output_bucket")
-        output_prefix = doc_output_prefix(source_key)
+        output_prefix = doc_output_prefix(source_key, namespace=namespace)
         foundation_llm_model_id = Helper.get_property("foundation_llm_model_id")
         max_concurrent_image_calls = int(Helper.get_property("concurrent_bedrock_image_calls", default=5))
 
@@ -324,7 +324,7 @@ def invoke_parsed_images_data(source_key):
             i_count = i_count + 1
 
 
-        bda_image_output_filename = per_doc_output_key(source_key, "image")
+        bda_image_output_filename = per_doc_output_key(source_key, "image", namespace=namespace)
         log.debug(f"Output Image File Name={bda_image_output_filename}")
 
         s3_client = boto3.client('s3')

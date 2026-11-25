@@ -249,12 +249,12 @@ def chunk_text_docs(docs):
     return chunked_docs
 
 
-def invoke_parsed_text_data(source_key):
+def invoke_parsed_text_data(source_key, namespace=None):
     log.info(f"***************** invoke_parsed_text_data Starts. __name__={__name__}")
     try:
 
         output_bucket = Helper.get_property("output_bucket")
-        output_prefix = doc_output_prefix(source_key)
+        output_prefix = doc_output_prefix(source_key, namespace=namespace)
         aws_client_s3 = aws_client("s3")
 
         log.info(f"invoke_parsed_text_data() output_bucket={output_bucket} output_prefix={output_prefix}")
@@ -272,7 +272,7 @@ def invoke_parsed_text_data(source_key):
             text_data.extend(parsed_text_info(data))
 
         text_chunks = chunk_text_docs(text_data)
-        bda_text_output_filename = per_doc_output_key(source_key, "text")
+        bda_text_output_filename = per_doc_output_key(source_key, "text", namespace=namespace)
 
         log.debug(
             f"invoke_parsed_text_data() Split {len(text_data)} parsed document(s) into {len(text_chunks)} chunk(s). Name of Output Text File Name={bda_text_output_filename}")

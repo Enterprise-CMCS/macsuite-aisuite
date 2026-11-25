@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from botocore.exceptions import ClientError
 
 from common.utils.helper import Helper
@@ -11,34 +12,46 @@ def doc_name_for_key(key):
 
 
 OUTPUT_FOLDERS = {"text": "BDATextOutput", "table": "BDATableOutput", "image": "BDAImageOutput"}
+RUN_ARTIFACTS_PREFIX = "runs/"
+_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
-def output_root(key):
+def _clean_namespace(namespace):
+    if namespace is None or namespace == "":
+        return None
+    if not isinstance(namespace, str) or not _NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError(f"Invalid artifact namespace '{namespace}'.")
+    return namespace
+
+
+def output_root(key, namespace=None):
+    ns = _clean_namespace(namespace)
     parts = [part for part in os.path.dirname(key).split("/") if part]
-    if not parts:
-        return "_bdaoutput/"
-    return "/".join([f"{parts[0]}_bdaoutput", *parts[1:]]) + "/"
+    root = "_bdaoutput/" if not parts else "/".join([f"{parts[0]}_bdaoutput", *parts[1:]]) + "/"
+    return f"{RUN_ARTIFACTS_PREFIX}{ns}/{root}" if ns else root
 
 
-def bda_output_prefix(key):
-    return f"{output_root(key)}bdaoutput/"
+def bda_output_prefix(key, namespace=None):
+    return f"{output_root(key, namespace=namespace)}bdaoutput/"
 
 
-def doc_output_prefix(key):
-    return f"{bda_output_prefix(key)}{doc_name_for_key(key)}/"
+def doc_output_prefix(key, namespace=None):
+    return f"{bda_output_prefix(key, namespace=namespace)}{doc_name_for_key(key)}/"
 
 
-def per_doc_output_key(key, kind):
-    return f"{output_root(key)}{OUTPUT_FOLDERS[kind]}/{doc_name_for_key(key)}-preprocessed-{kind}.json"
+def per_doc_output_key(key, kind, namespace=None):
+    return f"{output_root(key, namespace=namespace)}{OUTPUT_FOLDERS[kind]}/{doc_name_for_key(key)}-preprocessed-{kind}.json"
 
 
 RAG_OUTPUT_PREFIX = "RAG_Output/"
 
 
-def rag_output_key(key):
+def rag_output_key(key, namespace=None):
     """state_of_TN/Contract/a.pdf -> RAG_Output/state_of_TN/Contract/a.json ; a.pdf -> RAG_Output/a.json"""
+    ns = _clean_namespace(namespace)
     folder = os.path.dirname(key).strip("/")
-    return f"{RAG_OUTPUT_PREFIX}{folder + '/' if folder else ''}{doc_name_for_key(key)}.json"
+    ns_prefix = f"{RUN_ARTIFACTS_PREFIX}{ns}/" if ns else ""
+    return f"{RAG_OUTPUT_PREFIX}{ns_prefix}{folder + '/' if folder else ''}{doc_name_for_key(key)}.json"
 
 class BDAResults:
     def __init__(self):

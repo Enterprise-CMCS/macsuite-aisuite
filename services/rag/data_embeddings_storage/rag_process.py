@@ -44,11 +44,20 @@ def _load_rag_documents(key):
     return documents
 
 
-async def _store_embeddings(documents, table_name, key):
-    status = await EmbeddingProcessor(table_name=table_name).process_data(documents, batch_size=EMBED_BATCH_SIZE)
+async def _generate_embeddings(documents, table_name, key):
+    processor = EmbeddingProcessor(table_name=table_name)
+    records, status = await processor.generate_embeddings(
+        documents,
+        batch_size=EMBED_BATCH_SIZE,
+        fail_fast=True,
+    )
     if status["failed"]:
         raise RuntimeError(f"Embedding failed for {status['failed']} document(s) of {key}: {status['errors'][:5]}")
-    return status
+    return processor, records
+
+
+async def _store_embeddings(connection, processor, records):
+    return await processor.insert_embeddings(connection, records, batch_size=EMBED_BATCH_SIZE)
 
 
 async def delete_source_rows(connection, table_name, rag_output_key):
@@ -64,16 +73,19 @@ async def _replace_source_embeddings(documents, table_name, key):
         {**doc, "metadata": {**(doc.get("metadata") or {}), SOURCE_METADATA_KEY: key}}
         for doc in documents
     ]
+    processor = None
+    records = []
+    if stamped:
+        processor, records = await _generate_embeddings(stamped, table_name, key)
+
     lock_id = f"{table_name}:{key}"
     async with pooled_connection() as connection:
-        await connection.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", lock_id)
-        try:
+        async with connection.transaction():
+            await connection.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lock_id)
             await delete_source_rows(connection, table_name, key)
-            if not stamped:
-                return {"total": 0, "postgres_processed": 0, "failed": 0, "errors": []}
-            return await _store_embeddings(stamped, table_name, key)
-        finally:
-            await connection.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock_id)
+            inserted = await _store_embeddings(connection, processor, records) if records else 0
+
+    return {"total": len(stamped), "postgres_processed": inserted, "failed": 0, "errors": []}
 
 
 def _validate_manifest_table(table_name):
