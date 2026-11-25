@@ -127,6 +127,7 @@ def parse_table_elements_simple(source_data):
             "text": text.strip(),
             "metadata": {
                 "doc_id": doc_name,
+                "source_key": source_key,
                 "element_type": "TABLE",
                 "page": page_index,
                 "printed_page": printed_pages.get(page_index, ""),

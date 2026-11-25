@@ -61,6 +61,7 @@ class EvidenceRecord(BaseModel):
     chunk_text: str = "" 
     chunk_id: Optional[int] = None
     doc_id: str = ""
+    source_key: str = ""
     page: Optional[int] = None
     # Optional because reviews recorded before this field settled on "" wrote it as
     # null, and a sidecar line that will not load is a review quietly done twice.
@@ -132,13 +133,18 @@ class RequirementReview(BaseModel):
             cleaned)
 
     def where_found(self):
-        documents = {simplify_doc_id(record.doc_id) for record in self.evidence if record.doc_id}
+        documents = {
+            record.source_key or simplify_doc_id(record.doc_id)
+            for record in self.evidence
+            if record.source_key or record.doc_id
+        }
         seen = []
         for record in self.evidence:
             pointer = page_label(record.page, record.printed_page)
-            if len(documents) > 1 and record.doc_id:
-                pointer = f"{pointer} - {record.doc_id}" if pointer else record.doc_id
-            pointer = pointer or record.doc_id
+            doc_label = record.source_key or record.doc_id
+            if len(documents) > 1 and doc_label:
+                pointer = f"{pointer} - {doc_label}" if pointer else doc_label
+            pointer = pointer or doc_label
             if pointer and pointer not in seen:
                 seen.append(pointer)
         return " | ".join(seen)

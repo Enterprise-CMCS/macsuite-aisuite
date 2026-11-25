@@ -15,7 +15,7 @@ RESULTS_PREFIX = "manifest-results/"
 
 
 REQUEST_KEY_PATTERN = r"^[A-Za-z0-9_-]{1,80}$"
-# Keeps Postgres index names (e.g. idx_<table>_search_text_trgm, +21 chars) within the 63-byte limit.
+
 MAX_TABLE_NAME_LEN = 41
 
 MAX_DOCUMENTS = 500
@@ -54,13 +54,11 @@ def manifest_embeddings_table_name(request_key: str, state: str) -> str:
         raise ValueError(f"Invalid state '{state}': expected a two-letter code.")
 
     slug = re.sub(r"[^a-z0-9]+", "_", request_key.lower()).strip("_") or "req"
-    name = f"embeddings_{slug}_{code}"
-    if len(name) > MAX_TABLE_NAME_LEN:
-        digest = hashlib.sha256(f"{request_key}:{code}".encode("utf-8")).hexdigest()[:8]
-        suffix = f"_{digest}_{code}"
-        max_slug = MAX_TABLE_NAME_LEN - len("embeddings_") - len(suffix)
-        short_slug = slug[:max_slug].rstrip("_")
-        name = f"embeddings_{short_slug}{suffix}" if short_slug else f"embeddings_{digest}_{code}"
+    digest = hashlib.sha256(f"{request_key}:{code}".encode("utf-8")).hexdigest()[:8]
+    suffix = f"_{digest}_{code}"
+    max_slug = MAX_TABLE_NAME_LEN - len("embeddings_") - len(suffix)
+    short_slug = slug[:max_slug].rstrip("_")
+    name = f"embeddings_{short_slug}{suffix}" if short_slug else f"embeddings_{digest}_{code}"
     return validate_embeddings_table_name(name)
 
 

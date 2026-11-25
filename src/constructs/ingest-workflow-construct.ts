@@ -1,8 +1,10 @@
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecs from "aws-cdk-lib/aws-ecs";
+import * as events from "aws-cdk-lib/aws-events";
+import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as kms from "aws-cdk-lib/aws-kms";
-import type * as lambda from "aws-cdk-lib/aws-lambda";
+import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as sfn from "aws-cdk-lib/aws-stepfunctions";
@@ -14,6 +16,74 @@ import { INGEST_MAX_CONCURRENCY } from "./pre-processing-lambda-construct";
 
 
 export const MANIFEST_RUN_PREFIXES = ["manifests/", "manifest-results/"] as const;
+export const TERMINAL_EXECUTION_STATUSES = ["TIMED_OUT", "ABORTED"] as const;
+
+export const TERMINAL_NOTIFICATION_HANDLER = `const { DescribeExecutionCommand, SFNClient } = require("@aws-sdk/client-sfn");
+const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
+
+const DEFAULT_ERRORS = {
+  ABORTED: "ExecutionAborted",
+  TIMED_OUT: "States.Timeout",
+};
+
+const sfn = new SFNClient({});
+const sqs = new SQSClient({});
+
+exports.handler = async (event) => {
+  const detail = event?.detail ?? {};
+  let rawInput = detail.input;
+  let status = detail.status;
+  let error = detail.error;
+
+  if ((!rawInput || detail.inputDetails?.included === false) && detail.executionArn) {
+    const described = await sfn.send(
+      new DescribeExecutionCommand({ executionArn: detail.executionArn }),
+    );
+    rawInput = rawInput || described.input;
+    status = status || described.status;
+    error = error || described.error;
+  }
+
+  if (status !== "TIMED_OUT" && status !== "ABORTED") {
+    return { skipped: true, status };
+  }
+
+  let input = {};
+  if (typeof rawInput === "string" && rawInput.length > 0) {
+    try {
+      input = JSON.parse(rawInput);
+    } catch {
+      input = {};
+    }
+  }
+
+  const requestKey =
+    input.requestKey ||
+    detail.name ||
+    (typeof detail.executionArn === "string" ? detail.executionArn.split(":")?.pop() : undefined);
+  if (!requestKey) {
+    throw new Error("Cannot determine requestKey for execution " + (detail.executionArn ?? "unknown"));
+  }
+
+  const body = {
+    requestKey,
+    ...(input.state !== undefined ? { state: input.state } : {}),
+    ...(input.reviewType !== undefined ? { reviewType: input.reviewType } : {}),
+    status: "FAILED",
+    error: error || DEFAULT_ERRORS[status],
+    statusPath: "/manifest/" + requestKey,
+  };
+
+  await sqs.send(
+    new SendMessageCommand({
+      MessageBody: JSON.stringify(body),
+      QueueUrl: process.env.NOTIFICATION_QUEUE_URL,
+    }),
+  );
+
+  return body;
+};
+`;
 
 
 const WORKFLOW_TIMEOUT = cdk.Duration.hours(24);
@@ -46,6 +116,8 @@ export class IngestWorkflowConstruct extends Construct {
   public readonly notificationDeadLetterQueue: sqs.IQueue;
   public readonly notificationQueue: sqs.IQueue;
   public readonly stateMachine: sfn.StateMachine;
+  public readonly terminalExecutionRule: events.Rule;
+  public readonly terminalNotificationFunction: lambda.Function;
 
   public constructor(
     scope: Construct,
@@ -321,13 +393,74 @@ export class IngestWorkflowConstruct extends Construct {
       tracingEnabled: true,
     });
 
+    const terminalNotifierName = `${prefix}-manifest-terminal-notify`;
+    const terminalNotifierLogGroup = new logs.LogGroup(
+      this,
+      "TerminalNotificationLogGroup",
+      {
+        logGroupName: `/aws/lambda/${terminalNotifierName}`,
+        removalPolicy,
+        retention: logs.RetentionDays.ONE_MONTH,
+      },
+    );
+
+    this.terminalNotificationFunction = new lambda.Function(
+      this,
+      "TerminalNotificationFunction",
+      {
+        architecture: lambda.Architecture.ARM_64,
+        code: lambda.Code.fromInline(TERMINAL_NOTIFICATION_HANDLER),
+        description:
+          "Sends a FAILED MuleSoft SQS notification when a manifest workflow execution ends in TIMED_OUT or ABORTED.",
+        environment: {
+          NOTIFICATION_QUEUE_URL: this.notificationQueue.queueUrl,
+        },
+        functionName: terminalNotifierName,
+        handler: "index.handler",
+        logGroup: terminalNotifierLogGroup,
+        runtime: lambda.Runtime.NODEJS_22_X,
+        timeout: cdk.Duration.seconds(30),
+      },
+    );
+    this.notificationQueue.grantSendMessages(this.terminalNotificationFunction);
+    this.stateMachine.grantRead(this.terminalNotificationFunction);
+
     if (externalNotificationKey) {
-      externalNotificationKey.grant(
+      for (const grantee of [
         this.stateMachine,
-        "kms:Decrypt",
-        "kms:GenerateDataKey*",
-      );
+        this.terminalNotificationFunction,
+      ]) {
+        externalNotificationKey.grant(
+          grantee,
+          "kms:Decrypt",
+          "kms:GenerateDataKey*",
+        );
+      }
     }
+
+    this.terminalExecutionRule = new events.Rule(
+      this,
+      "TerminalExecutionRule",
+      {
+        description:
+          "Routes TIMED_OUT and ABORTED manifest workflow executions to the MuleSoft failure notifier.",
+        eventPattern: {
+          detail: {
+            stateMachineArn: [this.stateMachine.stateMachineArn],
+            status: [...TERMINAL_EXECUTION_STATUSES],
+          },
+          detailType: ["Step Functions Execution Status Change"],
+          source: ["aws.states"],
+        },
+        ruleName: `${prefix}-manifest-terminal-status`,
+        targets: [
+          new targets.LambdaFunction(this.terminalNotificationFunction, {
+            maxEventAge: cdk.Duration.hours(24),
+            retryAttempts: 3,
+          }),
+        ],
+      },
+    );
   }
 
   private invokeLambda(

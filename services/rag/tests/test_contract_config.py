@@ -136,7 +136,7 @@ class ActiveContractResolutionTests(unittest.TestCase):
         self.assertEqual(common_embeddings_table_name(config), "embeddings_cms_regs")
         self.assertEqual(
             list_embeddings_table_names_from_config(config),
-            ["embeddings_cms_regs"],
+            ["embeddings"],
         )
         self.assertIsNone(resolve_active_contract_section(config))
 

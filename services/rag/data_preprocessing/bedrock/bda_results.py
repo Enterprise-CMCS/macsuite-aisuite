@@ -14,7 +14,9 @@ OUTPUT_FOLDERS = {"text": "BDATextOutput", "table": "BDATableOutput", "image": "
 
 
 def output_root(key):
-    parts = [part for part in os.path.dirname(key).split("/") if part] or ["root"]
+    parts = [part for part in os.path.dirname(key).split("/") if part]
+    if not parts:
+        return "_bdaoutput/"
     return "/".join([f"{parts[0]}_bdaoutput", *parts[1:]]) + "/"
 
 

@@ -14,7 +14,7 @@ class EmbeddingProcessor:
         self.max_concurrent_requests = max_concurrent_requests
         self.table_name = table_name or Helper.get_embeddings_table_name()
     
-    async def process_data(self, data, batch_size=1):
+    async def process_data(self, data, batch_size=20):
 
         status = {"total": len(data), "postgres_processed": 0, "failed": 0, "errors": []}
 
@@ -64,7 +64,6 @@ class EmbeddingProcessor:
 
         finally:
             await release_connection(db_connection)
-            await close_db()
 
             
         print(f"\n{'='*20} Processing info {'='*20}")

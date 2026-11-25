@@ -227,6 +227,7 @@ def parsed_text_info(source_data):
             "text": elem['text'],
             "metadata": {
                 "doc_id": doc_id,
+                "source_key": source_key,
                 "page": elem['page'],
                 "printed_page": elem['printed_page'],
                 "element_type": "TEXT",

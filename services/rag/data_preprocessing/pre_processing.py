@@ -49,7 +49,11 @@ def merge_outputs_to_rag_output(source_key):
     all_docs = []
     for output_key in output_keys:
         all_docs.extend(Helper.get_json_from_s3(bucket, output_key))
-    documents = [doc for doc in all_docs if doc and doc.get("text")]
+    documents = [
+        {**doc, "metadata": {**(doc.get("metadata") or {}), "source_key": source_key}}
+        for doc in all_docs
+        if doc and doc.get("text")
+    ]
 
     rag_key = rag_output_key(source_key)
     Helper.create_file(bucket, rag_key, documents)
@@ -69,14 +73,3 @@ def handler(event, context=None):
         print(f"No PDF or DOCX objects in event. Skipping. Event={event}")
         return {"status": "skipped"}
     return {"status": "completed", "rag_output": rag_outputs}
-
-
-# def main():
-#     if len(sys.argv) < 2:
-#         raise SystemExit("usage: python -m data_preprocessing.pre_processing <s3-key-in-input-bucket>")
-#     process(sys.argv[1])
-#     merge_outputs_to_rag_output(sys.argv[1])
-
-
-# if __name__ == "__main__":
-#     main()

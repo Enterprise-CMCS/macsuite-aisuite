@@ -157,13 +157,18 @@ async def process_agent_query(query: str, contract: Optional[str] = None) -> Age
             deps = build_deps(table_name=table_name)
             _deps_by_table[table_name] = deps
 
-        answer = await answer_question_formatted(query, deps=deps)
+        answer, error = await answer_question_formatted(query, deps=deps)
         elapsed = time.perf_counter() - start
+        succeeded = not bool(error)
 
-        logger.info("agent_success", query=query[:100], contract=table_name,
-                    length=len(answer), processing_time=elapsed)
+        if succeeded:
+            logger.info("agent_success", query=query[:100], contract=table_name,
+                        length=len(answer), processing_time=elapsed)
+        else:
+            logger.error("agent_review_error", error=error, query=query[:100],
+                         contract=table_name, processing_time=elapsed)
         return AgentResponse(query=query, response=answer, contract=table_name,
-                              processing_time=elapsed, success=True)
+                              processing_time=elapsed, success=succeeded)
 
     except HTTPException:
         raise

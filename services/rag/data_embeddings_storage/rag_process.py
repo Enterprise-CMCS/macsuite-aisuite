@@ -1,7 +1,5 @@
 import asyncio
-import hashlib
 import json
-import re
 
 from common.utils.aws_files_access import object_keys
 from common.utils.contract_config import validate_embeddings_table_name
@@ -35,21 +33,6 @@ def is_common_rag_output_key(key, common_prefix=None):
     return key.startswith(f"{RAG_OUTPUT_PREFIX}{normalized}/")
 
 
-def embeddings_table_for_key(key):
-    if is_common_rag_output_key(key):
-        common_table = Helper.get_common_embeddings_table_name()
-        if common_table:
-            return common_table
-
-    base = key.rsplit("/", 1)[-1].removesuffix(".json")
-    slug = re.sub(r"[^a-z0-9]+", "_", base.lower()).strip("_") or "doc"
-    name = f"emb_{slug}"
-    if len(name) > MAX_TABLE_NAME_LEN:
-        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
-        name = f"{name[: MAX_TABLE_NAME_LEN - 9].rstrip('_')}_{digest}"
-    return name
-
-
 def _load_rag_documents(key):
     bucket = Helper.get_property("output_bucket")
     log.info(f"Loading s3://{bucket}/{key}")
@@ -76,6 +59,23 @@ async def delete_source_rows(connection, table_name, rag_output_key):
     )
 
 
+async def _replace_source_embeddings(documents, table_name, key):
+    stamped = [
+        {**doc, "metadata": {**(doc.get("metadata") or {}), SOURCE_METADATA_KEY: key}}
+        for doc in documents
+    ]
+    lock_id = f"{table_name}:{key}"
+    async with pooled_connection() as connection:
+        await connection.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", lock_id)
+        try:
+            await delete_source_rows(connection, table_name, key)
+            if not stamped:
+                return {"total": 0, "postgres_processed": 0, "failed": 0, "errors": []}
+            return await _store_embeddings(stamped, table_name, key)
+        finally:
+            await connection.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock_id)
+
+
 def _validate_manifest_table(table_name):
     if not isinstance(table_name, str) or not table_name.startswith("embeddings_"):
         raise ValueError(f"Invalid manifest embeddings table '{table_name}'.")
@@ -85,32 +85,19 @@ def _validate_manifest_table(table_name):
 
 
 async def invoke_rag_process(key):
+    if not is_common_rag_output_key(key):
+        raise ValueError(f"S3 notification embedding is only supported for common reference keys, got '{key}'.")
+    table_name = Helper.get_common_embeddings_table_name()
+    if not table_name:
+        raise ValueError("common_embeddings_table_name is not configured.")
+
     documents = _load_rag_documents(key)
-    is_common = is_common_rag_output_key(key)
-    table_name = embeddings_table_for_key(key)
-
-    if is_common:
-        documents = [
-            {**doc, "metadata": {**(doc.get("metadata") or {}), SOURCE_METADATA_KEY: key}}
-            for doc in documents
-        ]
-        log.info(f"invoke_rag_process() Using common embeddings table {table_name} for {key}")
-        await create_embedding_table(table_name)
-        try:
-            async with pooled_connection() as connection:
-                await delete_source_rows(connection, table_name, key)
-        finally:
-            await close_db()
-        if not documents:
-            return {"total": 0, "postgres_processed": 0, "failed": 0, "errors": []}
-        return await _store_embeddings(documents, table_name, key)
-
-    if not documents:
-        return {"total": 0, "postgres_processed": 0, "failed": 0, "errors": []}
-
-    log.info(f"invoke_rag_process() Using embeddings table {table_name}")
+    log.info(f"invoke_rag_process() Using common embeddings table {table_name} for {key}")
     await create_embedding_table(table_name)
-    return await _store_embeddings(documents, table_name, key)
+    try:
+        return await _replace_source_embeddings(documents, table_name, key)
+    finally:
+        await close_db()
 
 
 def _required(event, field):
@@ -135,16 +122,7 @@ async def _embed(event):
     if not is_rag_output_key(key):
         raise ValueError(f"'{key}' is not a {RAG_OUTPUT_PREFIX} JSON object.")
 
-    documents = [
-        {**doc, "metadata": {**(doc.get("metadata") or {}), SOURCE_METADATA_KEY: key}}
-        for doc in _load_rag_documents(key)
-    ]
-    async with pooled_connection() as connection:
-        await delete_source_rows(connection, table_name, key)
-    if not documents:
-        return {"key": key, "tableName": table_name, "embedded": 0}
-
-    status = await _store_embeddings(documents, table_name, key)
+    status = await _replace_source_embeddings(_load_rag_documents(key), table_name, key)
     return {"key": key, "tableName": table_name, "embedded": status["postgres_processed"]}
 
 
@@ -165,19 +143,8 @@ def handler(event, context=None):
     if isinstance(event, dict) and event.get("action"):
         return asyncio.run(_run_action(event))
 
-    keys = [key for key in object_keys(event) if is_rag_output_key(key)]
+    keys = [key for key in object_keys(event) if is_common_rag_output_key(key)]
     if not keys:
-        log.info(f"No RAG_Output JSON objects in event. Skipping. Event={event}")
+        log.info(f"No common RAG_Output JSON objects in event. Skipping. Event={event}")
         return {"status": "skipped"}
     return {"status": "completed", "results": {key: asyncio.run(invoke_rag_process(key)) for key in keys}}
-
-
-# def main():
-#     if len(sys.argv) < 2:
-#         raise SystemExit("usage: python -m data_embeddings_storage.rag_process RAG_Output/<folders>/<file name>.json")
-#     print(asyncio.run(invoke_rag_process(sys.argv[1])))
-
-
-# if __name__ == "__main__":
-#     main()
-

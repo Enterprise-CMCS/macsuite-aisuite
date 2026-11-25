@@ -29,7 +29,13 @@ with patch.dict(sys.modules, _IMPORT_STUBS):
     from common.utils.aws_files_access import object_keys
     from data_embeddings_storage import rag_process
     from data_preprocessing import pre_processing
-    from data_preprocessing.bedrock.bda_results import rag_output_key
+    from data_preprocessing.bedrock.bda_results import (
+        bda_output_prefix,
+        doc_output_prefix,
+        output_root,
+        per_doc_output_key,
+        rag_output_key,
+    )
 
 
 def _s3_event(*keys):
@@ -50,6 +56,14 @@ class RagOutputKeyTests(unittest.TestCase):
 
     def test_root_level_file(self):
         self.assertEqual(rag_output_key("My File.docx"), "RAG_Output/My_File.json")
+
+    def test_root_level_bda_outputs_do_not_collide_with_root_folder(self):
+        self.assertEqual(output_root("a.pdf"), "_bdaoutput/")
+        self.assertEqual(output_root("root/a.pdf"), "root_bdaoutput/")
+        self.assertNotEqual(bda_output_prefix("a.pdf"), bda_output_prefix("root/a.pdf"))
+        self.assertNotEqual(doc_output_prefix("a.pdf"), doc_output_prefix("root/a.pdf"))
+        for kind in ("text", "table", "image"):
+            self.assertNotEqual(per_doc_output_key("a.pdf", kind), per_doc_output_key("root/a.pdf", kind))
 
 
 class ObjectKeysTests(unittest.TestCase):
@@ -138,7 +152,10 @@ class MergeOutputsToRagOutputTests(unittest.TestCase):
         bucket, rag_key, documents = create_file.call_args.args
         self.assertEqual((bucket, rag_key), ("post-bucket", "RAG_Output/NE/sub/a.json"))
         self.assertEqual([doc["text"] for doc in documents], ["chunk one", "| a | b |", "chart summary"])
-        self.assertEqual(documents[0]["metadata"], {"element_type": "TEXT", "page": 1})
+        self.assertEqual(
+            documents[0]["metadata"],
+            {"element_type": "TEXT", "page": 1, "source_key": "NE/sub/a.pdf"},
+        )
 
 
 class PreProcessingHandlerTests(unittest.TestCase):
@@ -167,63 +184,66 @@ class RagProcessHandlerTests(unittest.TestCase):
         self.assertFalse(rag_process.is_rag_output_key("NE_bdaoutput/BDATextOutput/a-preprocessed-text.json"))
         self.assertFalse(rag_process.is_rag_output_key("RAG_Output/NE/a.txt"))
 
-    def test_embeddings_table_per_source_file(self):
-        self.assertEqual(rag_process.embeddings_table_for_key("RAG_Output/NE/My_File-v2.json"), "emb_my_file_v2")
+    def test_identifies_common_rag_output_keys(self):
+        with patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"):
+            self.assertTrue(rag_process.is_common_rag_output_key("RAG_Output/common/42_cfr_438.json"))
+            self.assertFalse(rag_process.is_common_rag_output_key("RAG_Output/NE/My_File-v2.json"))
+
+    def test_handler_embeds_only_common_rag_output_files(self):
+        with patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"), \
+                patch.object(rag_process, "invoke_rag_process", new=AsyncMock(return_value={"failed": 0})) as invoke:
+            result = rag_process.handler(
+                _s3_event("RAG_Output/common/cfr_438.json", "RAG_Output/NE/a.json", "NE_bdaoutput/x.json")
+            )
+
+        invoke.assert_awaited_once_with("RAG_Output/common/cfr_438.json")
         self.assertEqual(
-            rag_process.embeddings_table_for_key("RAG_Output/common/42_cfr_438.json"),
-            "embeddings_cms_regs",
+            result,
+            {"status": "completed", "results": {"RAG_Output/common/cfr_438.json": {"failed": 0}}},
         )
 
-        long_name = rag_process.embeddings_table_for_key("RAG_Output/" + "a" * 80 + ".json")
-        self.assertEqual(len(long_name), rag_process.MAX_TABLE_NAME_LEN)
-        self.assertTrue(long_name.startswith("emb_a"))
-
-    def test_handler_embeds_each_rag_output_file(self):
-        with patch.object(rag_process, "invoke_rag_process", new=AsyncMock(return_value={"failed": 0})) as invoke:
+    def test_handler_skips_non_common_keys(self):
+        with patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"), \
+                patch.object(rag_process, "invoke_rag_process", new=AsyncMock()) as invoke:
             result = rag_process.handler(_s3_event("RAG_Output/NE/a.json", "NE_bdaoutput/x.json"))
-
-        invoke.assert_awaited_once_with("RAG_Output/NE/a.json")
-        self.assertEqual(result, {"status": "completed", "results": {"RAG_Output/NE/a.json": {"failed": 0}}})
-
-    def test_handler_skips_other_keys(self):
-        with patch.object(rag_process, "invoke_rag_process", new=AsyncMock()) as invoke:
-            result = rag_process.handler(_s3_event("NE_bdaoutput/x.json"))
 
         self.assertEqual(result, {"status": "skipped"})
         invoke.assert_not_called()
 
 
 class InvokeRagProcessTests(unittest.IsolatedAsyncioTestCase):
-    async def _invoke(self, status):
-        processor = MagicMock()
-        processor.process_data = AsyncMock(return_value=status)
-        documents = [{"text": "chunk", "metadata": {}}, {"text": ""}, "junk"]
-        with patch.object(rag_process.Helper, "get_property", return_value="post-bucket"), \
-                patch.object(rag_process.Helper, "get_json_from_s3", return_value=documents) as get_json, \
-                patch.object(rag_process, "create_embedding_table", new=AsyncMock()) as create_table, \
-                patch.object(rag_process, "EmbeddingProcessor", return_value=processor) as processor_cls:
-            try:
-                return await rag_process.invoke_rag_process("RAG_Output/NE/a.json")
-            finally:
-                get_json.assert_called_once_with("post-bucket", "RAG_Output/NE/a.json")
-                create_table.assert_awaited_once_with("emb_a")
-                processor_cls.assert_called_once_with(table_name="emb_a")
-                processor.process_data.assert_awaited_once_with([{"text": "chunk", "metadata": {}}], batch_size=30)
-
-    async def test_embeds_combined_documents_into_per_file_table(self):
-        status = {"total": 1, "postgres_processed": 1, "failed": 0, "errors": []}
-
-        self.assertEqual(await self._invoke(status), status)
+    async def test_rejects_non_common_keys(self):
+        with patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"):
+            with self.assertRaises(ValueError):
+                await rag_process.invoke_rag_process("RAG_Output/NE/a.json")
 
     async def test_embeds_common_prefix_into_fixed_table(self):
         status = {"total": 1, "postgres_processed": 1, "failed": 0, "errors": []}
         processor = MagicMock()
-        processor.process_data = AsyncMock(return_value=status)
+        events = []
+
+        async def fake_process_data(docs, **kwargs):
+            events.append(("store",))
+            return status
+
+        processor.process_data = AsyncMock(side_effect=fake_process_data)
         connection = MagicMock()
+
+        async def fake_execute(sql, *args):
+            if "pg_advisory_lock" in sql:
+                events.append(("lock", args[0]))
+            elif "pg_advisory_unlock" in sql:
+                events.append(("unlock", args[0]))
+
+        connection.execute = AsyncMock(side_effect=fake_execute)
         pooled_ctx = MagicMock()
         pooled_ctx.__aenter__ = AsyncMock(return_value=connection)
         pooled_ctx.__aexit__ = AsyncMock(return_value=False)
         documents = [{"text": "reg chunk", "metadata": {"page": 2}}]
+
+        async def fake_delete(conn, tbl, key):
+            events.append(("delete", conn is connection, tbl, key))
+
         with patch.object(rag_process.Helper, "get_property", return_value="post-bucket"), \
                 patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"), \
                 patch.object(rag_process.Helper, "get_common_embeddings_table_name", return_value="embeddings_cms_regs"), \
@@ -231,13 +251,13 @@ class InvokeRagProcessTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(rag_process, "create_embedding_table", new=AsyncMock()) as create_table, \
                 patch.object(rag_process, "pooled_connection", return_value=pooled_ctx), \
                 patch.object(rag_process, "close_db", new=AsyncMock()) as close_db, \
-                patch.object(rag_process, "delete_source_rows", new=AsyncMock()) as delete_rows, \
+                patch.object(rag_process, "delete_source_rows", side_effect=fake_delete) as delete_rows, \
                 patch.object(rag_process, "EmbeddingProcessor", return_value=processor) as processor_cls:
             result = await rag_process.invoke_rag_process("RAG_Output/common/cfr_438.json")
 
         self.assertEqual(result, status)
         create_table.assert_awaited_once_with("embeddings_cms_regs")
-        delete_rows.assert_awaited_once_with(
+        delete_rows.assert_called_once_with(
             connection,
             "embeddings_cms_regs",
             "RAG_Output/common/cfr_438.json",
@@ -248,10 +268,40 @@ class InvokeRagProcessTests(unittest.IsolatedAsyncioTestCase):
             [{"text": "reg chunk", "metadata": {"page": 2, "rag_output_key": "RAG_Output/common/cfr_438.json"}}],
             batch_size=30,
         )
+        lock_id = "embeddings_cms_regs:RAG_Output/common/cfr_438.json"
+        self.assertEqual(
+            events,
+            [
+                ("lock", lock_id),
+                ("delete", True, "embeddings_cms_regs", "RAG_Output/common/cfr_438.json"),
+                ("store",),
+                ("unlock", lock_id),
+            ],
+        )
 
     async def test_raises_when_any_embedding_fails(self):
-        with self.assertRaises(RuntimeError):
-            await self._invoke({"total": 1, "postgres_processed": 0, "failed": 1, "errors": ["boom"]})
+        processor = MagicMock()
+        processor.process_data = AsyncMock(
+            return_value={"total": 1, "postgres_processed": 0, "failed": 1, "errors": ["boom"]}
+        )
+        connection = MagicMock()
+        connection.execute = AsyncMock()
+        pooled_ctx = MagicMock()
+        pooled_ctx.__aenter__ = AsyncMock(return_value=connection)
+        pooled_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(rag_process.Helper, "get_property", return_value="post-bucket"), \
+                patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"), \
+                patch.object(rag_process.Helper, "get_common_embeddings_table_name", return_value="embeddings_cms_regs"), \
+                patch.object(rag_process.Helper, "get_json_from_s3", return_value=[{"text": "reg chunk", "metadata": {}}]), \
+                patch.object(rag_process, "create_embedding_table", new=AsyncMock()), \
+                patch.object(rag_process, "pooled_connection", return_value=pooled_ctx), \
+                patch.object(rag_process, "close_db", new=AsyncMock()) as close_db, \
+                patch.object(rag_process, "delete_source_rows", new=AsyncMock()), \
+                patch.object(rag_process, "EmbeddingProcessor", return_value=processor):
+            with self.assertRaises(RuntimeError):
+                await rag_process.invoke_rag_process("RAG_Output/common/cfr_438.json")
+        close_db.assert_awaited_once()
 
 
 if __name__ == "__main__":

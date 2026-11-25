@@ -500,6 +500,7 @@ def chunk_provenance(chunk):
     metadata = get_metadata(chunk)
     return {
         "doc_id": metadata.get("doc_id"),
+        "source_key": metadata.get("source_key") or metadata.get("rag_output_key") or "",
         "page": metadata.get("page"),
         "printed_page": (metadata.get("printed_page") or "").strip(),}
  
@@ -513,7 +514,7 @@ def format_retrieved_chunks(chunks):
             raise ValueError(
                 f"Retrieved chunk (id={chunk_id}) has no text")
 
-        doc_id = metadata.get("doc_id", "")
+        doc_id = metadata.get("source_key") or metadata.get("doc_id", "")
         page = page_number(metadata.get("page"),metadata.get("printed_page", ""),)
  
         blocks.append(
@@ -657,6 +658,8 @@ def format_review_display(review, deps):
         format_stage1_reasoning(review),]
     if review.decision_response:
         lines += ["", "Decision rationale:", review.decision_response]
+    if review.error:
+        lines += ["", f"Error: {review.error}"]
     return "\n".join(lines).rstrip()
 
 # SEARCH TOOL
@@ -761,6 +764,7 @@ def build_verified_evidence(evidence_items,deps,):
         verified = quote_matches(quote, text)
  
         records.append(EvidenceRecord(quote=quote, chunk_text=text, chunk_id=chunk_id, doc_id=metadata.get("doc_id","",),
+                source_key=metadata.get("source_key") or metadata.get("rag_output_key") or "",
                 page=metadata.get("page"),
                 printed_page=metadata.get("printed_page","",),
                 retrieval_confidence=chunk.get("retrieval_confidence"),
@@ -780,7 +784,7 @@ def build_decision_input(requirement, reasoning, missing_information, evidence, 
         verified_evidence.append(
             {
                 "contract_text": record.chunk_text,
-                "document": record.doc_id,
+                "document": record.source_key or record.doc_id,
                 "page": page,
                 "retrieval_confidence": record.retrieval_confidence,
             })
@@ -1017,4 +1021,4 @@ async def answer_question_formatted(
     return format_review_display(
         review,
         deps,
-    )
+    ), review.error

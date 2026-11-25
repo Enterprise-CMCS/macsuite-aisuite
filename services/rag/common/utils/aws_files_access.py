@@ -15,19 +15,19 @@ def object_keys(event):
         if isinstance(doc, dict) and isinstance(doc.get("s3"), dict):
             path = doc["s3"].get("path") or doc["s3"].get("key")
             if path:
-                keys.append(unquote_plus(path))
+                keys.append(path)
 
     if isinstance(event.get("s3"), dict):
         path = event["s3"].get("path") or event["s3"].get("key")
         if path:
-            keys.append(unquote_plus(path))
+            keys.append(path)
 
     for rag_key in event.get("rag_output", []):
         if isinstance(rag_key, str) and rag_key:
             keys.append(rag_key)
 
     if isinstance(event.get("key"), str) and event["key"]:
-        keys.append(unquote_plus(event["key"]))
+        keys.append(event["key"])
 
     return keys
 
@@ -61,8 +61,9 @@ def stream_s3_object(s3, bucket, key):
         return None
 
 
-def write_s3_json(s3, bucket, key, body):
-    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
+def write_s3_json(s3, bucket, key, body, *, if_none_match=False):
+    extra = {"IfNoneMatch": "*"} if if_none_match else {}
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json", **extra)
                
 
 

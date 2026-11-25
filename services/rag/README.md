@@ -37,9 +37,7 @@ flowchart LR
   sfn --> sqs[SQS_notification]
   sqs --> mule
   resultsS3 -->|GET results| api
-  pgvector --> crt[CRT_workbook_review]
   review --> llm[Bedrock_LLM]
-  crt --> llm
 ```
 
 1. **Manifest API**: MuleSoft uploads the documents, then posts `manifest.json`
@@ -49,17 +47,14 @@ flowchart LR
    Data Automation, parses the text/table/image outputs, splits text into
    chunks, and writes one combined JSON per file to `RAG_Output/` in the
    post-processing bucket. Embedding starts only after every document succeeds.
-3. **RAG process** creates a new `embeddings_<requestKey>_<state>` table for the
-   run and embeds every `RAG_Output/` JSON into it.
+3. **RAG process** creates a new `embeddings_<requestKey>_<hash>_<state>` table
+   for the run and embeds every `RAG_Output/` JSON into it.
 4. **Requirement review** (Fargate) reviews every `legalRequirements` item
    against that table and writes the results to S3.
 5. **Notification**: an SQS message tells MuleSoft the run finished, and
    MuleSoft fetches the results from `GET /manifest/{requestKey}/results`.
 6. **API** answers natural-language questions via search and a Bedrock
    foundation model.
-7. **Contract review** runs the requirements in a CMS Contract Review Tool
-   workbook through the same retrieval and writes the findings back into the
-   workbook.
 
 ### Retrieval
 
@@ -212,20 +207,10 @@ VPN/bastion).
 | Mode | Local command | Cloud |
 |------|---------------|--------|
 | Query API | `python -m search.routes.endpoint` (or Docker image `CMD` → uvicorn) | Always-on ECS Fargate service on port `8001` |
-| Pre-process (one file) | `python -m data_preprocessing.pre_processing <source-key>` | Lambda, invoked by the manifest workflow once per document |
-| Embeddings (one file) | `python -m data_embeddings_storage.rag_process RAG_Output/<folders>/<file>.json` | Lambda, invoked by the manifest workflow (`create_table`, `embed`) |
-| Requirement review | `REQUEST_KEY=<key> EMBEDDINGS_TABLE_NAME=embeddings_req_123_md python -m search.manifest_review` | Fargate task run by the manifest workflow |
-| Contract review | `python search/excel_process/process_excel_with_rag.py` | not deployed yet; run it on demand |
+| Pre-process | `data_preprocessing.pre_processing.handler` | Lambda, invoked by the manifest workflow (and `common/` S3 uploads) |
+| Embeddings | `data_embeddings_storage.rag_process.handler` | Lambda, invoked by the manifest workflow (`create_table`, `embed`) and `RAG_Output/common/` S3 notifications |
+| Requirement review | `REQUEST_KEY=<key> EMBEDDINGS_TABLE_NAME=embeddings_req_123_5fde4fd5_md python -m search.manifest_review` | Fargate task run by the manifest workflow |
 | DB bootstrap | usually not local (needs master secret) | One-shot Fargate task: `python -m data_embeddings_storage.database.bootstrap` |
-
-Typical ingest order for one document outside the workflow (writes that file's
-own `emb_<file>` table; the deployed path is the
-[manifest workflow](#ingest-manifest-workflow)):
-
-```sh
-python -m data_preprocessing.pre_processing NE/contract.pdf
-python -m data_embeddings_storage.rag_process RAG_Output/NE/contract.json
-```
 
 ### Query API (local)
 
@@ -254,79 +239,6 @@ curl -s -X POST "http://127.0.0.1:8001/agent" \
   -H "Content-Type: application/json" \
   -d '{"query":"What is coverage for NEMT?"}'
 ```
-
-### Contract review run job
-
-Drop the CMS Contract Review Tool workbook (`.xlsm` or `.xlsx`) into
-`output_excel/` at the repository root and run:
-
-```sh
-python search/excel_process/process_excel_with_rag.py
-```
-
-Every requirement row goes through retrieval and three agents — an analyst that
-commits to a status, a challenger that argues the opposing case over the same
-evidence, and an adjudicator that settles it. Findings are written back into the
-columns a reviewer already works from (Status, Where Found, Follow-up Required,
-General Comments), and everything that does not fit a form field — both
-confidence scores, the verified quotes with the page number each came from — goes
-onto an added **RAG Analysis** sheet keyed by sheet and row.
-
-General Comments is ordered finding first, caveats after: `AI recommended
-status:`, the adjudicated reasoning under `AI response:`, `Page number:`, the
-confidence scores, any note about them, then the quotes. The challenger's
-counter-argument is not printed in the workbook — it is the agent's working
-rather than a finding, and a paragraph arguing against the status directly under
-it reads as though the tool is recommending both. It stays on
-`RequirementReview.counter_argument` and in the sidecar for audit.
-
-Two notes can follow the confidence scores. One when a quote could not be matched
-back to the retrieved text, and one when the status has **no** quotes at all —
-`retrieval_confidence` falls back to the best chunk that came back when nothing
-was cited, so an evidence-free row still prints three scores and would otherwise
-read as a supported finding. On a full CRT run 100 of 667 rows cite nothing.
-
-The cell is capped at `MAX_CELL_CHARS` (4000), and quotes are dropped **whole** to
-stay under it, with a line saying how many went missing and where to find them.
-Cutting the text at an arbitrary character left the last citation ending
-mid-sentence, still wrapped in quote marks — indistinguishable from the contract
-saying exactly that. Long exceptions get the same treatment: `Automated review
-failed:` keeps the first 220 characters, which is the message and the code, and
-leaves boto's `ResponseMetadata` to the Error column.
-
-| Flag | Effect |
-|------|--------|
-| `--folder` | Where to look for workbooks (default `output_excel/`) |
-| `--sheet` | Only this sheet; repeatable |
-| `--limit` | Stop after N requirements, for a smoke test |
-| `--concurrency` | Requirements in flight at once (default 4) |
-| `--no-challenge` | Analyst only, skip the challenge and adjudication |
-| `--skip-answered` | Leave rows that already have a Status alone |
-| `--fresh` | Discard the sidecar and review everything again |
-| `--render-only` | Rebuild the workbook from the sidecar without reviewing |
-
-A full CRT is 667 requirements at three model calls each, so each finding is
-appended to a `<name>.xlsm.reviewed.jsonl` sidecar as it completes. Re-running
-resumes from that sidecar rather than paying for the same rows twice. The
-reviewed workbook is saved as `<name>.reviewed.xlsm`; the uploaded file is never
-modified.
-
-`--render-only` rebuilds the workbook from that sidecar and reviews nothing, which
-turns a change to how a finding is presented into a four-second check instead of
-an hour of Bedrock time. It needs no Bedrock and no database: the agents and the
-connection pool are imported inside the functions that use them, because
-`common/utils/db_settings.py` fetches the database secret at import and importing it
-at the top of the module killed a render before `main()` saw the flag. Rows the
-sidecar does not cover are named rather than left silently blank, since a workbook
-rendering 600 of 667 requirements looks finished. It refuses to run with `--fresh`,
-which would delete the sidecar it renders from.
-
-Two things to know about the output. Status is left blank when the verdict has no
-matching dropdown option — `A. Completeness` offers Yes/No and has nowhere to put
-an UNCLEAR — and the reason goes in General Comments. And openpyxl warns that it
-is dropping the workbook's conditional-formatting extension: macros, dropdowns
-and layout survive the round trip, the colour-scale rules on the Summary sheet do
-not.
 
 ### Cloud operation
 
@@ -436,9 +348,10 @@ The Step Functions execution, named after `requestKey`, then:
 
 1. **Pre-processes** every document with the pre-processing Lambda
    (`data_preprocessing.pre_processing.handler`), at most 5 at once.
-2. **Creates** this run's embeddings table `embeddings_<requestKey>_<state>`
-   (sanitized to lowercase/underscores, truncated with an 8-char SHA-256 hash
-   when over 41 chars to fit Postgres's 63-byte index-name limit).
+2. **Creates** this run's embeddings table
+   `embeddings_<requestKey>_<hash>_<state>` (sanitized to lowercase/underscores,
+   always including an 8-char SHA-256 hash of `requestKey:state` and truncated
+   to at most 41 chars to fit Postgres's 63-byte index-name limit).
 3. **Embeds** every `RAG_Output` JSON into that table with the embeddings Lambda
    (`data_embeddings_storage.rag_process.handler`) and fails the run if 0 chunks
    were produced across all documents.
@@ -454,7 +367,7 @@ The Step Functions execution, named after `requestKey`, then:
 
    ```json
    {"requestKey": "…", "state": "MD", "reviewType": "STREAMLINED", "status": "COMPLETED",
-    "requirementCount": 2, "embeddingsTable": "embeddings_req_123_md",
+    "requirementCount": 2, "embeddingsTable": "embeddings_req_123_5fde4fd5_md",
     "resultsPath": "/manifest/<requestKey>/results"}
    ```
 
@@ -476,9 +389,7 @@ Output for `<folder>/<file>.pdf` in the post-processing bucket:
   overlap (`data_preprocessing/recursive_text_splitter.py`).
 
 Re-embedding a file into the same table first deletes that file's rows, so a
-retried step does not duplicate vectors. Run outside the workflow (no
-`action`), the embeddings Lambda still writes a file to its own
-`emb_<filename>` table.
+retried step does not duplicate vectors.
 
 Both Lambdas are standard Lambda functions in the VPC's private subnets with a
 15-minute timeout (the Lambda maximum). Each runs at most 5 files at once and

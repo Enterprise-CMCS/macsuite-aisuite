@@ -37,6 +37,7 @@ _HEAD_OBJECT_WORKERS = 16
 _MAX_REPORTED_ERRORS = 50
 
 _RUN_STATUS = {"RUNNING": "PROCESSING", "PENDING_REDRIVE": "PROCESSING", "SUCCEEDED": "COMPLETED"}
+_TERMINAL_DEFAULT_ERROR = {"TIMED_OUT": "States.Timeout", "ABORTED": "ExecutionAborted"}
 _ERROR_RESPONSES = {
     code: {"model": ManifestError}
     for code in (
@@ -161,6 +162,58 @@ def _accepted(manifest, execution_arn, message):
     )
 
 
+def _already_processed_error(request_key, execution):
+    return ManifestApiError(
+        status.HTTP_409_CONFLICT,
+        request_key,
+        _run_status(execution),
+        [f"requestKey '{request_key}' was already processed ({execution['status']}); resubmit with a new requestKey."],
+    )
+
+
+def _reserve_manifest(manifest):
+    request_key = manifest.requestKey
+    s3 = _client("s3")
+    bucket = _run_bucket()
+    key = manifest_object_key(request_key)
+
+    try:
+        write_s3_json(s3, bucket, key, manifest.model_dump_json(), if_none_match=True)
+        return
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "Unknown")
+        if code not in ("PreconditionFailed", "ConditionalRequestConflict"):
+            logger.error("manifest_upstream_error", request_key=request_key, action="store the manifest", error=str(exc))
+            raise ManifestApiError(
+                status.HTTP_502_BAD_GATEWAY, request_key, "UPSTREAM_ERROR", [f"Could not store the manifest ({code})."]
+            ) from exc
+
+    with _upstream(request_key, "read the existing manifest"):
+        existing = stream_s3_object(s3, bucket, key)
+        raw = existing.read() if existing is not None else None
+
+    if raw is None:
+        raise ManifestApiError(
+            status.HTTP_409_CONFLICT,
+            request_key,
+            "CONFLICT",
+            [f"requestKey '{request_key}' is currently being reserved; retry the request."],
+        )
+
+    try:
+        same_manifest = Manifest.model_validate_json(raw) == manifest
+    except ValueError:
+        same_manifest = False
+
+    if not same_manifest:
+        raise ManifestApiError(
+            status.HTTP_409_CONFLICT,
+            request_key,
+            "CONFLICT",
+            [f"requestKey '{request_key}' is already reserved with different manifest content."],
+        )
+
+
 @router.post("", status_code=status.HTTP_202_ACCEPTED, response_model=ManifestAccepted, responses=_ERROR_RESPONSES)
 def submit_manifest(manifest: Manifest):
     """Validate MuleSoft's manifest and start pre-processing, embeddings and requirement review."""
@@ -174,40 +227,35 @@ def submit_manifest(manifest: Manifest):
         requirement_count=len(manifest.legalRequirements),
     )
 
+    state_machine_arn = _state_machine_arn(request_key)
+
     errors = _document_errors(manifest)
     if errors:
         logger.warning("manifest_rejected", request_key=request_key, errors=errors)
         raise ManifestApiError(status.HTTP_400_BAD_REQUEST, request_key, "FAILED_VALIDATION", errors)
 
     execution = _describe_execution(request_key)
-    if execution is not None:
-        if _run_status(execution) == "PROCESSING":
-            return _accepted(manifest, execution["executionArn"], "Manifest is already processing.")
+    if execution is not None and _run_status(execution) != "PROCESSING":
         # Step Functions keeps closed execution names for 90 days, so a key cannot be rerun.
-        raise ManifestApiError(
-            status.HTTP_409_CONFLICT,
-            request_key,
-            _run_status(execution),
-            [f"requestKey '{request_key}' was already processed ({execution['status']}); resubmit with a new requestKey."],
-        )
+        raise _already_processed_error(request_key, execution)
 
-    with _upstream(request_key, "store the manifest"):
-        write_s3_json(
-            _client("s3"),
-            _run_bucket(),
-            manifest_object_key(request_key),
-            manifest.model_dump_json(),
-        )
+    _reserve_manifest(manifest)
+
+    if execution is not None:
+        return _accepted(manifest, execution["executionArn"], "Manifest is already processing.")
 
     sfn = _client("stepfunctions")
     with _upstream(request_key, "start the workflow"):
         try:
             response = sfn.start_execution(
-                stateMachineArn=_state_machine_arn(request_key),
+                stateMachineArn=state_machine_arn,
                 name=request_key,
                 input=json.dumps(_workflow_input(manifest)),
             )
         except sfn.exceptions.ExecutionAlreadyExists:
+            existing = _describe_execution(request_key)
+            if existing is not None and _run_status(existing) != "PROCESSING":
+                raise _already_processed_error(request_key, existing)
             return _accepted(manifest, _execution_arn(request_key), "Manifest is already processing.")
 
     logger.info("manifest_accepted", request_key=request_key, execution_arn=response["executionArn"])
@@ -230,7 +278,7 @@ def get_manifest_status(request_key: RequestKey):
         startedAt=started.isoformat() if started else None,
         stoppedAt=stopped.isoformat() if stopped else None,
         resultsPath=f"/manifest/{request_key}/results" if run_status == "COMPLETED" else None,
-        error=execution.get("error"),
+        error=execution.get("error") or _TERMINAL_DEFAULT_ERROR.get(execution.get("status")),
         cause=execution.get("cause"),
     )
 

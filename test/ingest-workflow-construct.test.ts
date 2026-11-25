@@ -1,12 +1,18 @@
+import vm from "node:vm";
+
 import * as cdk from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as lambda from "aws-cdk-lib/aws-lambda";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { REVIEW_CONTAINER_NAME } from "../src/constructs/compute-construct";
-import { IngestWorkflowConstruct } from "../src/constructs/ingest-workflow-construct";
+import {
+  IngestWorkflowConstruct,
+  TERMINAL_EXECUTION_STATUSES,
+  TERMINAL_NOTIFICATION_HANDLER,
+} from "../src/constructs/ingest-workflow-construct";
 import { getDeploymentConfig } from "../src/deployment-config";
 
 interface StateJson {
@@ -195,6 +201,140 @@ describe("IngestWorkflowConstruct", () => {
     qaTemplate.hasResourceProperties("AWS::SQS::Queue", {
       QueueName: "aisuite-qa-manifest-notifications-dlq",
       SqsManagedSseEnabled: true,
+    });
+  });
+
+  it("routes TIMED_OUT and ABORTED executions through an EventBridge terminal-status notifier", () => {
+    template.hasResourceProperties("AWS::Events::Rule", {
+      EventPattern: {
+        detail: {
+          stateMachineArn: [Match.anyValue()],
+          status: [...TERMINAL_EXECUTION_STATUSES],
+        },
+        "detail-type": ["Step Functions Execution Status Change"],
+        source: ["aws.states"],
+      },
+      Name: "aisuite-dev-manifest-terminal-status",
+      State: "ENABLED",
+      Targets: [
+        Match.objectLike({
+          RetryPolicy: {
+            MaximumEventAgeInSeconds: 86400,
+            MaximumRetryAttempts: 3,
+          },
+        }),
+      ],
+    });
+
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      Architectures: ["arm64"],
+      FunctionName: "aisuite-dev-manifest-terminal-notify",
+      Handler: "index.handler",
+      Runtime: "nodejs22.x",
+      Timeout: 30,
+    });
+  });
+
+  it("publishes FAILED MuleSoft notifications for TIMED_OUT and ABORTED executions", async () => {
+    const sendSfn = vi.fn();
+    const sendSqs = vi.fn().mockResolvedValue({});
+
+    class MockDescribeExecutionCommand {
+      public readonly input: Record<string, unknown>;
+      public constructor(input: Record<string, unknown>) {
+        this.input = input;
+      }
+    }
+    class MockSendMessageCommand {
+      public readonly input: Record<string, unknown>;
+      public constructor(input: Record<string, unknown>) {
+        this.input = input;
+      }
+    }
+
+    const moduleExports: { handler?: (event: unknown) => Promise<unknown> } = {};
+    const sandbox = {
+      exports: moduleExports,
+      process: {
+        env: { NOTIFICATION_QUEUE_URL: "https://sqs.us-east-1.amazonaws.com/123456789012/queue" },
+      },
+      require: (id: string) => {
+        if (id === "@aws-sdk/client-sfn") {
+          return {
+            DescribeExecutionCommand: MockDescribeExecutionCommand,
+            SFNClient: class {
+              public send = sendSfn;
+            },
+          };
+        }
+        if (id === "@aws-sdk/client-sqs") {
+          return {
+            SQSClient: class {
+              public send = sendSqs;
+            },
+            SendMessageCommand: MockSendMessageCommand,
+          };
+        }
+        throw new Error(`Unexpected module: ${id}`);
+      },
+    };
+    vm.runInNewContext(TERMINAL_NOTIFICATION_HANDLER, sandbox);
+    const handler = moduleExports.handler!;
+
+    await handler({
+      detail: {
+        executionArn:
+          "arn:aws:states:us-east-1:123456789012:execution:aisuite-dev-manifest-ingest:req-timeout-1",
+        input: JSON.stringify({
+          requestKey: "req-timeout-1",
+          reviewType: "STREAMLINED",
+          state: "MD",
+        }),
+        inputDetails: { included: true },
+        name: "req-timeout-1",
+        status: "TIMED_OUT",
+      },
+    });
+
+    expect(sendSfn).not.toHaveBeenCalled();
+    expect(sendSqs).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(sendSqs.mock.calls[0]?.[0]?.input?.MessageBody)).toEqual({
+      error: "States.Timeout",
+      requestKey: "req-timeout-1",
+      reviewType: "STREAMLINED",
+      state: "MD",
+      status: "FAILED",
+      statusPath: "/manifest/req-timeout-1",
+    });
+
+    sendSqs.mockClear();
+    sendSfn.mockResolvedValueOnce({
+      input: JSON.stringify({
+        requestKey: "req-aborted-2",
+        reviewType: "FULL",
+        state: "WA",
+      }),
+      status: "ABORTED",
+    });
+
+    await handler({
+      detail: {
+        executionArn:
+          "arn:aws:states:us-east-1:123456789012:execution:aisuite-dev-manifest-ingest:req-aborted-2",
+        inputDetails: { included: false },
+        name: "req-aborted-2",
+        status: "ABORTED",
+      },
+    });
+
+    expect(sendSfn).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(sendSqs.mock.calls[0]?.[0]?.input?.MessageBody)).toEqual({
+      error: "ExecutionAborted",
+      requestKey: "req-aborted-2",
+      reviewType: "FULL",
+      state: "WA",
+      status: "FAILED",
+      statusPath: "/manifest/req-aborted-2",
     });
   });
 });

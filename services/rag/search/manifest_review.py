@@ -19,6 +19,7 @@ from common.utils.manifest import (
     results_object_key,
     review_item_prefix,
 )
+from data_preprocessing.bedrock.bda_results import rag_output_key
 from search.database_searching.review_models import page_number, simplify_doc_id
 
 DEFAULT_CONCURRENCY = 4
@@ -72,8 +73,18 @@ class ReviewStore:
 
 
 def document_labels(manifest):
-    """Map each simplified file name back to MuleSoft's documentId."""
-    return {simplify_doc_id(os.path.basename(doc.s3.path)): doc.documentId for doc in manifest.documents}
+    """Map each source key, RAG_Output key, and unambiguous basename back to MuleSoft's documentId."""
+    by_exact_key = {}
+    counts = {}
+    by_basename = {}
+    for doc in manifest.documents:
+        by_exact_key[doc.s3.path] = doc.documentId
+        by_exact_key[rag_output_key(doc.s3.path)] = doc.documentId
+        base = simplify_doc_id(os.path.basename(doc.s3.path))
+        counts[base] = counts.get(base, 0) + 1
+        by_basename[base] = doc.documentId
+    unambiguous_basenames = {base: doc_id for base, doc_id in by_basename.items() if counts[base] == 1}
+    return {**unambiguous_basenames, **by_exact_key}
 
 
 def found_in(evidence, labels):
@@ -84,7 +95,14 @@ def found_in(evidence, labels):
         if not number:
             continue
         doc_id = record.doc_id or ""
-        label = labels.get(simplify_doc_id(os.path.basename(doc_id)), doc_id)
+        source_key = record.source_key or ""
+        label = (
+            labels.get(source_key)
+            or labels.get(doc_id)
+            or labels.get(simplify_doc_id(os.path.basename(doc_id)))
+            or source_key
+            or doc_id
+        )
         # Order by physical page index so printed roman numerals stay in document order.
         pages_by_doc.setdefault(label, {}).setdefault(number, record.page or 0)
 
