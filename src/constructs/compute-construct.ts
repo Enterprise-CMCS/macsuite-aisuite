@@ -7,7 +7,7 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
-import type * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
 
 import {
@@ -43,6 +43,19 @@ const TASK_SIZE_BY_ENVIRONMENT = {
   DeploymentEnvironmentName,
   { cpu: number; memoryLimitMiB: number }
 >;
+
+/** Minimum task size when the Falcon sensor shares the task with the API. */
+const FALCON_MIN_TASK_SIZE = { cpu: 512, memoryLimitMiB: 1024 } as const;
+
+const FALCON_VOLUME_NAME = "crowdstrike-falcon-volume";
+const FALCON_MOUNT_PATH = "/tmp/CrowdStrike";
+const FALCON_ROOTFS = `${FALCON_MOUNT_PATH}/rootfs`;
+const FALCON_LOADER = [
+  `${FALCON_ROOTFS}/lib64/ld-linux-x86-64.so.2`,
+  "--library-path",
+  `${FALCON_ROOTFS}/lib64`,
+  `${FALCON_ROOTFS}/bin/bash`,
+] as const;
 
 export interface ComputeConstructProps {
   appSecurityGroup: ec2.ISecurityGroup;
@@ -105,11 +118,23 @@ export class ComputeConstruct extends Construct {
     });
     logGroup.grantWrite(executionRole);
 
+    const falconConfig = props.deploymentConfig.falcon;
+    const baseTaskSize = TASK_SIZE_BY_ENVIRONMENT[name];
+    const taskSize = falconConfig
+      ? {
+          cpu: Math.max(baseTaskSize.cpu, FALCON_MIN_TASK_SIZE.cpu),
+          memoryLimitMiB: Math.max(
+            baseTaskSize.memoryLimitMiB,
+            FALCON_MIN_TASK_SIZE.memoryLimitMiB,
+          ),
+        }
+      : baseTaskSize;
+
     const taskDefinition = new ecs.FargateTaskDefinition(
       this,
       "TaskDefinition",
       {
-        ...TASK_SIZE_BY_ENVIRONMENT[name],
+        ...taskSize,
         executionRole,
         family: serviceName,
         runtimePlatform: {
@@ -130,6 +155,83 @@ export class ComputeConstruct extends Construct {
     const apiActivated =
       activationContext === true || activationContext === "true";
 
+    let falconInit: ecs.ContainerDefinition | undefined;
+    let falconContainerOptions:
+      | Pick<
+          ecs.ContainerDefinitionOptions,
+          "entryPoint" | "linuxParameters" | "secrets"
+        >
+      | undefined;
+
+    if (falconConfig) {
+      taskDefinition.addVolume({ name: FALCON_VOLUME_NAME });
+
+      const registryCredentials = falconConfig.registryCredentialsSecretName
+        ? secretsmanager.Secret.fromSecretNameV2(
+            this,
+            "FalconRegistryCredentials",
+            falconConfig.registryCredentialsSecretName,
+          )
+        : undefined;
+
+      falconInit = taskDefinition.addContainer(
+        "crowdstrike-falcon-init-container",
+        {
+          image: ecs.ContainerImage.fromRegistry(
+            falconConfig.image,
+            registryCredentials ? { credentials: registryCredentials } : {},
+          ),
+          essential: false,
+          user: "0:0",
+          readonlyRootFilesystem: true,
+          logging: ecs.LogDrivers.awsLogs({
+            logGroup,
+            streamPrefix: "falcon-init",
+          }),
+          entryPoint: [
+            "/bin/bash",
+            "-c",
+            `chmod u+rwx ${FALCON_MOUNT_PATH} && mkdir -p ${FALCON_ROOTFS}/lib && cp -r /bin /etc /lib64 /usr /entrypoint-ecs.sh ${FALCON_ROOTFS} && chmod -R a=rX ${FALCON_MOUNT_PATH}`,
+          ],
+        },
+      );
+      falconInit.addMountPoints({
+        containerPath: FALCON_MOUNT_PATH,
+        readOnly: false,
+        sourceVolume: FALCON_VOLUME_NAME,
+      });
+
+      const falconLinuxParameters = new ecs.LinuxParameters(
+        this,
+        "FalconLinuxParameters",
+      );
+      falconLinuxParameters.addCapabilities(ecs.Capability.SYS_PTRACE);
+      const falconSecret = secretsmanager.Secret.fromSecretNameV2(
+        this,
+        "FalconSecret",
+        falconConfig.secretName,
+      );
+
+      // Secrets arrive as env vars at runtime, so FALCONCTL_OPTS is assembled in
+      // the container rather than written into the CloudFormation template.
+      const falconBootstrap = [
+        `export FALCONCTL_OPTS="--provisioning-token=\${FALCON_PROVISIONING_TOKEN} --tags=rag-api,${name},rag-api-${name} --cid=\${FALCON_CID}"`,
+        `exec ${FALCON_LOADER.join(" ")} ${FALCON_ROOTFS}/entrypoint-ecs.sh "$@"`,
+      ].join("; ");
+
+      falconContainerOptions = {
+        entryPoint: [...FALCON_LOADER, "-c", falconBootstrap, "--"],
+        linuxParameters: falconLinuxParameters,
+        secrets: {
+          FALCON_CID: ecs.Secret.fromSecretsManager(falconSecret, "cid"),
+          FALCON_PROVISIONING_TOKEN: ecs.Secret.fromSecretsManager(
+            falconSecret,
+            "provisioningToken",
+          ),
+        },
+      };
+    }
+
     const container = taskDefinition.addContainer("Container", {
       containerName: "rag-api",
       environment: {
@@ -145,7 +247,21 @@ export class ComputeConstruct extends Construct {
       },
       image: ecs.ContainerImage.fromEcrRepository(this.repository, imageTag),
       logging: ecs.LogDrivers.awsLogs({ logGroup, streamPrefix: "rag-api" }),
+      ...falconContainerOptions,
     });
+
+    if (falconInit) {
+      container.addMountPoints({
+        containerPath: FALCON_MOUNT_PATH,
+        readOnly: true,
+        sourceVolume: FALCON_VOLUME_NAME,
+      });
+      container.addContainerDependencies({
+        container: falconInit,
+        condition: ecs.ContainerDependencyCondition.SUCCESS,
+      });
+    }
+
     container.addPortMappings({
       containerPort: API_CONTAINER_PORT,
       protocol: ecs.Protocol.TCP,

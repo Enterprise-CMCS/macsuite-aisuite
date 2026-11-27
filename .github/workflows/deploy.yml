@@ -36,6 +36,11 @@ jobs:
       # Stable within a release so DeployedAt tags do not churn every deploy.
       # workflow_dispatch has no head_commit; guard push-only access or the value is empty.
       DEPLOYMENT_TIMESTAMP: ${{ github.event_name == 'push' && github.event.head_commit.timestamp || github.run_started_at }}
+      # CrowdStrike Falcon is opt-in per GitHub Environment; job-level env keeps
+      # synth, diff, and both deploy phases on the same task definition.
+      AISUITE_FALCON_ENABLED: ${{ vars.AISUITE_FALCON_ENABLED || 'false' }}
+      AISUITE_FALCON_IMAGE: ${{ vars.AISUITE_FALCON_IMAGE }}
+      AISUITE_FALCON_REGISTRY_SECRET_NAME: ${{ vars.AISUITE_FALCON_REGISTRY_SECRET_NAME }}
 
     steps:
       - name: Checkout
