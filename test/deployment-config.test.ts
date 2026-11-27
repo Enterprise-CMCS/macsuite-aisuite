@@ -8,6 +8,11 @@ import {
   DEPLOYMENT_ENVIRONMENT_NAMES,
   DEPLOYMENT_ENVIRONMENT_VPC_NAME,
   DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID,
+  FALCON_ENABLED_ENV_KEY,
+  FALCON_IMAGE,
+  FALCON_IMAGE_ENV_KEY,
+  FALCON_REGISTRY_SECRET_ENV_KEY,
+  FALCON_SECRET_NAME,
   getDeploymentConfig,
   resolveAccountId,
 } from "../src/deployment-config";
@@ -19,6 +24,9 @@ describe("deployment config", () => {
     delete process.env.AISUITE_NONPROD_ACCOUNT_ID;
     delete process.env.AISUITE_PROD_ACCOUNT_ID;
     delete process.env.DEFAULT_REGION;
+    delete process.env[FALCON_ENABLED_ENV_KEY];
+    delete process.env[FALCON_IMAGE_ENV_KEY];
+    delete process.env[FALCON_REGISTRY_SECRET_ENV_KEY];
   });
 
   it("builds a namespaced stack config for a known environment", () => {
@@ -164,5 +172,37 @@ describe("deployment config", () => {
 
     const deployedAt = getDeploymentConfig("dev").tags.DeployedAt;
     expect(deployedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it.each([undefined, "false", " ", "1"])(
+    "leaves Falcon disabled when %s is set as the enable flag",
+    (value) => {
+      if (value !== undefined) {
+        process.env[FALCON_ENABLED_ENV_KEY] = value;
+      }
+
+      expect(getDeploymentConfig("dev").falcon).toBeUndefined();
+    },
+  );
+
+  it("enables Falcon with the pinned image and secret", () => {
+    process.env[FALCON_ENABLED_ENV_KEY] = " TRUE ";
+
+    expect(getDeploymentConfig("dev").falcon).toEqual({
+      image: FALCON_IMAGE,
+      secretName: FALCON_SECRET_NAME,
+    });
+  });
+
+  it("applies Falcon image and registry credential overrides", () => {
+    process.env[FALCON_ENABLED_ENV_KEY] = "true";
+    process.env[FALCON_IMAGE_ENV_KEY] = " example.invalid/falcon:test ";
+    process.env[FALCON_REGISTRY_SECRET_ENV_KEY] = " artifactory/pull ";
+
+    expect(getDeploymentConfig("dev").falcon).toEqual({
+      image: "example.invalid/falcon:test",
+      registryCredentialsSecretName: "artifactory/pull",
+      secretName: FALCON_SECRET_NAME,
+    });
   });
 });

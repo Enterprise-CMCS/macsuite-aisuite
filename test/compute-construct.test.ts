@@ -72,6 +72,99 @@ function apiContainerEnvironment(
   );
 }
 
+describe("AISuite RAG API with CrowdStrike Falcon", () => {
+  it("injects the Falcon sensor without exposing credentials", () => {
+    const app = new cdk.App({ context: { [STUB_VPC_CONTEXT_KEY]: true } });
+    const deploymentConfig = getDeploymentConfig("dev");
+    deploymentConfig.falcon = {
+      image: "example.invalid/falcon:test",
+      registryCredentialsSecretName: "artifactory/pull",
+      secretName: "crowdstrike/falcon",
+    };
+    const stack = new AisuiteInfrastructureStack(
+      app,
+      deploymentConfig.stackName,
+      {
+        deploymentConfig,
+        env: deploymentConfig.awsEnvironment,
+        stackName: deploymentConfig.stackName,
+      },
+    );
+    const template = Template.fromStack(stack);
+    const falconLoader = [
+      "/tmp/CrowdStrike/rootfs/lib64/ld-linux-x86-64.so.2",
+      "--library-path",
+      "/tmp/CrowdStrike/rootfs/lib64",
+      "/tmp/CrowdStrike/rootfs/bin/bash",
+    ];
+
+    template.hasResourceProperties("AWS::ECS::TaskDefinition", {
+      Family: "aisuite-dev-rag-api",
+      Cpu: "512",
+      Memory: "1024",
+      Volumes: [{ Name: "crowdstrike-falcon-volume" }],
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Essential: false,
+          Image: "example.invalid/falcon:test",
+          LogConfiguration: Match.objectLike({
+            Options: Match.objectLike({
+              "awslogs-stream-prefix": "falcon-init",
+            }),
+          }),
+          MountPoints: [
+            {
+              ContainerPath: "/tmp/CrowdStrike",
+              ReadOnly: false,
+              SourceVolume: "crowdstrike-falcon-volume",
+            },
+          ],
+          Name: "crowdstrike-falcon-init-container",
+          ReadonlyRootFilesystem: true,
+          RepositoryCredentials: {
+            CredentialsParameter: Match.anyValue(),
+          },
+          User: "0:0",
+        }),
+        Match.objectLike({
+          DependsOn: [
+            {
+              Condition: "SUCCESS",
+              ContainerName: "crowdstrike-falcon-init-container",
+            },
+          ],
+          EntryPoint: [
+            ...falconLoader,
+            "-c",
+            Match.stringLikeRegexp(
+              `--tags=rag-api,dev,rag-api-dev .*exec ${falconLoader.join(" ")} /tmp/CrowdStrike/rootfs/entrypoint-ecs.sh "\\$@"$`,
+            ),
+            "--",
+          ],
+          LinuxParameters: {
+            Capabilities: { Add: ["SYS_PTRACE"] },
+          },
+          MountPoints: [
+            {
+              ContainerPath: "/tmp/CrowdStrike",
+              ReadOnly: true,
+              SourceVolume: "crowdstrike-falcon-volume",
+            },
+          ],
+          Name: "rag-api",
+          Secrets: Match.arrayWith([
+            Match.objectLike({ Name: "FALCON_CID" }),
+            Match.objectLike({ Name: "FALCON_PROVISIONING_TOKEN" }),
+          ]),
+        }),
+      ]),
+    });
+    expect(JSON.stringify(template.toJSON())).not.toContain(
+      '"Name":"FALCONCTL_OPTS"',
+    );
+  });
+});
+
 describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
   "AISuite %s RAG API",
   (environmentName) => {
@@ -90,13 +183,15 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
         Family: serviceName,
         NetworkMode: "awsvpc",
         RequiresCompatibilities: ["FARGATE"],
-        ContainerDefinitions: Match.arrayWith([
+        Volumes: Match.absent(),
+        ContainerDefinitions: [
           Match.objectLike({
+            EntryPoint: Match.absent(),
             PortMappings: [
               { ContainerPort: API_CONTAINER_PORT, Protocol: "tcp" },
             ],
           }),
-        ]),
+        ],
       });
       template.hasResourceProperties("AWS::ECS::Service", {
         LaunchType: "FARGATE",
