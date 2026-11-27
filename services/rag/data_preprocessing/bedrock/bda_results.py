@@ -7,13 +7,23 @@ from common.utils.helper import Helper
 from common.utils.logger import log
 
 
+def _split_s3_key(key):
+    if "/" not in key:
+        return None, key
+    return key.rsplit("/", 1)
+
+
 def doc_name_for_key(key):
-    return os.path.splitext(os.path.basename(key))[0].replace(" ", "_")
+    _, basename = _split_s3_key(key)
+    return os.path.splitext(basename)[0].replace(" ", "_")
 
 
 OUTPUT_FOLDERS = {"text": "BDATextOutput", "table": "BDATableOutput", "image": "BDAImageOutput"}
 RUN_ARTIFACTS_PREFIX = "runs/"
 _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+MAX_S3_KEY_BYTES = 1024
+# Reserve headroom under doc_output_prefix for BDA's nested result/asset suffixes.
+BDA_INTERNAL_KEY_HEADROOM_BYTES = 160
 
 
 def _clean_namespace(namespace):
@@ -26,8 +36,15 @@ def _clean_namespace(namespace):
 
 def output_root(key, namespace=None):
     ns = _clean_namespace(namespace)
-    parts = [part for part in os.path.dirname(key).split("/") if part]
-    root = "_bdaoutput/" if not parts else "/".join([f"{parts[0]}_bdaoutput", *parts[1:]]) + "/"
+    dir_part, _ = _split_s3_key(key)
+    if dir_part is None:
+        root = "_bdaoutput/"
+    else:
+        parts = dir_part.split("/")
+        if parts[0]:
+            root = "/".join([f"{parts[0]}_bdaoutput", *parts[1:]]) + "/"
+        else:
+            root = "/" + "/".join(["_bdaoutput", *parts[1:]]) + "/"
     return f"{RUN_ARTIFACTS_PREFIX}{ns}/{root}" if ns else root
 
 
@@ -49,9 +66,33 @@ RAG_OUTPUT_PREFIX = "RAG_Output/"
 def rag_output_key(key, namespace=None):
     """state_of_TN/Contract/a.pdf -> RAG_Output/state_of_TN/Contract/a.json ; a.pdf -> RAG_Output/a.json"""
     ns = _clean_namespace(namespace)
-    folder = os.path.dirname(key).strip("/")
+    dir_part, _ = _split_s3_key(key)
     ns_prefix = f"{RUN_ARTIFACTS_PREFIX}{ns}/" if ns else ""
-    return f"{RAG_OUTPUT_PREFIX}{ns_prefix}{folder + '/' if folder else ''}{doc_name_for_key(key)}.json"
+    folder_prefix = f"{dir_part}/" if dir_part is not None else ""
+    return f"{RAG_OUTPUT_PREFIX}{ns_prefix}{folder_prefix}{doc_name_for_key(key)}.json"
+
+
+def derived_artifact_key_errors(source_key, namespace=None):
+    """Return error messages if derived S3 artifact keys could exceed S3's 1,024-byte UTF-8 limit."""
+    errors = []
+    max_bda_prefix = MAX_S3_KEY_BYTES - BDA_INTERNAL_KEY_HEADROOM_BYTES
+    bda_prefix = doc_output_prefix(source_key, namespace=namespace)
+    bda_prefix_bytes = len(bda_prefix.encode("utf-8"))
+    if bda_prefix_bytes > max_bda_prefix:
+        errors.append(
+            f"derived BDA output prefix is {bda_prefix_bytes} UTF-8 bytes "
+            f"(max {max_bda_prefix} to stay within S3's {MAX_S3_KEY_BYTES}-byte key limit)"
+        )
+
+    candidates = [
+        ("RAG_Output key", rag_output_key(source_key, namespace=namespace)),
+        *((f"{kind} output key", per_doc_output_key(source_key, kind, namespace=namespace)) for kind in OUTPUT_FOLDERS),
+    ]
+    for label, artifact_key in candidates:
+        size = len(artifact_key.encode("utf-8"))
+        if size > MAX_S3_KEY_BYTES:
+            errors.append(f"derived {label} is {size} UTF-8 bytes (max {MAX_S3_KEY_BYTES})")
+    return errors
 
 class BDAResults:
     def __init__(self):

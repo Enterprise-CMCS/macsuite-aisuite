@@ -691,6 +691,79 @@ class ManifestApiTests(unittest.TestCase):
         self.s3.put_object.assert_not_called()
         self.sfn.start_execution.assert_not_called()
 
+    def test_rejects_derived_s3_artifact_keys_exceeding_1024_utf8_bytes_before_reserving_key(self):
+        # Valid 1,024-byte S3 source key whose derived run/BDA/RAG artifact keys exceed S3's 1,024-byte limit.
+        long_source_key = ("a/" * 509) + "ab.pdf"
+        self.assertEqual(len(long_source_key.encode("utf-8")), 1024)
+        oversized_key_payload = manifest_payload(
+            documents=[{"documentId": "DOC-LONG", "s3": {"bucket": DOCUMENTS_BUCKET, "path": long_source_key}}]
+        )
+
+        rejected = self.client.post("/manifest", json=oversized_key_payload)
+
+        self.assertEqual(rejected.status_code, 400)
+        body = rejected.json()
+        self.assertEqual((body["requestKey"], body["status"]), (REQUEST_KEY, "FAILED_VALIDATION"))
+        self.assertIn("1024", body["errors"][0])
+        self.s3.head_object.assert_not_called()
+        self.s3.put_object.assert_not_called()
+        self.sfn.start_execution.assert_not_called()
+
+        retry = self.client.post("/manifest", json=manifest_payload())
+        self.assertEqual(retry.status_code, 202)
+        self.sfn.start_execution.assert_called_once()
+
+    def test_rejects_downstream_step_functions_map_result_exceeding_256kib_before_reserving_key(self):
+        long_request_key = "r" * 80
+        # 500 docs with 395-byte S3 keys fit in StartExecution input (< 256 KiB)
+        # but exceed 262,144 bytes in the PreProcessDocuments and EmbedDocuments Map results.
+        prefix = "p" * (395 - len("/doc-000.pdf"))
+        payload = manifest_payload(
+            requestKey=long_request_key,
+            documents=[
+                {
+                    "documentId": f"DOC-{index:03d}",
+                    "s3": {"bucket": DOCUMENTS_BUCKET, "path": f"{prefix}/doc-{index:03d}.pdf"},
+                }
+                for index in range(500)
+            ],
+        )
+        manifest_obj = Manifest.model_validate(payload)
+        self.assertEqual(len(manifest_obj.documents[0].s3.path.encode("utf-8")), 395)
+        self.assertLess(
+            len(manifest_api._serialized_workflow_input(manifest_obj).encode("utf-8")),
+            manifest_api.MAX_WORKFLOW_INPUT_BYTES,
+        )
+
+        rejected = self.client.post("/manifest", json=payload)
+
+        self.assertEqual(rejected.status_code, 400)
+        body = rejected.json()
+        self.assertEqual((body["requestKey"], body["status"]), (long_request_key, "FAILED_VALIDATION"))
+        self.assertTrue(any("PreProcessDocuments" in err for err in body["errors"]))
+        self.assertTrue(any("EmbedDocuments" in err for err in body["errors"]))
+        self.s3.head_object.assert_not_called()
+        self.s3.put_object.assert_not_called()
+        self.sfn.start_execution.assert_not_called()
+
+        # Same requestKey remains available after validation failure.
+        retry = self.client.post("/manifest", json=manifest_payload(requestKey=long_request_key))
+        self.assertEqual(retry.status_code, 202)
+        self.sfn.start_execution.assert_called_once()
+
+    def test_accepts_distinct_s3_keys_differing_only_by_empty_directory_components(self):
+        payload = manifest_payload(
+            documents=[
+                {"documentId": "DOC-001", "s3": {"bucket": DOCUMENTS_BUCKET, "path": "folder/sub/a.pdf"}},
+                {"documentId": "DOC-002", "s3": {"bucket": DOCUMENTS_BUCKET, "path": "folder//sub/a.pdf"}},
+            ]
+        )
+
+        response = self.client.post("/manifest", json=payload)
+
+        self.assertEqual(response.status_code, 202)
+        self.sfn.start_execution.assert_called_once()
+
     def test_rejects_documents_that_are_missing_or_in_another_bucket(self):
         self.s3.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
         payload = manifest_payload()

@@ -22,12 +22,17 @@ from common.utils.manifest import (
     ManifestError,
     ManifestStatus,
     ReviewResults,
+    manifest_embeddings_table_name,
     manifest_object_key,
     results_object_key,
 )
 from common.utils.helper import Helper
 from common.utils.settings import aws_client
-from data_preprocessing.bedrock.bda_results import rag_output_key
+from data_preprocessing.bedrock.bda_results import (
+    derived_artifact_key_errors,
+    doc_output_prefix,
+    rag_output_key,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -35,6 +40,7 @@ router = APIRouter(prefix="/manifest", tags=["Manifest"])
 
 _HEAD_OBJECT_WORKERS = 16
 _MAX_REPORTED_ERRORS = 50
+_MAX_EMBEDDED_COUNT_PLACEHOLDER = 999_999_999
 DEFAULT_MAX_MANIFEST_BODY_BYTES = 5 * 1024 * 1024
 MAX_WORKFLOW_INPUT_BYTES = 256 * 1024
 # Leave headroom below API Gateway's 10 MiB buffered REST response ceiling.
@@ -221,17 +227,22 @@ def _document_errors(manifest):
     with ThreadPoolExecutor(max_workers=_HEAD_OBJECT_WORKERS) as pool:
         errors = [error for error in pool.map(check, manifest.documents) if error]
 
-    # a.pdf and a.docx in one folder pre-process to the same RAG_Output file.
-    by_output = {}
-    for document in manifest.documents:
-        by_output.setdefault(
-            rag_output_key(document.s3.path, namespace=manifest.requestKey), []
-        ).append(document.documentId)
-    errors.extend(
-        f"Documents {', '.join(ids)} share a folder and file name, so their pre-processing output would collide."
-        for ids in by_output.values()
-        if len(ids) > 1
-    )
+    # a.pdf and a.docx in one folder pre-process to the same RAG_Output / BDA output prefix.
+    reported_collisions = set()
+    for key_fn in (rag_output_key, doc_output_prefix):
+        by_output = {}
+        for document in manifest.documents:
+            by_output.setdefault(
+                key_fn(document.s3.path, namespace=manifest.requestKey), []
+            ).append(document.documentId)
+        for ids in by_output.values():
+            if len(ids) > 1:
+                pair = tuple(ids)
+                if pair not in reported_collisions:
+                    reported_collisions.add(pair)
+                    errors.append(
+                        f"Documents {', '.join(ids)} share a folder and file name, so their pre-processing output would collide."
+                    )
     return errors
 
 
@@ -248,6 +259,50 @@ def _workflow_input(manifest):
 
 def _serialized_workflow_input(manifest):
     return json.dumps(_workflow_input(manifest))
+
+
+def _workflow_limit_errors(manifest, workflow_input_json):
+    errors = []
+    request_key = manifest.requestKey
+
+    for document in manifest.documents:
+        key_errors = derived_artifact_key_errors(document.s3.path, namespace=request_key)
+        if key_errors:
+            location = f"Document '{document.documentId}' (s3://{document.s3.bucket}/{document.s3.path})"
+            errors.append(f"{location}: {'; '.join(key_errors)}.")
+
+    workflow_input_bytes = len(workflow_input_json.encode("utf-8"))
+    if workflow_input_bytes > MAX_WORKFLOW_INPUT_BYTES:
+        errors.append(
+            f"Serialized workflow input is {workflow_input_bytes} bytes (UTF-8), "
+            f"exceeding the {MAX_WORKFLOW_INPUT_BYTES} byte Step Functions limit; "
+            "reduce the number of documents or shorten their S3 paths."
+        )
+
+    rag_keys = [rag_output_key(document.s3.path, namespace=request_key) for document in manifest.documents]
+    preprocess_result = [{"status": "completed", "rag_output": [key]} for key in rag_keys]
+    preprocess_bytes = len(json.dumps(preprocess_result, separators=(",", ":")).encode("utf-8"))
+    if preprocess_bytes > MAX_WORKFLOW_INPUT_BYTES:
+        errors.append(
+            f"Projected PreProcessDocuments Map result is {preprocess_bytes} bytes (UTF-8), "
+            f"exceeding the {MAX_WORKFLOW_INPUT_BYTES} byte Step Functions limit; "
+            "reduce the number of documents or shorten their S3 paths."
+        )
+
+    table_name = manifest_embeddings_table_name(request_key, manifest.state)
+    embed_result = [
+        {"key": key, "tableName": table_name, "embedded": _MAX_EMBEDDED_COUNT_PLACEHOLDER}
+        for key in rag_keys
+    ]
+    embed_bytes = len(json.dumps(embed_result, separators=(",", ":")).encode("utf-8"))
+    if embed_bytes > MAX_WORKFLOW_INPUT_BYTES:
+        errors.append(
+            f"Projected EmbedDocuments Map result is {embed_bytes} bytes (UTF-8), "
+            f"exceeding the {MAX_WORKFLOW_INPUT_BYTES} byte Step Functions limit; "
+            "reduce the number of documents or shorten their S3 paths."
+        )
+
+    return errors
 
 
 def _accepted(manifest, execution_arn, message):
@@ -328,15 +383,10 @@ def submit_manifest(manifest: Manifest):
     state_machine_arn = _state_machine_arn(request_key)
 
     workflow_input_json = _serialized_workflow_input(manifest)
-    workflow_input_bytes = len(workflow_input_json.encode("utf-8"))
-    if workflow_input_bytes > MAX_WORKFLOW_INPUT_BYTES:
-        error = (
-            f"Serialized workflow input is {workflow_input_bytes} bytes (UTF-8), "
-            f"exceeding the {MAX_WORKFLOW_INPUT_BYTES} byte Step Functions limit; "
-            "reduce the number of documents or shorten their S3 paths."
-        )
-        logger.warning("manifest_rejected", request_key=request_key, errors=[error])
-        raise ManifestApiError(status.HTTP_400_BAD_REQUEST, request_key, "FAILED_VALIDATION", [error])
+    limit_errors = _workflow_limit_errors(manifest, workflow_input_json)
+    if limit_errors:
+        logger.warning("manifest_rejected", request_key=request_key, errors=limit_errors)
+        raise ManifestApiError(status.HTTP_400_BAD_REQUEST, request_key, "FAILED_VALIDATION", limit_errors)
 
     errors = _document_errors(manifest)
     if errors:

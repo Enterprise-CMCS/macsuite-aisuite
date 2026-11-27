@@ -66,8 +66,14 @@ def stream_s3_object(s3, bucket, key):
         return None
 
 
-def write_s3_json(s3, bucket, key, body, *, if_none_match=False):
-    extra = {"IfNoneMatch": "*"} if if_none_match else {}
+def write_s3_json(s3, bucket, key, body, *, if_none_match=False, if_match=None):
+    if if_none_match and if_match is not None:
+        raise ValueError("Cannot specify both if_none_match and if_match.")
+    extra = {}
+    if if_none_match:
+        extra["IfNoneMatch"] = "*"
+    elif if_match is not None:
+        extra["IfMatch"] = if_match
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json", **extra)
 
 
@@ -93,7 +99,7 @@ def read_s3_json_with_version(s3, bucket, key):
     return data, s3_object_version(response)
 
 
-def head_s3_object_version(s3, bucket, key):
+def _head_s3_object(s3, bucket, key):
     candidate = getattr(getattr(s3, "exceptions", None), "NoSuchKey", None)
     extra_missing = (
         (candidate,)
@@ -101,7 +107,7 @@ def head_s3_object_version(s3, bucket, key):
         else ()
     )
     try:
-        response = s3.head_object(Bucket=bucket, Key=key)
+        return s3.head_object(Bucket=bucket, Key=key)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code")
         if code in _MISSING_S3_OBJECT_CODES:
@@ -109,4 +115,18 @@ def head_s3_object_version(s3, bucket, key):
         raise
     except extra_missing:
         return None
+
+
+def head_s3_object_version(s3, bucket, key):
+    response = _head_s3_object(s3, bucket, key)
+    if response is None:
+        return None
     return s3_object_version(response)
+
+
+def head_s3_object_etag(s3, bucket, key):
+    response = _head_s3_object(s3, bucket, key)
+    if response is None:
+        return None
+    etag = response.get("ETag")
+    return etag if isinstance(etag, str) and etag else None

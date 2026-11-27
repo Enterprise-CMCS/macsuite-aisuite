@@ -4,7 +4,7 @@ import boto3
 import datetime
 import time
 
-from data_preprocessing.bedrock.bda_results import bda_output_prefix
+from data_preprocessing.bedrock.bda_results import bda_output_prefix, doc_name_for_key
 from common.utils.helper import Helper
 from common.utils.logger import log
 from common.utils.settings import aws_client,aws_session
@@ -244,14 +244,9 @@ def bda_invoke(project_arn, input_bucket, p_files, output_bucket, out_prefix, da
     work_list = []
     for key in p_files:
         log.info(f"********************************** Key ={key} *********************** START ")
-        str_basename = os.path.basename(key)
-        log.debug("str_basename=" + str_basename + ", Setting rename file info variable ")
-        rename_file_info = os.path.splitext(str_basename)[0]
-        log.debug(f"rename_file_info={rename_file_info}, Setting rename file info variable. Replacing  empty string in name of file with _")
-        rename_file_info = rename_file_info.replace(" ", "_")
-
+        rename_file_info = doc_name_for_key(key)
         prefix_check = f"{out_prefix.rstrip('/')}/{rename_file_info}/"
-        log.info(f"strBasename={str_basename}, rename_file_info={rename_file_info}, Setting prefix_check variable. prefix_check={ prefix_check} ")
+        log.info(f"key={key}, rename_file_info={rename_file_info}, Setting prefix_check variable. prefix_check={ prefix_check} ")
 
         if is_already_processed(output_bucket, prefix_check, rename_file_info):
             log.info(f"Already processed: {rename_file_info}. Deleting the old output at {prefix_check} and processing the file again.")

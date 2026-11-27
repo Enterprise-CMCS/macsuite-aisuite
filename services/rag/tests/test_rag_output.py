@@ -45,7 +45,10 @@ with patch.dict(sys.modules, _IMPORT_STUBS):
     from data_preprocessing import pre_processing
     from data_preprocessing.bedrock import bedrock_BDA
     from data_preprocessing.bedrock.bda_results import (
+        BDA_INTERNAL_KEY_HEADROOM_BYTES,
+        MAX_S3_KEY_BYTES,
         bda_output_prefix,
+        derived_artifact_key_errors,
         doc_output_prefix,
         output_root,
         per_doc_output_key,
@@ -97,6 +100,49 @@ class RagOutputKeyTests(unittest.TestCase):
         for bad_namespace in ("../escape", "req/1", "a" * 81):
             with self.subTest(bad_namespace=bad_namespace), self.assertRaises(ValueError):
                 rag_output_key(key, namespace=bad_namespace)
+
+    def test_preserves_empty_directory_components_in_intermediate_and_rag_paths(self):
+        variants = [
+            "a.pdf",
+            "/a.pdf",
+            "//a.pdf",
+            "folder/sub/a.pdf",
+            "folder//sub/a.pdf",
+            "folder/sub//a.pdf",
+            "/folder/sub/a.pdf",
+        ]
+        for namespace in (None, "req-1"):
+            with self.subTest(namespace=namespace):
+                self.assertEqual(len({output_root(k, namespace=namespace) for k in variants}), len(variants))
+                self.assertEqual(len({bda_output_prefix(k, namespace=namespace) for k in variants}), len(variants))
+                self.assertEqual(len({doc_output_prefix(k, namespace=namespace) for k in variants}), len(variants))
+                self.assertEqual(len({rag_output_key(k, namespace=namespace) for k in variants}), len(variants))
+                for kind in ("text", "table", "image"):
+                    self.assertEqual(
+                        len({per_doc_output_key(k, kind, namespace=namespace) for k in variants}),
+                        len(variants),
+                    )
+        self.assertEqual(output_root("folder//sub/a.pdf"), "folder_bdaoutput//sub/")
+        self.assertEqual(doc_output_prefix("folder//sub/a.pdf"), "folder_bdaoutput//sub/bdaoutput/a/")
+        self.assertEqual(rag_output_key("folder//sub/a.pdf"), "RAG_Output/folder//sub/a.json")
+
+    def test_derived_artifact_key_errors_enforces_s3_utf8_key_limit(self):
+        self.assertEqual(derived_artifact_key_errors("NE/sub/a.pdf", namespace="req-1"), [])
+
+        valid_1024_key = ("a/" * 509) + "ab.pdf"
+        self.assertEqual(len(valid_1024_key.encode("utf-8")), MAX_S3_KEY_BYTES)
+        errors = derived_artifact_key_errors(valid_1024_key, namespace="req-1")
+        self.assertTrue(errors)
+        self.assertTrue(any("1024" in err for err in errors))
+
+        # A key shorter than 1,024 UTF-8 bytes whose derived BDA prefix still exceeds 1,024 - headroom.
+        utf8_key = ("é/" * 260) + "doc.pdf"
+        self.assertLess(len(utf8_key.encode("utf-8")), MAX_S3_KEY_BYTES)
+        self.assertGreater(
+            len(doc_output_prefix(utf8_key, namespace="r" * 80).encode("utf-8")),
+            MAX_S3_KEY_BYTES - BDA_INTERNAL_KEY_HEADROOM_BYTES,
+        )
+        self.assertTrue(derived_artifact_key_errors(utf8_key, namespace="r" * 80))
 
 
 class BdaInvokePrefixTests(unittest.TestCase):
@@ -268,16 +314,115 @@ class MergeOutputsToRagOutputTests(unittest.TestCase):
 
 class PreProcessingHandlerTests(unittest.TestCase):
     def test_processes_each_pdf_or_docx_key(self):
-        with patch.object(pre_processing, "process") as process, \
-                patch.object(pre_processing, "merge_outputs_to_rag_output", side_effect=rag_output_key):
+        attempts = iter(["attempt-1", "attempt-2"])
+        cleaned = []
+        with patch.object(pre_processing.Helper, "get_property", return_value="in-bucket"), \
+                patch.object(pre_processing.Helper, "get_s3_object_version", side_effect=["version:v1", "version:v2"]), \
+                patch.object(pre_processing, "_new_attempt_namespace", side_effect=attempts), \
+                patch.object(pre_processing, "_cleanup_attempt_artifacts", side_effect=cleaned.append), \
+                patch.object(pre_processing, "process") as process, \
+                patch.object(
+                    pre_processing,
+                    "merge_outputs_to_rag_output",
+                    side_effect=lambda key, namespace=None, **_kw: rag_output_key(key, namespace=namespace),
+                ) as merge:
             result = pre_processing.handler(_s3_event("NE/a b.pdf", "NE/c.DOCX", "NE/notes.txt"))
 
         self.assertEqual([call.args[0] for call in process.call_args_list], ["NE/a b.pdf", "NE/c.DOCX"])
-        self.assertEqual([call.kwargs for call in process.call_args_list], [{"namespace": None}, {"namespace": None}])
+        self.assertEqual(
+            [call.kwargs for call in process.call_args_list],
+            [{"namespace": "attempt-1"}, {"namespace": "attempt-2"}],
+        )
+        self.assertEqual(
+            merge.call_args_list[0].kwargs,
+            {
+                "namespace": None,
+                "artifact_namespace": "attempt-1",
+                "expected_source_version": "version:v1",
+                "input_bucket": "in-bucket",
+            },
+        )
+        self.assertEqual(cleaned, ["attempt-1", "attempt-2"])
         self.assertEqual(
             result,
             {"status": "completed", "rag_output": ["RAG_Output/NE/a_b.json", "RAG_Output/NE/c.json"]},
         )
+
+    def test_isolates_concurrent_common_notifications_and_skips_stale_publish(self):
+        fake_s3 = MagicMock()
+        fake_s3.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
+        cleaned = []
+
+        def fake_get_property(name, **_kw):
+            return {"input_bucket_name": "in-bucket", "output_bucket": "post-bucket"}[name]
+
+        # Start sees version:v1, but before publishing the source object has moved to version:v2.
+        with patch.object(pre_processing.Helper, "get_property", side_effect=fake_get_property), \
+                patch.object(
+                    pre_processing.Helper,
+                    "get_s3_object_version",
+                    side_effect=["version:v1", "version:v2"],
+                ), \
+                patch.object(pre_processing, "_new_attempt_namespace", return_value="attempt-stale"), \
+                patch.object(pre_processing, "_cleanup_attempt_artifacts", side_effect=cleaned.append), \
+                patch.object(pre_processing, "process") as process, \
+                patch.object(
+                    pre_processing.Helper,
+                    "get_json_from_s3",
+                    return_value=[{"text": "old text", "metadata": {"page": 1}}],
+                ) as get_json, \
+                patch.object(pre_processing, "aws_client", return_value=fake_s3):
+            result = pre_processing.handler(_s3_event("common/shared.pdf"))
+
+        process.assert_called_once_with("common/shared.pdf", namespace="attempt-stale")
+        self.assertTrue(
+            all(call.args[1].startswith("runs/attempt-stale/") for call in get_json.call_args_list)
+        )
+        fake_s3.put_object.assert_not_called()
+        self.assertEqual(cleaned, ["attempt-stale"])
+        self.assertEqual(result, {"status": "skipped", "stale": ["common/shared.pdf"]})
+
+    def test_conditional_publish_aborts_when_conflict_reveals_newer_source_version(self):
+        fake_s3 = MagicMock()
+        fake_s3.head_object.return_value = {"ETag": '"etag-old"'}
+        fake_s3.put_object.side_effect = ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject")
+
+        def fake_get_property(name, **_kw):
+            return {"input_bucket_name": "in-bucket", "output_bucket": "post-bucket"}[name]
+
+        # Pre-write check sees v1, concurrent v2 updates RAG_Output causing 412, post-conflict check sees v2.
+        with patch.object(pre_processing.Helper, "get_property", side_effect=fake_get_property), \
+                patch.object(
+                    pre_processing.Helper,
+                    "get_s3_object_version",
+                    side_effect=["version:v1", "version:v2"],
+                ), \
+                patch.object(
+                    pre_processing.Helper,
+                    "get_json_from_s3",
+                    return_value=[{"text": "v1 chunk", "metadata": {"page": 1}}],
+                ), \
+                patch.object(pre_processing, "aws_client", return_value=fake_s3):
+            published = pre_processing.merge_outputs_to_rag_output(
+                "common/shared.pdf",
+                namespace=None,
+                artifact_namespace="attempt-v1",
+                expected_source_version="version:v1",
+                input_bucket="in-bucket",
+            )
+
+        self.assertIsNone(published)
+        fake_s3.put_object.assert_called_once()
+        self.assertEqual(fake_s3.put_object.call_args.kwargs["IfMatch"], '"etag-old"')
+
+    def test_skips_missing_common_source_before_bda(self):
+        with patch.object(pre_processing.Helper, "get_property", return_value="in-bucket"), \
+                patch.object(pre_processing.Helper, "get_s3_object_version", return_value=None), \
+                patch.object(pre_processing, "process") as process:
+            result = pre_processing.handler(_s3_event("common/deleted.pdf"))
+
+        process.assert_not_called()
+        self.assertEqual(result, {"status": "skipped", "stale": ["common/deleted.pdf"]})
 
     def test_namespaces_manifest_document_items_by_request_key(self):
         event = {
