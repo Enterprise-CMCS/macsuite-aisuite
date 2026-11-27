@@ -10,10 +10,23 @@ import { describe, expect, it, vi } from "vitest";
 import { REVIEW_CONTAINER_NAME } from "../src/constructs/compute-construct";
 import {
   IngestWorkflowConstruct,
+  LAMBDA_THROTTLE_RETRY_INTERVAL,
+  LAMBDA_THROTTLE_RETRY_MAX_ATTEMPTS,
+  LAMBDA_THROTTLE_RETRY_MAX_DELAY,
   TERMINAL_EXECUTION_STATUSES,
   TERMINAL_NOTIFICATION_HANDLER,
 } from "../src/constructs/ingest-workflow-construct";
+import { INGEST_TIMEOUT } from "../src/constructs/pre-processing-lambda-construct";
 import { getDeploymentConfig } from "../src/deployment-config";
+
+interface RetryJson {
+  BackoffRate?: number;
+  ErrorEquals: string[];
+  IntervalSeconds?: number;
+  JitterStrategy?: string;
+  MaxAttempts?: number;
+  MaxDelaySeconds?: number;
+}
 
 interface StateJson {
   Catch?: Array<{
@@ -24,12 +37,13 @@ interface StateJson {
   Choices?: Array<{ Next: string }>;
   Default?: string;
   End?: boolean;
-  ItemProcessor?: { StartAt: string };
+  ItemProcessor?: { StartAt: string; States?: Record<string, StateJson> };
   ItemSelector?: Record<string, unknown>;
   MaxConcurrency?: number;
   Next?: string;
   Output?: Record<string, unknown>;
   Resource?: string;
+  Retry?: RetryJson[];
   Type: string;
 }
 
@@ -141,6 +155,47 @@ describe("IngestWorkflowConstruct", () => {
       `Containers[Name = '${REVIEW_CONTAINER_NAME}'].ExitCode`,
     );
     expect(states.ReviewRequirements?.Next).toBe("ReviewSucceeded");
+  });
+
+  it("retries Lambda throttling long enough to outlast competing 900-second manifest runs under FULL jitter", () => {
+    const lambdaStates: Array<[string, StateJson | undefined]> = [
+      [
+        "PreProcessDocument",
+        states.PreProcessDocuments?.ItemProcessor?.States?.PreProcessDocument,
+      ],
+      ["CreateEmbeddingsTable", states.CreateEmbeddingsTable],
+      [
+        "EmbedDocument",
+        states.EmbedDocuments?.ItemProcessor?.States?.EmbedDocument,
+      ],
+    ];
+
+    for (const [name, state] of lambdaStates) {
+      const throttleRetry = state?.Retry?.find((rule) =>
+        rule.ErrorEquals.includes("Lambda.TooManyRequestsException"),
+      );
+      expect(throttleRetry, `${name} throttling retry`).toEqual({
+        BackoffRate: 2,
+        ErrorEquals: ["Lambda.TooManyRequestsException"],
+        IntervalSeconds: LAMBDA_THROTTLE_RETRY_INTERVAL.toSeconds(),
+        JitterStrategy: "FULL",
+        MaxAttempts: LAMBDA_THROTTLE_RETRY_MAX_ATTEMPTS,
+        MaxDelaySeconds: LAMBDA_THROTTLE_RETRY_MAX_DELAY.toSeconds(),
+      });
+
+      const interval = throttleRetry!.IntervalSeconds!;
+      const backoff = throttleRetry!.BackoffRate!;
+      const maxDelay = throttleRetry!.MaxDelaySeconds!;
+      const maxAttempts = throttleRetry!.MaxAttempts!;
+      let unjitteredTotal = 0;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        unjitteredTotal += Math.min(interval * backoff ** attempt, maxDelay);
+      }
+      // FULL jitter halves expected wait; ensure even the expected wait comfortably exceeds
+      // multiple full 900-second Lambda executions from competing manifests.
+      const expectedWaitSeconds = unjitteredTotal / 2;
+      expect(expectedWaitSeconds).toBeGreaterThan(INGEST_TIMEOUT.toSeconds() * 4);
+    }
   });
 
   it("notifies MuleSoft only when the review task exits cleanly", () => {

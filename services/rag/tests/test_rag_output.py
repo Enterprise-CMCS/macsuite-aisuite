@@ -424,6 +424,37 @@ class PreProcessingHandlerTests(unittest.TestCase):
         process.assert_not_called()
         self.assertEqual(result, {"status": "skipped", "stale": ["common/deleted.pdf"]})
 
+    def test_cleanup_deletes_object_versions_and_markers_under_attempt_prefix(self):
+        fake_bucket = MagicMock()
+        fake_filtered = fake_bucket.object_versions.filter.return_value
+        fake_filtered.delete.return_value = [{"Deleted": [{"Key": "runs/attempt-1/a", "VersionId": "v1"}]}]
+        fake_resource = MagicMock()
+        fake_resource.Bucket.return_value = fake_bucket
+        fake_session = MagicMock()
+        fake_session.resource.return_value = fake_resource
+
+        with patch.object(pre_processing.Helper, "get_property", return_value="post-bucket"), \
+                patch.object(pre_processing, "aws_session", return_value=fake_session):
+            pre_processing._cleanup_attempt_artifacts("attempt-1")
+
+        fake_resource.Bucket.assert_called_once_with("post-bucket")
+        fake_bucket.object_versions.filter.assert_called_once_with(Prefix="runs/attempt-1/")
+        fake_filtered.delete.assert_called_once_with()
+        fake_bucket.objects.filter.assert_not_called()
+
+    def test_delete_bucket_file_recursively_raises_on_partial_version_delete_errors(self):
+        fake_bucket = MagicMock()
+        fake_bucket.object_versions.filter.return_value.delete.return_value = [
+            {"Errors": [{"Key": "runs/attempt-1/a", "VersionId": "v1", "Code": "AccessDenied"}]}
+        ]
+        fake_resource = MagicMock()
+        fake_resource.Bucket.return_value = fake_bucket
+
+        with self.assertRaises(RuntimeError):
+            pre_processing.Helper.delete_bucket_file_recursively(
+                fake_resource, "post-bucket", "runs/attempt-1/"
+            )
+
     def test_namespaces_manifest_document_items_by_request_key(self):
         event = {
             "documentId": "DOC-001",

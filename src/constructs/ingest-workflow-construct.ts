@@ -100,6 +100,13 @@ exports.handler = async (event) => {
 const WORKFLOW_TIMEOUT = cdk.Duration.hours(24);
 const REVIEW_TASK_TIMEOUT = cdk.Duration.hours(20);
 
+// Both ingest Lambdas have 5 reserved slots and a 15-minute (900s) timeout, while Map
+// concurrency is per execution. A long FULL-jitter backoff window lets a second manifest
+// wait out competing runs (expected wait ~86 min, max ~172 min) instead of failing on throttling.
+export const LAMBDA_THROTTLE_RETRY_INTERVAL = cdk.Duration.seconds(15);
+export const LAMBDA_THROTTLE_RETRY_MAX_DELAY = cdk.Duration.minutes(3);
+export const LAMBDA_THROTTLE_RETRY_MAX_ATTEMPTS = 60;
+
 
 const RUN_INPUT = "$states.context.Execution.Input";
 const REQUEST_KEY = `${RUN_INPUT}.requestKey`;
@@ -498,10 +505,10 @@ export class IngestWorkflowConstruct extends Construct {
     step.addRetry({
       backoffRate: 2,
       errors: ["Lambda.TooManyRequestsException"],
-      interval: cdk.Duration.seconds(5),
+      interval: LAMBDA_THROTTLE_RETRY_INTERVAL,
       jitterStrategy: sfn.JitterType.FULL,
-      maxAttempts: 8,
-      maxDelay: cdk.Duration.minutes(2),
+      maxAttempts: LAMBDA_THROTTLE_RETRY_MAX_ATTEMPTS,
+      maxDelay: LAMBDA_THROTTLE_RETRY_MAX_DELAY,
     });
     // Transient BDA, Bedrock and database errors; every Lambda action is safe to repeat.
     step.addRetry({

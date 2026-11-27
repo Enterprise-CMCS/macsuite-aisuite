@@ -203,15 +203,26 @@ class Helper:
     def delete_bucket_file_recursively(s3_resource, bucket_name, p_prefix=""):
         buckets3_resource = s3_resource.Bucket(bucket_name)
         if p_prefix == "":
-            # Delete all objects (including versions if versioning is enabled)
-            buckets3_resource.objects.delete()
-            buckets3_resource.object_versions.delete()
-            # Now delete the bucket itself
-            #bucket.delete()
-            log.info(f"All contents from Bucket '{bucket_name}' have been deleted.")
+            # Delete all object versions and delete markers (also removes current objects).
+            responses = buckets3_resource.object_versions.delete()
+            target = f"Bucket '{bucket_name}'"
         else:
-            buckets3_resource.objects.filter(Prefix=p_prefix).delete()
-            log.info(f"All contents from Bucket '{bucket_name}' and folder {p_prefix} have been deleted.")
+            # Delete every object version and delete marker under the prefix so versioned buckets reclaim storage.
+            responses = buckets3_resource.object_versions.filter(Prefix=p_prefix).delete()
+            target = f"Bucket '{bucket_name}' and folder {p_prefix}"
+
+        if isinstance(responses, list):
+            errors = [
+                err
+                for resp in responses
+                if isinstance(resp, dict)
+                for err in resp.get("Errors", ())
+            ]
+            if errors:
+                raise RuntimeError(
+                    f"Failed to delete {len(errors)} object version(s) in {target}: {errors[:5]}"
+                )
+        log.info(f"All contents from {target} have been deleted.")
 
     @staticmethod
     def check_if_s3_folder_exists(s3_client, bucket_name: str, folder_path: str):
