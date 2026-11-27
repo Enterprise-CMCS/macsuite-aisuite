@@ -1,4 +1,4 @@
-from common.utils.settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+from common.utils.db_settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
 import asyncio
 import asyncpg
 

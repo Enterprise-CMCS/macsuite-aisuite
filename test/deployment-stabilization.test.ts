@@ -14,7 +14,6 @@ import {
 
 const ACTIVATE_API_CONTEXT_KEY = "aisuite:activateApi";
 const API_IMAGE_TAG_CONTEXT_KEY = "aisuite:apiImageTag";
-const BATCH_IMAGE_TAG_CONTEXT_KEY = "aisuite:batchImageTag";
 const IMMUTABLE_IMAGE_TAG = "0123456789abcdef0123456789abcdef01234567";
 
 interface CloudFormationResource {
@@ -108,13 +107,13 @@ describe("two-phase API activation", () => {
 });
 
 describe("immutable x86-64 task images", () => {
-  it("sets Linux x86-64 on the API and both batch task definitions", () => {
+  it("sets Linux x86-64 on the API, requirement review, and bootstrap task definitions", () => {
     const template = synthesize("dev");
 
     for (const family of [
       "aisuite-dev-rag-api",
-      "aisuite-dev-pre-processing",
-      "aisuite-dev-rag-process",
+      "aisuite-dev-requirement-review",
+      "aisuite-dev-rag-db-bootstrap",
     ]) {
       expect(taskDefinitionByFamily(template, family).Properties).toEqual(
         expect.objectContaining({
@@ -127,16 +126,15 @@ describe("immutable x86-64 task images", () => {
     }
   });
 
-  it("uses the immutable API and batch image-tag contexts", () => {
+  it("uses the immutable API image-tag context across ECS task definitions", () => {
     const template = synthesize("dev", {
       [API_IMAGE_TAG_CONTEXT_KEY]: IMMUTABLE_IMAGE_TAG,
-      [BATCH_IMAGE_TAG_CONTEXT_KEY]: IMMUTABLE_IMAGE_TAG,
     });
 
     for (const family of [
       "aisuite-dev-rag-api",
-      "aisuite-dev-pre-processing",
-      "aisuite-dev-rag-process",
+      "aisuite-dev-requirement-review",
+      "aisuite-dev-rag-db-bootstrap",
     ]) {
       const [container] = containersOf(taskDefinitionByFamily(template, family));
       expect(JSON.stringify(container?.Image)).toContain(IMMUTABLE_IMAGE_TAG);
@@ -146,7 +144,7 @@ describe("immutable x86-64 task images", () => {
 });
 
 describe("environment-appropriate ECR removal", () => {
-  it("destroys and empties both dev repositories on stack deletion", () => {
+  it("destroys and empties the dev repository on stack deletion", () => {
     const resources = Object.values(
       synthesize("dev").toJSON().Resources as Record<
         string,
@@ -154,7 +152,7 @@ describe("environment-appropriate ECR removal", () => {
       >,
     ).filter((resource) => resource.Type === "AWS::ECR::Repository");
 
-    expect(resources).toHaveLength(2);
+    expect(resources).toHaveLength(1);
     for (const resource of resources) {
       expect(resource.DeletionPolicy).toBe("Delete");
       expect(resource.UpdateReplacePolicy).toBe("Delete");
@@ -163,7 +161,7 @@ describe("environment-appropriate ECR removal", () => {
   });
 
   it.each(["qa", "uat", "prod"] as const)(
-    "retains and does not empty both %s repositories",
+    "retains and does not empty the %s repository",
     (environmentName) => {
       const resources = Object.values(
         synthesize(environmentName).toJSON().Resources as Record<
@@ -172,7 +170,7 @@ describe("environment-appropriate ECR removal", () => {
         >,
       ).filter((resource) => resource.Type === "AWS::ECR::Repository");
 
-      expect(resources).toHaveLength(2);
+      expect(resources).toHaveLength(1);
       for (const resource of resources) {
         expect(resource.DeletionPolicy).toBe("Retain");
         expect(resource.UpdateReplacePolicy).toBe("Retain");
@@ -340,22 +338,16 @@ describe("deployment workflow contract", () => {
     expect(positions).toEqual([...positions].sort((left, right) => left - right));
   });
 
-  it("builds and pushes API and batch SHA images for linux/amd64", () => {
+  it("builds and pushes API SHA image for linux/amd64", () => {
     expect(workflow).toContain("--platform linux/amd64");
     expect(workflow).toContain("--push");
     expect(workflow).toMatch(
       /\$\{\{\s*github\.sha\s*\}\}|\$\{GITHUB_SHA\}|\$GITHUB_SHA/,
     );
     expect(workflow).toContain("ApiEcrRepositoryUri");
-    expect(workflow).toContain("BatchEcrRepositoryUri");
     expect(workflow).toMatch(
       new RegExp(
         `--context ${API_IMAGE_TAG_CONTEXT_KEY.replace(":", "\\:")}=(?:\\$\\{\\{\\s*github\\.sha\\s*\\}\\}|\\$\\{GITHUB_SHA\\}|\\$GITHUB_SHA)`,
-      ),
-    );
-    expect(workflow).toMatch(
-      new RegExp(
-        `--context ${BATCH_IMAGE_TAG_CONTEXT_KEY.replace(":", "\\:")}=(?:\\$\\{\\{\\s*github\\.sha\\s*\\}\\}|\\$\\{GITHUB_SHA\\}|\\$GITHUB_SHA)`,
       ),
     );
   });
@@ -377,5 +369,16 @@ describe("deployment workflow contract", () => {
   it("prints bootstrap CloudWatch logs on task failure", () => {
     expect(workflow).toContain("aws logs get-log-events");
     expect(workflow).toContain("bootstrap/Container/");
+  });
+
+  it("registers QEMU ARM64 emulation before CDK deployment", () => {
+    const qemuSetupPos = workflow.indexOf("docker/setup-qemu-action@");
+    const firstDeployPos = workflow.indexOf("pnpm run cdk:deploy");
+
+    expect(qemuSetupPos).toBeGreaterThanOrEqual(0);
+    expect(firstDeployPos).toBeGreaterThan(qemuSetupPos);
+    expect(workflow.slice(qemuSetupPos, firstDeployPos)).toMatch(
+      /platforms:\s*(?:arm64|linux\/arm64|all)\b/,
+    );
   });
 });

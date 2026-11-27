@@ -14,13 +14,14 @@ class Helper:
         "input_bucket_name": ("DOCUMENTS_BUCKET",),
         "output_bucket": ("POST_PROCESSING_BUCKET",),
         "RagSplitOutPutBucket": ("POST_PROCESSING_BUCKET",),
-        "code_bucket_name": ("PIPELINE_CODE_BUCKET",),
         "temp_bucket_name": ("PIPELINE_TEMP_BUCKET",),
         "vector-db-admin-secret": ("DB_SECRET_ARN", "DB_SECRET_NAME"),
         "foundation_llm_model_id": ("BEDROCK_MODEL_ID",),
         "model_id_bedrock_profile_embed": ("BEDROCK_EMBED_MODEL_ID",),
         "model_id_bedrock_embeddings": ("BEDROCK_EMBED_MODEL_ID",),
         "embeddings_table_name": ("EMBEDDINGS_TABLE_NAME",),
+        "common_input_prefix": ("COMMON_INPUT_PREFIX",),
+        "common_embeddings_table_name": ("COMMON_EMBEDDINGS_TABLE_NAME",),
     }
 
     @staticmethod
@@ -72,6 +73,22 @@ class Helper:
             default=default,
         )
         return Helper.validate_embeddings_table_name(name.strip())
+
+    @staticmethod
+    def get_common_embeddings_table_name(config_file='aws.properties.ini'):
+        env_value = Helper.get_env_property("common_embeddings_table_name")
+        if env_value:
+            return contract_cfg.validate_embeddings_table_name(env_value)
+        config = Helper.load_config(config_file)
+        return contract_cfg.common_embeddings_table_name(config)
+
+    @staticmethod
+    def get_common_input_prefix(config_file='aws.properties.ini'):
+        env_value = Helper.get_env_property("common_input_prefix")
+        if env_value:
+            return contract_cfg.normalize_s3_prefix(env_value)
+        config = Helper.load_config(config_file)
+        return contract_cfg.common_input_prefix(config)
 
     @staticmethod
     def get_property(str_property_name, config_file='aws.properties.ini', default=_RAISE_IF_MISSING):
@@ -155,17 +172,17 @@ class Helper:
             str_summary_folder += '/'
 
         if str_file_name == "TEXT":
-            str_summary_file = os.path.join(str_summary_folder, "Text_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Text_SummaryFile.log"
         elif str_file_name == "TABLE":
-            str_summary_file = os.path.join(str_summary_folder, "Table_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Table_SummaryFile.log"
         elif str_file_name == "IMAGE":
-            str_summary_file = os.path.join(str_summary_folder, "Image_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Image_SummaryFile.log"
         elif str_file_name == "EXCELTABLE":
-            str_summary_file = os.path.join(str_summary_folder, "ExcelTable_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}ExcelTable_SummaryFile.log"
         elif str_file_name == "BEDROCK":
-            str_summary_file = os.path.join(str_summary_folder, "Bedrock_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Bedrock_SummaryFile.log"
         else:
-            str_summary_file = os.path.join(str_summary_folder, "Unknown_SummaryFile.log")
+            str_summary_file = f"{str_summary_folder}Unknown_SummaryFile.log"
         s3_client = aws_client('s3')
 
         try:
@@ -186,15 +203,26 @@ class Helper:
     def delete_bucket_file_recursively(s3_resource, bucket_name, p_prefix=""):
         buckets3_resource = s3_resource.Bucket(bucket_name)
         if p_prefix == "":
-            # Delete all objects (including versions if versioning is enabled)
-            buckets3_resource.objects.delete()
-            buckets3_resource.object_versions.delete()
-            # Now delete the bucket itself
-            #bucket.delete()
-            log.info(f"All contents from Bucket '{bucket_name}' have been deleted.")
+            # Delete all object versions and delete markers (also removes current objects).
+            responses = buckets3_resource.object_versions.delete()
+            target = f"Bucket '{bucket_name}'"
         else:
-            buckets3_resource.objects.filter(Prefix=p_prefix).delete()
-            log.info(f"All contents from Bucket '{bucket_name}' and folder {p_prefix} have been deleted.")
+            # Delete every object version and delete marker under the prefix so versioned buckets reclaim storage.
+            responses = buckets3_resource.object_versions.filter(Prefix=p_prefix).delete()
+            target = f"Bucket '{bucket_name}' and folder {p_prefix}"
+
+        if isinstance(responses, list):
+            errors = [
+                err
+                for resp in responses
+                if isinstance(resp, dict)
+                for err in resp.get("Errors", ())
+            ]
+            if errors:
+                raise RuntimeError(
+                    f"Failed to delete {len(errors)} object version(s) in {target}: {errors[:5]}"
+                )
+        log.info(f"All contents from {target} have been deleted.")
 
     @staticmethod
     def check_if_s3_folder_exists(s3_client, bucket_name: str, folder_path: str):
@@ -253,6 +281,37 @@ class Helper:
             return json_data
         except Exception as lclEx:
             Helper.print_exception("getJsonFromS3()", lclEx, f" Exception occurred while reading data form S3 bucket{bucket_name} for file {file_key}.")
+            raise lclEx
+
+    @staticmethod
+    def get_json_with_version_from_s3(bucket_name, file_key):
+        from common.utils.aws_files_access import read_s3_json_with_version
+        from common.utils.settings import aws_client
+        log.debug(f"get_json_with_version_from_s3() Getting data and version for bucket {bucket_name} and file {file_key}")
+        s3_client = aws_client('s3')
+        try:
+            return read_s3_json_with_version(s3_client, bucket_name, file_key)
+        except Exception as lclEx:
+            Helper.print_exception(
+                "get_json_with_version_from_s3()",
+                lclEx,
+                f" Exception occurred while reading data from S3 bucket {bucket_name} for file {file_key}.",
+            )
+            raise lclEx
+
+    @staticmethod
+    def get_s3_object_version(bucket_name, file_key):
+        from common.utils.aws_files_access import head_s3_object_version
+        from common.utils.settings import aws_client
+        s3_client = aws_client('s3')
+        try:
+            return head_s3_object_version(s3_client, bucket_name, file_key)
+        except Exception as lclEx:
+            Helper.print_exception(
+                "get_s3_object_version()",
+                lclEx,
+                f" Exception occurred while checking S3 version in bucket {bucket_name} for file {file_key}.",
+            )
             raise lclEx
 
     @staticmethod

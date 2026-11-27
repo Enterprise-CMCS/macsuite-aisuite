@@ -12,11 +12,18 @@ import { APPLICATION_NAME, type DeploymentConfig } from "../deployment-config";
 
 export const API_STAGE_NAME = "v1";
 
+/** Exact API Gateway stage-prefixed path exempt from WAF's 8 KiB body-size rule. */
+export const MANIFEST_UPLOAD_PATH = `/${API_STAGE_NAME}/manifest`;
+
 /** Requests per 5 minutes per source IP before WAF blocks. */
 export const WAF_RATE_LIMIT_PER_IP = 2000;
 
-const AWS_MANAGED_RULE_GROUPS = [
-  "AWSManagedRulesCommonRuleSet",
+const WAF_COMMON_RULE_SET = "AWSManagedRulesCommonRuleSet";
+const WAF_BODY_SIZE_RULE_NAME = "SizeRestrictions_BODY";
+const WAF_BODY_SIZE_LABEL =
+  "awswaf:managed:aws:core-rule-set:SizeRestrictions_Body";
+
+const ADDITIONAL_AWS_MANAGED_RULE_GROUPS = [
   "AWSManagedRulesKnownBadInputsRuleSet",
   "AWSManagedRulesAmazonIpReputationList",
 ] as const;
@@ -192,10 +199,78 @@ export class ApiGatewayConstruct extends Construct {
           },
           visibilityConfig: visibility("RateLimitPerIp"),
         },
-        ...AWS_MANAGED_RULE_GROUPS.map((ruleName, index) => ({
+        {
+          name: WAF_COMMON_RULE_SET,
+          overrideAction: { none: {} },
+          priority: 1,
+          statement: {
+            managedRuleGroupStatement: {
+              name: WAF_COMMON_RULE_SET,
+              // Count SizeRestrictions_BODY so the scoped rule below can exempt
+              // POST /v1/manifest while keeping all other CRS protections active.
+              ruleActionOverrides: [
+                {
+                  actionToUse: { count: {} },
+                  name: WAF_BODY_SIZE_RULE_NAME,
+                },
+              ],
+              vendorName: "AWS",
+            },
+          },
+          visibilityConfig: visibility(WAF_COMMON_RULE_SET),
+        },
+        {
+          action: { block: {} },
+          name: "EnforceBodySizeOutsideManifestUpload",
+          priority: 2,
+          statement: {
+            andStatement: {
+              statements: [
+                {
+                  labelMatchStatement: {
+                    key: WAF_BODY_SIZE_LABEL,
+                    scope: "LABEL",
+                  },
+                },
+                {
+                  notStatement: {
+                    statement: {
+                      andStatement: {
+                        statements: [
+                          {
+                            byteMatchStatement: {
+                              fieldToMatch: { method: {} },
+                              positionalConstraint: "EXACTLY",
+                              searchString: "POST",
+                              textTransformations: [
+                                { priority: 0, type: "NONE" },
+                              ],
+                            },
+                          },
+                          {
+                            byteMatchStatement: {
+                              fieldToMatch: { uriPath: {} },
+                              positionalConstraint: "EXACTLY",
+                              searchString: MANIFEST_UPLOAD_PATH,
+                              textTransformations: [
+                                { priority: 0, type: "NONE" },
+                              ],
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              ],
+            },
+          },
+          visibilityConfig: visibility("EnforceBodySizeOutsideManifestUpload"),
+        },
+        ...ADDITIONAL_AWS_MANAGED_RULE_GROUPS.map((ruleName, index) => ({
           name: ruleName,
           overrideAction: { none: {} },
-          priority: index + 1,
+          priority: index + 3,
           statement: {
             managedRuleGroupStatement: {
               name: ruleName,

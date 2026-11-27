@@ -4,6 +4,7 @@ import {
   AWS_ACCOUNT_IDS,
   DEFAULT_REGION,
   DEPLOYMENT_ENVIRONMENT_ALB_CERTIFICATE_ARN,
+  DEPLOYMENT_ENVIRONMENT_MANIFEST_NOTIFICATION_QUEUE,
   DEPLOYMENT_ENVIRONMENT_NAMES,
   DEPLOYMENT_ENVIRONMENT_VPC_NAME,
   DEPLOYMENT_ENVIRONMENT_VPN_SECURITY_GROUP_ID,
@@ -102,6 +103,19 @@ describe("deployment config", () => {
         certificateArn,
       );
     }
+  });
+
+  it("maps dev to the externally provisioned MuleSoft notification queue and KMS key", () => {
+    expect(DEPLOYMENT_ENVIRONMENT_MANIFEST_NOTIFICATION_QUEUE.dev).toEqual({
+      deadLetterQueueName: "macsuite-aisuite-dev-mulesoft-sqs-dlq",
+      kmsKeyArn:
+        "arn:aws:kms:us-east-1:205501819586:key/626ce0e6-6103-4699-a587-534db33232e2",
+      queueName: "macsuite-aisuite-dev-mulesoft-sqs-queue",
+    });
+    expect(getDeploymentConfig("dev").manifestNotificationQueue).toEqual(
+      DEPLOYMENT_ENVIRONMENT_MANIFEST_NOTIFICATION_QUEUE.dev,
+    );
+    expect(getDeploymentConfig("qa").manifestNotificationQueue).toBeUndefined();
   });
 
   it("names the central access-logs bucket per account and region", () => {

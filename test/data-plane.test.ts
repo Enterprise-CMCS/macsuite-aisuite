@@ -25,12 +25,13 @@ const EXPECTED_OUTPUTS = [
   "ApiClusterName",
   "ApiServiceName",
   "ApiEcrRepositoryUri",
-  "BatchClusterName",
-  "PreProcessingTaskDefinitionArn",
-  "PreProcessingTaskDefinitionFamily",
-  "RagProcessTaskDefinitionArn",
-  "RagProcessTaskDefinitionFamily",
-  "BatchEcrRepositoryUri",
+  "PreProcessingFunctionName",
+  "EmbeddingsFunctionName",
+  "IngestStateMachineArn",
+  "RequirementReviewTaskDefinitionArn",
+  "ManifestNotificationQueueUrl",
+  "ManifestNotificationQueueArn",
+  "ManifestNotificationDeadLetterQueueUrl",
 ] as const;
 
 const DATA_RESOURCES = new Set([
@@ -178,35 +179,17 @@ describe.each(DEPLOYMENT_ENVIRONMENT_NAMES)(
 
       expect(bySid.RagAppDatabaseCredentials).toBeDefined();
       expect(bySid.RagDatabaseCredentials).toBeUndefined();
-      expect(bySid.DocumentsBucketList?.Action).toBe("s3:ListBucket");
-      expect(bySid.DocumentsBucketRead?.Action).toBe("s3:GetObject");
-      expect(bySid.PostProcessingBucketList?.Action).toBe("s3:ListBucket");
-      expect(bySid.PostProcessingBucketAccess?.Action).toEqual(
-        expect.arrayContaining([
-          "s3:DeleteObject",
-          "s3:GetObject",
-          "s3:PutObject",
-        ]),
-      );
-      expect(bySid.PipelineTempBucketList?.Action).toBe("s3:ListBucket");
-      expect(bySid.PipelineTempBucketAccess?.Action).toEqual(
-        expect.arrayContaining(["s3:GetObject", "s3:PutObject"]),
-      );
-      expect(bySid.PipelineTempBucketAccess?.Action).not.toEqual(
-        expect.arrayContaining(["s3:DeleteObject"]),
-      );
 
       const serialized = JSON.stringify(statements);
       expect(serialized).not.toContain("llm-pipeline-code");
       expect(serialized).not.toContain("foundation-model/*");
       expect(serialized).not.toContain("inference-profile/*");
-      expect(serialized).toContain("amazon.nova-pro-v1:0");
+      expect(serialized).toContain("amazon.nova-2-lite-v1:0");
       expect(serialized).toContain("cohere.embed-v4:0");
-      expect(serialized).toContain("us.amazon.nova-pro-v1:0");
+      expect(serialized).toContain("us.amazon.nova-2-lite-v1:0");
       expect(serialized).toContain("us.cohere.embed-v4:0");
       expect(serialized).toContain("cohere.rerank-v3-5:0");
       expect(bySid.BedrockRerank?.Action).toEqual("bedrock:Rerank");
-      expect(bySid.BedrockDataAutomationRuntime).toBeDefined();
     });
 
     it("preserves the stack output contract", () => {

@@ -53,4 +53,85 @@ describe("api gateway + waf", () => {
     template.hasResourceProperties("AWS::WAFv2::WebACL", { Scope: "REGIONAL" });
     template.resourceCountIs("AWS::WAFv2::WebACLAssociation", 1);
   });
+
+  it("exempts only POST /v1/manifest from SizeRestrictions_BODY while keeping all other WAF rules active", () => {
+    template.hasResourceProperties("AWS::WAFv2::WebACL", {
+      Rules: Match.arrayWith([
+        Match.objectLike({
+          Name: "AWSManagedRulesCommonRuleSet",
+          OverrideAction: { None: {} },
+          Priority: 1,
+          Statement: {
+            ManagedRuleGroupStatement: {
+              Name: "AWSManagedRulesCommonRuleSet",
+              RuleActionOverrides: [
+                {
+                  ActionToUse: { Count: {} },
+                  Name: "SizeRestrictions_BODY",
+                },
+              ],
+              VendorName: "AWS",
+            },
+          },
+        }),
+        Match.objectLike({
+          Action: { Block: {} },
+          Name: "EnforceBodySizeOutsideManifestUpload",
+          Priority: 2,
+          Statement: {
+            AndStatement: {
+              Statements: [
+                {
+                  LabelMatchStatement: {
+                    Key: "awswaf:managed:aws:core-rule-set:SizeRestrictions_Body",
+                    Scope: "LABEL",
+                  },
+                },
+                {
+                  NotStatement: {
+                    Statement: {
+                      AndStatement: {
+                        Statements: [
+                          {
+                            ByteMatchStatement: {
+                              FieldToMatch: { Method: {} },
+                              PositionalConstraint: "EXACTLY",
+                              SearchString: "POST",
+                              TextTransformations: [
+                                { Priority: 0, Type: "NONE" },
+                              ],
+                            },
+                          },
+                          {
+                            ByteMatchStatement: {
+                              FieldToMatch: { UriPath: {} },
+                              PositionalConstraint: "EXACTLY",
+                              SearchString: "/v1/manifest",
+                              TextTransformations: [
+                                { Priority: 0, Type: "NONE" },
+                              ],
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        }),
+        Match.objectLike({
+          Name: "AWSManagedRulesKnownBadInputsRuleSet",
+          OverrideAction: { None: {} },
+          Priority: 3,
+        }),
+        Match.objectLike({
+          Name: "AWSManagedRulesAmazonIpReputationList",
+          OverrideAction: { None: {} },
+          Priority: 4,
+        }),
+      ]),
+    });
+  });
 });

@@ -87,6 +87,11 @@ jobs:
       - name: Review CDK diff
         run: pnpm run cdk:diff --context environment=${DEPLOYMENT_ENV}
 
+      - name: Set up QEMU for ARM64 Lambda assets
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
       - name: Deploy infrastructure phase only (desired count 0)
         #if: env.DEPLOYMENT_ENV == 'dev'
         run: |
@@ -95,8 +100,7 @@ jobs:
           pnpm run cdk:deploy \
             --context environment=${DEPLOYMENT_ENV} \
             --context aisuite:activateApi=false \
-            --context aisuite:apiImageTag=${{ github.sha }} \
-            --context aisuite:batchImageTag=${{ github.sha }}
+            --context aisuite:apiImageTag=${{ github.sha }}
 
           STACK_NAME="aisuite-${DEPLOYMENT_ENV}-infrastructure"
           STACK_OUTPUTS="$(aws cloudformation describe-stacks \
@@ -116,7 +120,6 @@ jobs:
 
           {
             echo "API_REPOSITORY_URI=$(output_value ApiEcrRepositoryUri)"
-            echo "BATCH_REPOSITORY_URI=$(output_value BatchEcrRepositoryUri)"
             echo "BOOTSTRAP_CLUSTER_NAME=$(output_value BootstrapClusterName)"
             echo "BOOTSTRAP_TASK_DEFINITION_ARN=$(output_value BootstrapTaskDefinitionArn)"
             echo "BOOTSTRAP_SECURITY_GROUP_ID=$(output_value BootstrapSecurityGroupId)"
@@ -131,7 +134,6 @@ jobs:
           set -euo pipefail
 
           ECR_REGISTRY="${API_REPOSITORY_URI%%/*}"
-          test "${BATCH_REPOSITORY_URI%%/*}" = "${ECR_REGISTRY}"
           aws ecr get-login-password \
             | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
 
@@ -153,39 +155,6 @@ jobs:
 
           # Verify image appears in ECR; wait until available or fail
           REPO_NAME="${API_REPOSITORY_URI##*/}"
-          IMAGE_TAG="${{ github.sha }}"
-          MAX_ATTEMPTS=30
-          SLEEP_SECONDS=10
-          attempt=1
-          while ! aws ecr describe-images --repository-name "${REPO_NAME}" --image-ids imageTag="${IMAGE_TAG}" >/dev/null 2>&1; do
-            if [ "${attempt}" -ge "${MAX_ATTEMPTS}" ]; then
-              echo "ERROR: image ${REPO_NAME}:${IMAGE_TAG} not found in ECR after $((MAX_ATTEMPTS*SLEEP_SECONDS))s"
-              exit 1
-            fi
-            echo "Image not yet in ECR, waiting ${SLEEP_SECONDS}s (attempt ${attempt}/${MAX_ATTEMPTS})"
-            sleep "${SLEEP_SECONDS}"
-            attempt=$((attempt+1))
-          done
-          echo "Image ${REPO_NAME}:${IMAGE_TAG} exists in ECR."
-
-      - name: Build and push batch image (linux/amd64)
-        #if: env.DEPLOYMENT_ENV == 'dev'
-        run: |
-          set -euo pipefail
-
-          IMAGE="${BATCH_REPOSITORY_URI}:${{ github.sha }}"
-          docker buildx build \
-            --platform linux/amd64 \
-            --provenance=false \
-            --tag "${IMAGE}" \
-            --push \
-            services/rag
-          docker buildx imagetools inspect "${IMAGE}" \
-            --format '{{json .Image}}' \
-            | jq -e '.os == "linux" and .architecture == "amd64"'
-
-          # Verify image appears in ECR; wait until available or fail
-          REPO_NAME="${BATCH_REPOSITORY_URI##*/}"
           IMAGE_TAG="${{ github.sha }}"
           MAX_ATTEMPTS=30
           SLEEP_SECONDS=10

@@ -6,10 +6,11 @@ Application code for the CMCS Agentic RAG pipeline (Phase 2 packaging).
 
 ### Cloud layout
 
-Each environment deploys an internal ALB and ECS Fargate RAG API, on-demand ECS
-batch tasks (pre-processing, RAG process, DB bootstrap), and private RDS
-Postgres with pgvector. S3, Secrets Manager, ECR, and Bedrock sit outside the
-VPC but in the same account/region.
+Each environment deploys an internal ALB and ECS Fargate RAG API, a Step
+Functions manifest workflow (pre-processing and embeddings Lambdas plus a
+Fargate requirement review task), an SQS queue that notifies MuleSoft, and
+private RDS Postgres with pgvector. S3, Secrets Manager, ECR, SQS, Step
+Functions, and Bedrock sit outside the VPC but in the same account/region.
 
 ![AISuite Phase 2 architecture](../../docs/aisuite-phase2-architecture.drawio.png)
 
@@ -23,28 +24,37 @@ See also the [repo root README](../../README.md#architecture).
 
 ```mermaid
 flowchart LR
-  docsS3[Documents_S3] --> preProcess[pre_processing]
+  mule[MuleSoft] -->|POST /manifest| api[RAG_API]
+  api --> sfn[Step_Functions]
+  sfn --> preProcess[pre_processing]
   preProcess --> bda[Bedrock_BDA]
   bda --> postS3[PostProcessing_S3]
   postS3 --> ragProcess[rag_process]
   ragProcess --> embed[Bedrock_embeddings]
   embed --> pgvector[RDS_pgvector]
-  pgvector --> api[RAG_API_agent]
-  pgvector --> crt[CRT_workbook_review]
-  api --> llm[Bedrock_LLM]
-  crt --> llm
+  pgvector --> review[requirement_review]
+  review --> resultsS3[Temp_S3_results]
+  sfn --> sqs[SQS_notification]
+  sqs --> mule
+  resultsS3 -->|GET results| api
+  review --> llm[Bedrock_LLM]
 ```
 
-1. **Pre-processing** lists source docs under the active contract’s S3 prefix,
-   runs Bedrock Data Automation, and writes parsed text/table/image outputs to
-   the post-processing bucket.
-2. **RAG process** loads those outputs, chunks text, writes split JSON, embeds
-   with Bedrock, and stores vectors in the active contract’s embeddings table.
-3. **API** answers natural-language questions via search over that table and a
-   Bedrock foundation model.
-4. **Contract review** runs the requirements in a CMS Contract Review Tool
-   workbook through the same retrieval and writes the findings back into the
-   workbook.
+1. **Manifest API**: MuleSoft uploads the documents, then posts `manifest.json`
+   to `POST /manifest`. The API validates it and starts one workflow execution
+   named after `requestKey`.
+2. **Pre-processing** runs once for each manifest document. It runs Bedrock
+   Data Automation, parses the text/table/image outputs, splits text into
+   chunks, and writes one combined JSON per file to `RAG_Output/` in the
+   post-processing bucket. Embedding starts only after every document succeeds.
+3. **RAG process** creates a new `embeddings_<requestKey>_<hash>_<state>` table
+   for the run and embeds every `RAG_Output/` JSON into it.
+4. **Requirement review** (Fargate) reviews every `legalRequirements` item
+   against that table and writes the results to S3.
+5. **Notification**: an SQS message tells MuleSoft the run finished, and
+   MuleSoft fetches the results from `GET /manifest/{requestKey}/results`.
+6. **API** answers natural-language questions via search and a Bedrock
+   foundation model.
 
 ### Retrieval
 
@@ -196,20 +206,13 @@ VPN/bastion).
 
 | Mode | Local command | Cloud |
 |------|---------------|--------|
-| Query API | `python -m search.routes.endpoint` (or Docker image `CMD` → uvicorn) | Always-on ECS Fargate service on port `8001` |
-| Pre-process batch | `python -m data_preprocessing.pre_processing` | ECS on-demand task |
-| Embeddings batch | `python -m data_embeddings_storage.rag_process` | ECS on-demand task |
-| Contract review | `python search/excel_process/process_excel_with_rag.py` | not deployed yet; run it on demand |
+| API | `python -m search.routes.endpoint` (or Docker image `CMD` → uvicorn) | Always-on ECS Fargate service on port `8001` |
+| Pre-process | `data_preprocessing.pre_processing.handler` | Lambda, invoked by the manifest workflow (and `common/` S3 uploads) |
+| Embeddings | `data_embeddings_storage.rag_process.handler` | Lambda, invoked by the manifest workflow (`create_table`, `embed`) and `RAG_Output/common/` S3 notifications |
+| Requirement review | `REQUEST_KEY=<key> EMBEDDINGS_TABLE_NAME=embeddings_req_123_5fde4fd5_md python -m search.manifest_review` | Fargate task run by the manifest workflow |
 | DB bootstrap | usually not local (needs master secret) | One-shot Fargate task: `python -m data_embeddings_storage.database.bootstrap` |
 
-Typical ingest order after documents land in the input prefix:
-
-```sh
-python -m data_preprocessing.pre_processing
-python -m data_embeddings_storage.rag_process
-```
-
-### Query API (local)
+### API (local)
 
 ```sh
 export API_HOST=0.0.0.0
@@ -221,122 +224,47 @@ python -m search.routes.endpoint
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /health` | Health check |
-| `GET /agent?query=…` | Agent answer (query string) |
-| `POST /agent` | Agent answer; body `{"query": "…"}` |
+| `POST /manifest` | Validate a MuleSoft manifest and start its run (see [Ingest](#ingest-manifest-workflow)) |
+| `GET /manifest/{requestKey}` | Run status: `PROCESSING`, `COMPLETED` or `FAILED` |
+| `GET /manifest/{requestKey}/results` | Reviewed requirements once the run completes |
 | `GET /docs` | OpenAPI UI |
-
-Example:
-
-```sh
-curl -s "http://127.0.0.1:8001/agent?query=What+is+coverage+for+NEMT%3F"
-curl -s -X POST "http://127.0.0.1:8001/agent" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"What is coverage for NEMT?"}'
-```
-
-### Contract review run job
-
-Drop the CMS Contract Review Tool workbook (`.xlsm` or `.xlsx`) into
-`output_excel/` at the repository root and run:
-
-```sh
-python search/excel_process/process_excel_with_rag.py
-```
-
-Every requirement row goes through retrieval and three agents — an analyst that
-commits to a status, a challenger that argues the opposing case over the same
-evidence, and an adjudicator that settles it. Findings are written back into the
-columns a reviewer already works from (Status, Where Found, Follow-up Required,
-General Comments), and everything that does not fit a form field — both
-confidence scores, the verified quotes with the page number each came from — goes
-onto an added **RAG Analysis** sheet keyed by sheet and row.
-
-General Comments is ordered finding first, caveats after: `AI recommended
-status:`, the adjudicated reasoning under `AI response:`, `Page number:`, the
-confidence scores, any note about them, then the quotes. The challenger's
-counter-argument is not printed in the workbook — it is the agent's working
-rather than a finding, and a paragraph arguing against the status directly under
-it reads as though the tool is recommending both. It stays on
-`RequirementReview.counter_argument` and in the sidecar for audit.
-
-Two notes can follow the confidence scores. One when a quote could not be matched
-back to the retrieved text, and one when the status has **no** quotes at all —
-`retrieval_confidence` falls back to the best chunk that came back when nothing
-was cited, so an evidence-free row still prints three scores and would otherwise
-read as a supported finding. On a full CRT run 100 of 667 rows cite nothing.
-
-The cell is capped at `MAX_CELL_CHARS` (4000), and quotes are dropped **whole** to
-stay under it, with a line saying how many went missing and where to find them.
-Cutting the text at an arbitrary character left the last citation ending
-mid-sentence, still wrapped in quote marks — indistinguishable from the contract
-saying exactly that. Long exceptions get the same treatment: `Automated review
-failed:` keeps the first 220 characters, which is the message and the code, and
-leaves boto's `ResponseMetadata` to the Error column.
-
-| Flag | Effect |
-|------|--------|
-| `--folder` | Where to look for workbooks (default `output_excel/`) |
-| `--sheet` | Only this sheet; repeatable |
-| `--limit` | Stop after N requirements, for a smoke test |
-| `--concurrency` | Requirements in flight at once (default 4) |
-| `--no-challenge` | Analyst only, skip the challenge and adjudication |
-| `--skip-answered` | Leave rows that already have a Status alone |
-| `--fresh` | Discard the sidecar and review everything again |
-| `--render-only` | Rebuild the workbook from the sidecar without reviewing |
-
-A full CRT is 667 requirements at three model calls each, so each finding is
-appended to a `<name>.xlsm.reviewed.jsonl` sidecar as it completes. Re-running
-resumes from that sidecar rather than paying for the same rows twice. The
-reviewed workbook is saved as `<name>.reviewed.xlsm`; the uploaded file is never
-modified.
-
-`--render-only` rebuilds the workbook from that sidecar and reviews nothing, which
-turns a change to how a finding is presented into a four-second check instead of
-an hour of Bedrock time. It needs no Bedrock and no database: the agents and the
-connection pool are imported inside the functions that use them, because
-`common/utils/settings.py` fetches the database secret at import and importing it
-at the top of the module killed a render before `main()` saw the flag. Rows the
-sidecar does not cover are named rather than left silently blank, since a workbook
-rendering 600 of 667 requirements looks finished. It refuses to run with `--fresh`,
-which would delete the sidecar it renders from.
-
-Two things to know about the output. Status is left blank when the verdict has no
-matching dropdown option — `A. Completeness` offers Yes/No and has nowhere to put
-an UNCLEAR — and the reason goes in General Comments. And openpyxl warns that it
-is dropping the workbook's conditional-formatting extension: macros, dropdowns
-and layout survive the round trip, the colour-scale rules on the Summary sheet do
-not.
 
 ### Cloud operation
 
 - **API**: deployed via the AISuite stack (desired count gated by
   `aisuite:activateApi`). Traffic is internal ALB only.
+- **Manifest workflow**: the `IngestStateMachineArn`,
+  `RequirementReviewTaskDefinitionArn`, `ManifestNotificationQueueUrl`/`Arn`
+  and `ManifestNotificationDeadLetterQueueUrl` stack outputs identify the run
+  orchestration and the MuleSoft notification queue.
 - **Batch / bootstrap**: run the corresponding ECS task definitions on the
   private cluster/subnets. Stack outputs include bootstrap cluster name, task
   definition ARN, security group, and subnet IDs (`RunTask` contract).
-- Bucket names and model IDs are injected via ECS environment variables (see
-  below), which override matching keys in `aws.properties.ini`.
+- Bucket names and model IDs are injected via Lambda / ECS environment variables
+  (see below), which override matching keys in `aws.properties.ini`.
 
 ## Environment variables
 
 Path, model, and table defaults live in
 [`common/utils/aws.properties.ini`](common/utils/aws.properties.ini). Comments
 at the top of that file list env → property mappings. `Helper` applies env
-overrides first, then the active `[contract:…]` section, then `[default]`.
+overrides first, then `[default]`.
 
-### Cloud (ECS-injected)
+### Cloud (injected by CDK)
 
 | Variable | Role |
 |----------|------|
-| `AWS_REGION` / `AWS_DEFAULT_REGION` | AWS region |
-| `DOCUMENTS_BUCKET` | Source documents bucket |
-| `POST_PROCESSING_BUCKET` | BDA / RAG post-processing bucket |
-| `PIPELINE_CODE_BUCKET` | Pipeline code bucket |
-| `PIPELINE_TEMP_BUCKET` | Temp / summary logs bucket |
-| `DB_SECRET_ARN` (or `DB_SECRET_NAME`) | Secrets Manager secret for app DB credentials |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | AWS region (search API, review task) |
+| `DOCUMENTS_BUCKET` | Source documents bucket (pre-processing Lambda; the manifest API checks documents exist here) |
+| `POST_PROCESSING_BUCKET` | BDA / RAG post-processing bucket (both Lambdas) |
+| `PIPELINE_TEMP_BUCKET` | Temp bucket: BDA logs, `manifests/` and `manifest-results/` (pre-processing Lambda, search API, review task) |
+| `DB_SECRET_ARN` (or `DB_SECRET_NAME`) | Secrets Manager secret for app DB credentials (embeddings Lambda, search API, review task) |
 | `BEDROCK_MODEL_ID` | Foundation LLM |
 | `BEDROCK_EMBED_MODEL_ID` | Embedding model |
-| `EMBEDDINGS_TABLE_NAME` | Optional override of active contract table name |
+| `INGEST_STATE_MACHINE_ARN` | Manifest workflow started by `POST /manifest` (search API) |
+| `EMBEDDINGS_TABLE_NAME` | Table searched: default `embeddings` for the API; set per run by the workflow for the review task |
+| `REQUEST_KEY` | Manifest run to review (review task; set per run by the workflow) |
+| `REVIEW_CONCURRENCY` | Requirements reviewed at once (review task, default 4) |
 
 **Bootstrap task only** (from Secrets Manager at task start; never put in task
 env plain text, workflow args, or logs):
@@ -368,74 +296,114 @@ need valid account permissions for the non-prod (or prod) account you target.
 
 ## Specifying documents and contracts
 
-There is **no per-file CLI** and no document-id filter on search.
+MuleSoft lists the documents and requirements for each run in a manifest (see
+below). There is no document-id filter on search.
 
-### Ingest (batch)
+### Ingest (manifest workflow)
 
-Pre-processing lists **all** `.pdf` and `.docx` objects under
-`input_bucket_name` + the active contract’s `input_prefix`.
+MuleSoft uploads the documents to the documents bucket, then posts the
+manifest:
 
-To focus work on a particular file:
+```json
+{
+  "requestKey": "3f6c1e2a-8b4d-4c1e-9a77-2d5b0f1c9e41",
+  "reviewType": "STREAMLINED",
+  "state": "MD",
+  "legalRequirements": [
+    {"id": "a0X8z000001AbCdEAK", "itemNo": "2.1", "legalCite": "42 CFR 438.206", "requirement": "…"}
+  ],
+  "documents": [
+    {"documentId": "DOC-001", "s3": {"bucket": "aisuite-dev-contract-rag", "path": "SUB-123/ATT-001/DOC-001/amendment.pdf"}}
+  ]
+}
+```
 
-1. Upload that object under the contract prefix (or only that object present), **or**
-2. Temporarily set `input_prefix` to a narrower key prefix that contains only
-   what you want, **or**
-3. Switch the active contract (see below) if the document belongs to another
-   contract’s tree.
+`legalRequirements` can hold any number of items; they stay in S3 at
+`manifests/<requestKey>/manifest.json` in the temp bucket rather than in the
+workflow state. `requestKey` must match `^[A-Za-z0-9_-]{1,80}$`, `state` is a
+two-letter code, ids and paths must be unique, and a manifest holds at most 500
+documents.
 
-Then re-run pre-process → rag_process. Embeddings write to the active
-contract’s `embeddings_table_name`.
+| Response | When |
+|----------|------|
+| `202` `{requestKey, status: "PROCESSING", executionArn, documentCount, requirementCount, message}` | Manifest valid and the run started, or the same `requestKey` is still running |
+| `400` `FAILED_VALIDATION` | Schema errors, a document that is not `.pdf`/`.docx`, is outside the documents bucket or is missing, two documents whose `RAG_Output` files would collide, or a serialized Step Functions workflow input exceeding 256 KiB |
+| `409` | That `requestKey` already finished; resubmit with a new key |
+| `502` `UPSTREAM_ERROR` / `503` `NOT_CONFIGURED` | S3 or Step Functions call failed / workflow ARN not set |
+
+Every non-2xx body is `{"requestKey": "…", "status": "…", "errors": ["…"]}`.
+
+The Step Functions execution, named after `requestKey`, then:
+
+1. **Pre-processes** every document with the pre-processing Lambda
+   (`data_preprocessing.pre_processing.handler`), at most 5 at once.
+2. **Creates** this run's embeddings table
+   `embeddings_<requestKey>_<hash>_<state>` (sanitized to lowercase/underscores,
+   always including an 8-char SHA-256 hash of `requestKey:state` and truncated
+   to at most 41 chars to fit Postgres's 63-byte index-name limit).
+3. **Embeds** every `RAG_Output` JSON into that table with the embeddings Lambda
+   (`data_embeddings_storage.rag_process.handler`) and fails the run if 0 chunks
+   were produced across all documents.
+4. **Reviews** every requirement in a Fargate task
+   (`python -m search.manifest_review`) against that table and writes
+   `manifest-results/<requestKey>/results.json`. Each item echoes `id`,
+   `itemNo`, `legalCite` and `requirement`, and adds `siRecommendation`
+   (`MET`/`UNCLEAR`), `confidence` (`HIGH`/`MEDIUM`/`LOW`), `foundIn`,
+   `citedText`, `rationale` and `reasoning`. Finished items are checkpointed,
+   so a retried task resumes where it stopped.
+5. **Notifies** MuleSoft on the `aisuite-<env>-manifest-notifications` SQS
+   queue:
+
+   ```json
+   {"requestKey": "…", "state": "MD", "reviewType": "STREAMLINED", "status": "COMPLETED",
+    "requirementCount": 2, "embeddingsTable": "embeddings_req_123_5fde4fd5_md",
+    "resultsPath": "/manifest/<requestKey>/results"}
+   ```
+
+   Any failed step sends `"status": "FAILED"`
+   with `error` and `statusPath` (`/manifest/<requestKey>`) instead. Delivery is
+   at least once, so consumers should dedupe on `requestKey` + `status`.
+
+MuleSoft then calls `GET /manifest/<requestKey>/results` (`409` while the run is
+still processing, `404` if the key is unknown, `413` if an unpaginated response
+exceeds the buffered REST limit; optional `offset` and `limit` query parameters
+paginate large runs with `X-Total-Count` and `X-Next-Offset` headers). The S3
+uploads themselves no longer trigger any Lambda.
+
+Output for `<folder>/<file>.pdf` in the post-processing bucket:
+
+- `<folder>_bdaoutput/<file>/` raw BDA output
+- `<folder>_bdaoutput/BDA{Text,Table,Image}Output/`-style per-kind JSONs named
+  `<file>-preprocessed-{text,table,image}.json`
+- `RAG_Output/<folder>/<file>.json`, the text, table and image items combined
+  into one list. Text is split into 1,024-character chunks with a 30-character
+  overlap (`data_preprocessing/recursive_text_splitter.py`).
+
+Re-embedding a file into the same table first deletes that file's rows, so a
+retried step does not duplicate vectors.
+
+Both Lambdas are standard Lambda functions in the VPC's private subnets with a
+15-minute timeout (the Lambda maximum). Each runs at most 5 files at once and
+scales to zero when idle. The workflow retries throttled calls with backoff and
+failed calls twice.
 
 ### Search (API)
 
-The agent accepts only a natural-language `query`. Results come from the active
-contract embeddings table configured in the INI / `EMBEDDINGS_TABLE_NAME`.
+The agent accepts a natural-language `query` and an optional `contract` table
+name. When `contract` is omitted, the search API reads the table named by
+`EMBEDDINGS_TABLE_NAME` (default `embeddings`); passing a manifest run's
+`embeddings_<requestKey>_<state>` table name searches that run's embeddings.
 
-## Per-contract configuration (dev)
-
-Multi-contract isolation uses shared S3 buckets with per-contract prefixes and a
-per-contract embeddings table on the same RDS instance.
+## Shared buckets (dev)
 
 | Role | Dev bucket |
 |------|------------|
 | Source documents (input) | `aisuite-dev-contract-rag` |
 | BDA / RAG post-processing | `aisuite-dev-contract-rag-post-processing` |
-| Pipeline code | `aisuite-dev-llm-pipeline-code` |
 | Pipeline temp / summary logs | `aisuite-dev-llm-pipeline-temp` |
 
-Contract-specific paths and `embeddings_table_name` live in `[contract:…]` sections of
-`common/utils/aws.properties.ini`. ECS still overrides bucket names via env
-(`DOCUMENTS_BUCKET`, `POST_PROCESSING_BUCKET`, `PIPELINE_CODE_BUCKET`,
+Deployed bucket names come from env (`DOCUMENTS_BUCKET`, `POST_PROCESSING_BUCKET`,
 `PIPELINE_TEMP_BUCKET`).
-
-### Active contract
-
-Exactly one section may have `active = true`. Currently `ne_102897` (Nebraska).
-To switch:
-
-1. Set `active = true` on the target `[contract:…]` section.
-2. Set `active = false` on the previously active section.
-3. Leave prefixes and `embeddings_table_name` alone unless rewiring storage.
-4. Restart / redeploy tasks so they reload the INI.
-
-### Contract matrix (dev)
-
-| ID | Active | `input_prefix` | `embeddings_table_name` |
-|----|--------|----------------|-------------------------|
-| `me_0002` | false | `state_of_ME/MCR-ME-0002-NEMT/` | `embeddings_me_0002_nemt` |
-| `tn_6756` | false | `state_of_TN/MCCRS-TN-6756-TennCare/` | `embeddings_tn_6756_tenncare` |
-| `wa_6369` | false | `state_of_WA/MCCRS-WA-6369-IFC/` | `embeddings_wa_6369_ifc` |
-| `wa_6472` | false | `state_of_WA/MCCRS-WA-6472-AHIMC/` | `embeddings_wa_6472_ahimc` |
-| `wa_6473` | false | `state_of_WA/MCCRS-WA-6473-IFC/` | `embeddings_wa_6473_ifc` |
-| `ne_102897` | true | `NE/` | `embeddings_ne_102897` |
-
-Full `output_prefix` / BDA / RAG folder paths are in the INI under each contract section.
-
-### Bootstrap note
-
-Bootstrap creates each contract’s embeddings table (and indexes) so switching `active`
-does not require a re-run for DDL. Search/store use only the active contract table.
-
 ## One-time DB bootstrap (app user)
 
 CDK manages an on-demand Fargate task that bootstraps the private RDS database.

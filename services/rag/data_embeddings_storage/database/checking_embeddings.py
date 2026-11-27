@@ -1,6 +1,6 @@
 import asyncpg
 from common.utils.helper import Helper
-from common.utils.settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+from common.utils.db_settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
 from data_embeddings_storage.database.embeddings_schema import SEARCH_PATH_SQL
 
 

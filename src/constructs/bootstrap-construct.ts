@@ -8,9 +8,9 @@ import type * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Construct } from "constructs";
 
 import { APPLICATION_NAME, type DeploymentConfig } from "../deployment-config";
-import { BATCH_IMAGE_TAG_CONTEXT_KEY } from "./batch-construct";
+import { API_IMAGE_TAG_CONTEXT_KEY } from "./compute-construct";
 
-const DEFAULT_BATCH_IMAGE_TAG = "latest";
+const DEFAULT_API_IMAGE_TAG = "latest";
 const MINIMIZE_IAM_POLICIES_CONTEXT_KEY = "@aws-cdk/aws-iam:minimizePolicies";
 
 export interface BootstrapConstructProps {
@@ -74,9 +74,9 @@ export class BootstrapConstruct extends Construct {
     );
 
     const imageTag =
-      (this.node.tryGetContext(BATCH_IMAGE_TAG_CONTEXT_KEY) as
+      (this.node.tryGetContext(API_IMAGE_TAG_CONTEXT_KEY) as
         | string
-        | undefined) ?? DEFAULT_BATCH_IMAGE_TAG;
+        | undefined) ?? DEFAULT_API_IMAGE_TAG;
 
     this.taskDefinition.addContainer("Container", {
       command: [

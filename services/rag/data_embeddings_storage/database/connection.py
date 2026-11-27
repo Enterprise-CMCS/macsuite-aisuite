@@ -1,7 +1,8 @@
 import asyncio
+from contextlib import asynccontextmanager
 import asyncpg
 from pgvector.asyncpg import register_vector
-from common.utils.settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+from common.utils.db_settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
 from data_embeddings_storage.database.embeddings_schema import SEARCH_PATH_SQL
 
 postgres_pool = None
@@ -55,6 +56,15 @@ async def release_connection(connection):
     if postgres_pool is None:
         raise RuntimeError("Database pool is not initialized")
     await postgres_pool.release(connection)
+
+
+@asynccontextmanager
+async def pooled_connection():
+    connection = await get_connection()
+    try:
+        yield connection
+    finally:
+        await release_connection(connection)
 
 
 async def close_db():
