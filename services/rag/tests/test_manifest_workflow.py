@@ -195,12 +195,22 @@ class EmbeddingsActionTests(unittest.TestCase):
     def test_embed_replaces_earlier_rows_of_the_same_file(self):
         table = manifest_embeddings_table_name(REQUEST_KEY, "MD")
         documents = [{"text": "chunk one", "metadata": {"page": 1}}, {"text": "chunk two"}]
+        source = rag_process.LoadedRagSource(
+            bucket="post-bucket",
+            key=RAG_KEY,
+            documents=documents,
+            version="version:v1",
+        )
         processor = MagicMock()
         records = [("chunk one", "{}", [0.1]), ("chunk two", "{}", [0.2])]
 
         async def record_execute(sql, *args):
             if "pg_advisory_xact_lock" in sql:
                 self.events.append(("lock", args[0]))
+
+        def record_version_check(bucket, key):
+            self.events.append(("check_version", bucket, key))
+            return "version:v1"
 
         async def record_generate(docs, tbl, key):
             self.events.append(("generate", tbl, key))
@@ -214,7 +224,8 @@ class EmbeddingsActionTests(unittest.TestCase):
             return len(recs)
 
         self.connection.execute.side_effect = record_execute
-        with patch.object(rag_process, "_load_rag_documents", return_value=documents), \
+        with patch.object(rag_process, "_load_rag_documents", return_value=source), \
+                patch.object(rag_process, "_current_source_version", side_effect=record_version_check), \
                 patch.object(rag_process, "_generate_embeddings", side_effect=record_generate) as generate, \
                 patch.object(rag_process, "delete_source_rows", side_effect=record_delete) as delete_rows, \
                 patch.object(rag_process, "_store_embeddings", side_effect=record_store) as store:
@@ -236,6 +247,7 @@ class EmbeddingsActionTests(unittest.TestCase):
                 ("generate", table, RAG_KEY),
                 ("tx_begin",),
                 ("lock", lock_id),
+                ("check_version", "post-bucket", RAG_KEY),
                 ("delete", True, table, RAG_KEY),
                 ("store", True, True, 2),
                 ("tx_commit",),
@@ -244,11 +256,18 @@ class EmbeddingsActionTests(unittest.TestCase):
 
     def test_embed_empty_documents_deletes_rows_atomically_without_generating(self):
         table = manifest_embeddings_table_name(REQUEST_KEY, "MD")
+        source = rag_process.LoadedRagSource(
+            bucket="post-bucket",
+            key=RAG_KEY,
+            documents=[],
+            version="version:v1",
+        )
 
         async def record_delete(conn, tbl, key):
             self.events.append(("delete", conn is self.connection, tbl, key))
 
-        with patch.object(rag_process, "_load_rag_documents", return_value=[]), \
+        with patch.object(rag_process, "_load_rag_documents", return_value=source), \
+                patch.object(rag_process, "_current_source_version", return_value="version:v1"), \
                 patch.object(rag_process, "_generate_embeddings", new=AsyncMock()) as generate, \
                 patch.object(rag_process, "delete_source_rows", side_effect=record_delete), \
                 patch.object(rag_process, "_store_embeddings", new=AsyncMock()) as store:
@@ -265,6 +284,25 @@ class EmbeddingsActionTests(unittest.TestCase):
                 ("tx_commit",),
             ],
         )
+
+    def test_embed_raises_when_source_version_changes_under_lock(self):
+        table = manifest_embeddings_table_name(REQUEST_KEY, "MD")
+        source = rag_process.LoadedRagSource(
+            bucket="post-bucket",
+            key=RAG_KEY,
+            documents=[{"text": "chunk one"}],
+            version="version:v1",
+        )
+        with patch.object(rag_process, "_load_rag_documents", return_value=source), \
+                patch.object(rag_process, "_current_source_version", return_value="version:v2"), \
+                patch.object(rag_process, "_generate_embeddings", new=AsyncMock(return_value=(MagicMock(), [("chunk one", "{}", [0.1])]))), \
+                patch.object(rag_process, "delete_source_rows", new=AsyncMock()) as delete_rows, \
+                patch.object(rag_process, "_store_embeddings", new=AsyncMock()) as store:
+            with self.assertRaisesRegex(RuntimeError, "changed while embedding"):
+                rag_process.handler({"action": "embed", "key": RAG_KEY, "tableName": table})
+
+        delete_rows.assert_not_awaited()
+        store.assert_not_awaited()
 
     def test_rejects_unknown_actions_and_invalid_table_names(self):
         with self.assertRaises(ValueError):
@@ -284,13 +322,36 @@ class ResultMappingTests(unittest.TestCase):
     def test_found_in_reports_page_ranges_per_document(self):
         found_in = manifest_review.found_in
 
-        self.assertEqual(found_in([evidence(87)], self.labels), "Page 88")
-        self.assertEqual(found_in([evidence(page) for page in (44, 40, 41, 42, 43)], self.labels), "Pages 41-45")
+        self.assertEqual(found_in([evidence(87)], self.labels), "DOC-001: Page 88")
+        self.assertEqual(
+            found_in([evidence(page) for page in (44, 40, 41, 42, 43)], self.labels),
+            "DOC-001: Pages 41-45",
+        )
         self.assertEqual(
             found_in([evidence(2), evidence(6, doc_id="supporting-2.docx")], self.labels),
             "DOC-001: Page 3; DOC-003: Page 7",
         )
         self.assertEqual(found_in([], self.labels), "Not found")
+
+    def test_found_in_omits_document_label_only_for_single_document_manifest(self):
+        single_manifest = Manifest.model_validate(
+            manifest_payload(documents=[manifest_payload()["documents"][0]])
+        )
+        single_labels = manifest_review.document_labels(single_manifest)
+
+        self.assertEqual(manifest_review.found_in([evidence(87)], single_labels), "Page 88")
+        self.assertEqual(
+            manifest_review.found_in([evidence(page) for page in (44, 40, 41, 42, 43)], single_labels),
+            "Pages 41-45",
+        )
+        self.assertEqual(
+            manifest_review.found_in([evidence(2)], self.labels),
+            "DOC-001: Page 3",
+        )
+        self.assertEqual(
+            manifest_review.found_in([evidence(2)], single_labels, single_document=False),
+            "DOC-001: Page 3",
+        )
 
     def test_shared_basenames_keep_distinct_document_ids_and_pages(self):
         manifest = Manifest.model_validate(
@@ -364,7 +425,7 @@ class ResultMappingTests(unittest.TestCase):
         )
         self.assertEqual(
             (result.siRecommendation, result.confidence, result.foundIn, result.citedText),
-            ("MET", "HIGH", "Page 41", "maintain a network"),
+            ("MET", "HIGH", "DOC-001: Page 41", "maintain a network"),
         )
         self.assertEqual(result.rationale, "The network adequacy requirement is met.")
         self.assertEqual(result.reasoning, "Section 7.2 sets time and distance standards on page 41.")
@@ -449,9 +510,23 @@ class RunReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertCountEqual([call.args[0].id for call in review.await_args_list], [second.id, third.id])
         self.assertEqual([item.id for item in results.legalRequirements], [first.id, second.id, third.id])
         self.assertEqual(results.legalRequirements[0].rationale, "checkpointed")
+        self.assertEqual(results.legalRequirements[1].foundIn, "DOC-001: Page 1")
         self.assertEqual(sorted(store.saved_items), [1, 2])
         self.assertIs(store.saved_results, results)
         self.assertEqual((results.requestKey, results.state), (REQUEST_KEY, "MD"))
+
+    async def test_single_document_manifest_omits_document_label_in_results(self):
+        manifest = Manifest.model_validate(
+            manifest_payload(
+                documents=[manifest_payload()["documents"][0]],
+                legalRequirements=[requirement(0)],
+            )
+        )
+        store = FakeStore()
+
+        results = await manifest_review.run_review(manifest, store, self._reviewer())
+
+        self.assertEqual(results.legalRequirements[0].foundIn, "Page 1")
 
     async def test_failed_reviews_are_reported_but_not_checkpointed(self):
         manifest = self._manifest(5)
@@ -565,6 +640,57 @@ class ManifestApiTests(unittest.TestCase):
         self.s3.put_object.assert_not_called()
         self.sfn.start_execution.assert_not_called()
 
+    def test_rejects_workflow_input_exceeding_step_functions_limit_before_reserving_key(self):
+        long_prefix = "segment/" * 65
+        oversized = manifest_payload(
+            documents=[
+                {
+                    "documentId": f"DOC-{index:03d}",
+                    "s3": {"bucket": DOCUMENTS_BUCKET, "path": f"{long_prefix}doc-{index:03d}.pdf"},
+                }
+                for index in range(500)
+            ]
+        )
+        raw = json.dumps(oversized).encode("utf-8")
+        self.assertLess(len(raw), manifest_api.DEFAULT_MAX_MANIFEST_BODY_BYTES)
+        self.assertGreater(len(raw), manifest_api.MAX_WORKFLOW_INPUT_BYTES)
+
+        rejected = self.client.post("/manifest", json=oversized)
+
+        self.assertEqual(rejected.status_code, 400)
+        body = rejected.json()
+        self.assertEqual((body["requestKey"], body["status"]), (REQUEST_KEY, "FAILED_VALIDATION"))
+        self.assertIn(str(manifest_api.MAX_WORKFLOW_INPUT_BYTES), body["errors"][0])
+        self.s3.head_object.assert_not_called()
+        self.s3.put_object.assert_not_called()
+        self.sfn.start_execution.assert_not_called()
+
+        # Because the oversized manifest was never reserved, the same requestKey can be reused.
+        retry = self.client.post("/manifest", json=manifest_payload())
+        self.assertEqual(retry.status_code, 202)
+        self.sfn.start_execution.assert_called_once()
+
+    def test_workflow_input_size_limit_counts_utf8_bytes_at_boundary(self):
+        serialized = manifest_api._serialized_workflow_input(Manifest.model_validate(manifest_payload()))
+        exact_bytes = len(serialized.encode("utf-8"))
+
+        with patch.object(manifest_api, "MAX_WORKFLOW_INPUT_BYTES", exact_bytes):
+            accepted = self.client.post("/manifest", json=manifest_payload())
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(self.sfn.start_execution.call_args.kwargs["input"], serialized)
+
+        multibyte = json.dumps({"text": "é" * 20}, ensure_ascii=False)
+        self.assertLess(len(multibyte), len(multibyte.encode("utf-8")))
+        self.s3.put_object.reset_mock()
+        self.sfn.start_execution.reset_mock()
+        with patch.object(manifest_api, "_serialized_workflow_input", return_value=multibyte), \
+                patch.object(manifest_api, "MAX_WORKFLOW_INPUT_BYTES", len(multibyte)):
+            rejected = self.client.post("/manifest", json=manifest_payload())
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(rejected.json()["status"], "FAILED_VALIDATION")
+        self.s3.put_object.assert_not_called()
+        self.sfn.start_execution.assert_not_called()
+
     def test_rejects_documents_that_are_missing_or_in_another_bucket(self):
         self.s3.head_object.side_effect = ClientError({"Error": {"Code": "404"}}, "HeadObject")
         payload = manifest_payload()
@@ -656,7 +782,7 @@ class ManifestApiTests(unittest.TestCase):
             self.assertEqual(response.json()["status"], "FAILED")
             self.assertEqual(response.json()["error"], expected_error)
 
-    def test_results_conflict_until_written_then_stream_from_s3(self):
+    def test_results_conflict_until_written_then_return_buffered_json(self):
         self._execution("RUNNING")
         self.s3.get_object.side_effect = self.s3.exceptions.NoSuchKey()
 
@@ -666,8 +792,9 @@ class ManifestApiTests(unittest.TestCase):
         self.assertEqual(pending.json()["status"], "PROCESSING")
 
         results = {"requestKey": REQUEST_KEY, "reviewType": "STREAMLINED", "state": "MD", "legalRequirements": []}
+        raw = json.dumps(results).encode()
         body = MagicMock()
-        body.iter_chunks.return_value = iter([json.dumps(results).encode()])
+        body.read.return_value = raw
         self.s3.get_object.side_effect = None
         self.s3.get_object.return_value = {"Body": body}
 
@@ -675,10 +802,71 @@ class ManifestApiTests(unittest.TestCase):
 
         self.assertEqual(ready.status_code, 200)
         self.assertEqual(ready.json(), results)
+        self.assertEqual(ready.headers.get("content-length"), str(len(raw)))
+        body.close.assert_called_once()
         self.assertEqual(
             self.s3.get_object.call_args.kwargs,
             {"Bucket": TEMP_BUCKET, "Key": f"manifest-results/{REQUEST_KEY}/results.json"},
         )
+
+    def test_results_pagination_enforces_buffered_size_limit(self):
+        items = [
+            {
+                **requirement(index),
+                "siRecommendation": "MET",
+                "confidence": "HIGH",
+                "foundIn": f"DOC-001: Page {index + 1}",
+                "citedText": f"Quoted text {index} " + ("x" * 120),
+                "rationale": "Met.",
+                "reasoning": "Verified.",
+            }
+            for index in range(5)
+        ]
+        results = {
+            "requestKey": REQUEST_KEY,
+            "reviewType": "STREAMLINED",
+            "state": "MD",
+            "legalRequirements": items,
+        }
+        raw = json.dumps(results).encode("utf-8")
+        two_item_size = len(json.dumps({**results, "legalRequirements": items[:2]}).encode("utf-8"))
+        self.assertLess(two_item_size, len(raw))
+
+        def make_body(*_args, **_kwargs):
+            body = MagicMock()
+            body.read.return_value = raw
+            return {"Body": body}
+
+        self.s3.get_object.side_effect = make_body
+
+        with patch.object(manifest_api, "MAX_RESULTS_RESPONSE_BYTES", two_item_size):
+            too_large = self.client.get(f"/manifest/{REQUEST_KEY}/results")
+            self.assertEqual(too_large.status_code, 413)
+            self.assertEqual(too_large.json()["status"], "PAYLOAD_TOO_LARGE")
+            self.assertIn("offset", too_large.json()["errors"][0])
+
+            # Requesting more items than fit shrinks the page to stay within MAX_RESULTS_RESPONSE_BYTES.
+            collected = []
+            next_offset = 0
+            while next_offset is not None:
+                page = self.client.get(f"/manifest/{REQUEST_KEY}/results", params={"offset": next_offset, "limit": 5})
+                self.assertEqual(page.status_code, 200)
+                self.assertLessEqual(len(page.content), two_item_size)
+                self.assertEqual(page.headers["x-total-count"], "5")
+                self.assertEqual(page.headers["x-offset"], str(next_offset))
+                page_items = page.json()["legalRequirements"]
+                self.assertEqual(page.headers["x-limit"], str(len(page_items)))
+                collected.extend(page_items)
+                raw_next = page.headers.get("x-next-offset")
+                next_offset = int(raw_next) if raw_next is not None else None
+
+            self.assertEqual([item["id"] for item in collected], [item["id"] for item in items])
+
+        # If a single item exceeds the buffered ceiling, return 413 rather than an oversized response.
+        with patch.object(manifest_api, "MAX_RESULTS_RESPONSE_BYTES", 50):
+            single_too_large = self.client.get(f"/manifest/{REQUEST_KEY}/results", params={"offset": 0, "limit": 1})
+            self.assertEqual(single_too_large.status_code, 413)
+            self.assertEqual(single_too_large.json()["status"], "PAYLOAD_TOO_LARGE")
 
 
 class RemovedEndpointTests(unittest.TestCase):

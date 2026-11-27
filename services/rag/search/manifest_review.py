@@ -88,8 +88,8 @@ def document_labels(manifest):
     return {**unambiguous_basenames, **by_exact_key}
 
 
-def found_in(evidence, labels):
-    """Format verified page locations (e.g. 'Page 88', 'Pages 41-45', or 'DOC-001: Page 3; DOC-003: Page 7')."""
+def found_in(evidence, labels, *, single_document=None):
+    """Format verified page locations (e.g. 'Page 88' for a single-document manifest, or 'DOC-001: Page 3; DOC-003: Page 7')."""
     pages_by_doc = {}
     for record in evidence:
         number = page_number(record.page, record.printed_page)
@@ -123,12 +123,13 @@ def found_in(evidence, labels):
         span = f"{'Page' if len(ordered_pages) == 1 else 'Pages'} {page_text}"
         formatted.append((label, span))
 
-    if len(formatted) == 1:
+    omit_label = len(set(labels.values())) == 1 if single_document is None else bool(single_document)
+    if omit_label and len(formatted) == 1:
         return formatted[0][1]
     return "; ".join(f"{label}: {span}" if label else span for label, span in formatted)
 
 
-def to_result(requirement, review, labels):
+def to_result(requirement, review, labels, *, single_document=None):
     """Convert an agent RequirementReview into MuleSoft's RequirementResult contract."""
     evidence = [record for record in review.evidence if record.verified]
     failed = bool(review.error)
@@ -149,7 +150,7 @@ def to_result(requirement, review, labels):
         **requirement.model_dump(),
         siRecommendation="MET" if review.status == "MET" and not failed else "UNCLEAR",
         confidence=confidence,
-        foundIn=found_in(evidence, labels),
+        foundIn=found_in(evidence, labels, single_document=single_document),
         citedText="\n\n".join(dict.fromkeys(record.quote.strip() for record in evidence if record.quote.strip())),
         rationale=rationale,
         reasoning=reasoning.strip(),
@@ -173,11 +174,12 @@ async def run_review(manifest, store, review, concurrency=DEFAULT_CONCURRENCY):
     )
 
     labels = document_labels(manifest)
+    single_document = len(manifest.documents) == 1
     semaphore = asyncio.Semaphore(concurrency)
 
     async def review_one(index, requirement):
         async with semaphore:
-            result = to_result(requirement, await review(requirement), labels)
+            result = to_result(requirement, await review(requirement), labels, single_document=single_document)
         if not result.error:
             await asyncio.to_thread(store.save_item, index, result)
         results[index] = result

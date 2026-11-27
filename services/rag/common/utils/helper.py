@@ -273,6 +273,37 @@ class Helper:
             raise lclEx
 
     @staticmethod
+    def get_json_with_version_from_s3(bucket_name, file_key):
+        from common.utils.aws_files_access import read_s3_json_with_version
+        from common.utils.settings import aws_client
+        log.debug(f"get_json_with_version_from_s3() Getting data and version for bucket {bucket_name} and file {file_key}")
+        s3_client = aws_client('s3')
+        try:
+            return read_s3_json_with_version(s3_client, bucket_name, file_key)
+        except Exception as lclEx:
+            Helper.print_exception(
+                "get_json_with_version_from_s3()",
+                lclEx,
+                f" Exception occurred while reading data from S3 bucket {bucket_name} for file {file_key}.",
+            )
+            raise lclEx
+
+    @staticmethod
+    def get_s3_object_version(bucket_name, file_key):
+        from common.utils.aws_files_access import head_s3_object_version
+        from common.utils.settings import aws_client
+        s3_client = aws_client('s3')
+        try:
+            return head_s3_object_version(s3_client, bucket_name, file_key)
+        except Exception as lclEx:
+            Helper.print_exception(
+                "get_s3_object_version()",
+                lclEx,
+                f" Exception occurred while checking S3 version in bucket {bucket_name} for file {file_key}.",
+            )
+            raise lclEx
+
+    @staticmethod
     def get_account_id(sts_client):
         #sts_client = aws_client("sts")
         if not sts_client:

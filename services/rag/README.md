@@ -327,7 +327,7 @@ documents.
 | Response | When |
 |----------|------|
 | `202` `{requestKey, status: "PROCESSING", executionArn, documentCount, requirementCount, message}` | Manifest valid and the run started, or the same `requestKey` is still running |
-| `400` `FAILED_VALIDATION` | Schema errors, a document that is not `.pdf`/`.docx`, is outside the documents bucket or is missing, or two documents whose `RAG_Output` files would collide |
+| `400` `FAILED_VALIDATION` | Schema errors, a document that is not `.pdf`/`.docx`, is outside the documents bucket or is missing, two documents whose `RAG_Output` files would collide, or a serialized Step Functions workflow input exceeding 256 KiB |
 | `409` | That `requestKey` already finished; resubmit with a new key |
 | `502` `UPSTREAM_ERROR` / `503` `NOT_CONFIGURED` | S3 or Step Functions call failed / workflow ARN not set |
 
@@ -365,8 +365,10 @@ The Step Functions execution, named after `requestKey`, then:
    at least once, so consumers should dedupe on `requestKey` + `status`.
 
 MuleSoft then calls `GET /manifest/<requestKey>/results` (`409` while the run is
-still processing, `404` if the key is unknown). The S3 uploads themselves no
-longer trigger any Lambda.
+still processing, `404` if the key is unknown, `413` if an unpaginated response
+exceeds the buffered REST limit; optional `offset` and `limit` query parameters
+paginate large runs with `X-Total-Count` and `X-Next-Offset` headers). The S3
+uploads themselves no longer trigger any Lambda.
 
 Output for `<folder>/<file>.pdf` in the post-processing bucket:
 

@@ -370,4 +370,15 @@ describe("deployment workflow contract", () => {
     expect(workflow).toContain("aws logs get-log-events");
     expect(workflow).toContain("bootstrap/Container/");
   });
+
+  it("registers QEMU ARM64 emulation before CDK deployment", () => {
+    const qemuSetupPos = workflow.indexOf("docker/setup-qemu-action@");
+    const firstDeployPos = workflow.indexOf("pnpm run cdk:deploy");
+
+    expect(qemuSetupPos).toBeGreaterThanOrEqual(0);
+    expect(firstDeployPos).toBeGreaterThan(qemuSetupPos);
+    expect(workflow.slice(qemuSetupPos, firstDeployPos)).toMatch(
+      /platforms:\s*(?:arm64|linux\/arm64|all)\b/,
+    );
+  });
 });

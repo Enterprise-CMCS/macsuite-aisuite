@@ -1,5 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
 from urllib.parse import unquote_plus
+
+from botocore.exceptions import ClientError
+
+_MISSING_S3_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 
 
 def object_keys(event):
@@ -64,8 +69,44 @@ def stream_s3_object(s3, bucket, key):
 def write_s3_json(s3, bucket, key, body, *, if_none_match=False):
     extra = {"IfNoneMatch": "*"} if if_none_match else {}
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json", **extra)
-               
 
 
+def s3_object_version(response):
+    if not isinstance(response, dict):
+        raise ValueError("S3 response metadata is required to determine object version.")
+    version_id = response.get("VersionId")
+    if isinstance(version_id, str) and version_id and version_id != "null":
+        return f"version:{version_id}"
+    etag = response.get("ETag")
+    last_modified = response.get("LastModified")
+    if isinstance(etag, str) and etag:
+        if last_modified is not None:
+            ts = last_modified.isoformat() if hasattr(last_modified, "isoformat") else str(last_modified)
+            return f"etag:{etag}:{ts}"
+        return f"etag:{etag}"
+    raise ValueError(f"S3 response is missing VersionId and ETag: {sorted(response)}")
 
 
+def read_s3_json_with_version(s3, bucket, key):
+    response = s3.get_object(Bucket=bucket, Key=key)
+    data = json.loads(response["Body"].read().decode("utf-8"))
+    return data, s3_object_version(response)
+
+
+def head_s3_object_version(s3, bucket, key):
+    candidate = getattr(getattr(s3, "exceptions", None), "NoSuchKey", None)
+    extra_missing = (
+        (candidate,)
+        if isinstance(candidate, type) and issubclass(candidate, BaseException)
+        else ()
+    )
+    try:
+        response = s3.head_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in _MISSING_S3_OBJECT_CODES:
+            return None
+        raise
+    except extra_missing:
+        return None
+    return s3_object_version(response)

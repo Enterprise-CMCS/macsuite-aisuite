@@ -82,6 +82,11 @@ jobs:
       - name: Review CDK diff
         run: pnpm run cdk:diff --context environment=${DEPLOYMENT_ENV}
 
+      - name: Set up QEMU for ARM64 Lambda assets
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
       - name: Deploy infrastructure phase only (desired count 0)
         #if: env.DEPLOYMENT_ENV == 'dev'
         run: |

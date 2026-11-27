@@ -3,15 +3,15 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Optional
 
 import structlog
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, FastAPI, Path, Request, status
+from fastapi import APIRouter, FastAPI, Path, Query, Request, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 
 from common.utils.aws_files_access import stream_s3_object, write_s3_json
 from common.utils.manifest import (
@@ -36,6 +36,9 @@ router = APIRouter(prefix="/manifest", tags=["Manifest"])
 _HEAD_OBJECT_WORKERS = 16
 _MAX_REPORTED_ERRORS = 50
 DEFAULT_MAX_MANIFEST_BODY_BYTES = 5 * 1024 * 1024
+MAX_WORKFLOW_INPUT_BYTES = 256 * 1024
+# Leave headroom below API Gateway's 10 MiB buffered REST response ceiling.
+MAX_RESULTS_RESPONSE_BYTES = 9 * 1024 * 1024
 
 _RUN_STATUS = {"RUNNING": "PROCESSING", "PENDING_REDRIVE": "PROCESSING", "SUCCEEDED": "COMPLETED"}
 _TERMINAL_DEFAULT_ERROR = {"TIMED_OUT": "States.Timeout", "ABORTED": "ExecutionAborted"}
@@ -243,6 +246,10 @@ def _workflow_input(manifest):
     }
 
 
+def _serialized_workflow_input(manifest):
+    return json.dumps(_workflow_input(manifest))
+
+
 def _accepted(manifest, execution_arn, message):
     return ManifestAccepted(
         requestKey=manifest.requestKey,
@@ -281,7 +288,7 @@ def _reserve_manifest(manifest):
 
     with _upstream(request_key, "read the existing manifest"):
         existing = stream_s3_object(s3, bucket, key)
-        raw = existing.read() if existing is not None else None
+        raw = _read_s3_body(existing) if existing is not None else None
 
     if raw is None:
         raise ManifestApiError(
@@ -320,6 +327,17 @@ def submit_manifest(manifest: Manifest):
 
     state_machine_arn = _state_machine_arn(request_key)
 
+    workflow_input_json = _serialized_workflow_input(manifest)
+    workflow_input_bytes = len(workflow_input_json.encode("utf-8"))
+    if workflow_input_bytes > MAX_WORKFLOW_INPUT_BYTES:
+        error = (
+            f"Serialized workflow input is {workflow_input_bytes} bytes (UTF-8), "
+            f"exceeding the {MAX_WORKFLOW_INPUT_BYTES} byte Step Functions limit; "
+            "reduce the number of documents or shorten their S3 paths."
+        )
+        logger.warning("manifest_rejected", request_key=request_key, errors=[error])
+        raise ManifestApiError(status.HTTP_400_BAD_REQUEST, request_key, "FAILED_VALIDATION", [error])
+
     errors = _document_errors(manifest)
     if errors:
         logger.warning("manifest_rejected", request_key=request_key, errors=errors)
@@ -341,7 +359,7 @@ def submit_manifest(manifest: Manifest):
             response = sfn.start_execution(
                 stateMachineArn=state_machine_arn,
                 name=request_key,
-                input=json.dumps(_workflow_input(manifest)),
+                input=workflow_input_json,
             )
         except sfn.exceptions.ExecutionAlreadyExists:
             existing = _describe_execution(request_key)
@@ -374,12 +392,94 @@ def get_manifest_status(request_key: RequestKey):
     )
 
 
+def _read_s3_body(body) -> bytes:
+    try:
+        return body.read()
+    finally:
+        body.close()
+
+
+def _paginate_results(
+    request_key: str,
+    raw: bytes,
+    offset: Optional[int],
+    limit: Optional[int],
+) -> Response:
+    if offset is None and limit is None:
+        if len(raw) > MAX_RESULTS_RESPONSE_BYTES:
+            raise ManifestApiError(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                request_key,
+                "PAYLOAD_TOO_LARGE",
+                [
+                    f"Results payload is {len(raw)} bytes, exceeding the {MAX_RESULTS_RESPONSE_BYTES} byte "
+                    "response limit; paginate with 'offset' and 'limit' query parameters."
+                ],
+            )
+        return Response(content=raw, media_type="application/json")
+
+    payload = json.loads(raw)
+    items = payload.get("legalRequirements", [])
+    start = offset or 0
+    end = len(items) if limit is None else min(start + limit, len(items))
+    page_items = items[start:end]
+
+    def serialize(subset):
+        return json.dumps({**payload, "legalRequirements": subset}).encode("utf-8")
+
+    page_bytes = serialize(page_items)
+    if len(page_bytes) > MAX_RESULTS_RESPONSE_BYTES:
+        if len(page_items) <= 1:
+            raise ManifestApiError(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                request_key,
+                "PAYLOAD_TOO_LARGE",
+                [f"Results page at offset {start} exceeds the {MAX_RESULTS_RESPONSE_BYTES} byte response limit."],
+            )
+        lo, hi = 1, len(page_items) - 1
+        best_count = 0
+        best_bytes = b""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = serialize(page_items[:mid])
+            if len(candidate) <= MAX_RESULTS_RESPONSE_BYTES:
+                best_count = mid
+                best_bytes = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best_count == 0:
+            raise ManifestApiError(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                request_key,
+                "PAYLOAD_TOO_LARGE",
+                [f"Results page at offset {start} exceeds the {MAX_RESULTS_RESPONSE_BYTES} byte response limit."],
+            )
+        page_items = page_items[:best_count]
+        page_bytes = best_bytes
+
+    headers = {
+        "X-Total-Count": str(len(items)),
+        "X-Offset": str(start),
+        "X-Limit": str(len(page_items)),
+    }
+    next_offset = start + len(page_items)
+    if next_offset < len(items):
+        headers["X-Next-Offset"] = str(next_offset)
+    return Response(content=page_bytes, media_type="application/json", headers=headers)
+
+
 @router.get("/{request_key}/results", response_model=ReviewResults, responses=_ERROR_RESPONSES)
-def get_manifest_results(request_key: RequestKey):
+def get_manifest_results(
+    request_key: RequestKey,
+    offset: Annotated[Optional[int], Query(ge=0)] = None,
+    limit: Annotated[Optional[int], Query(ge=1)] = None,
+):
     with _upstream(request_key, "read the results"):
         body = stream_s3_object(_client("s3"), _run_bucket(), results_object_key(request_key))
-    if body is not None:
-        return StreamingResponse(body.iter_chunks(), media_type="application/json")
+        raw = _read_s3_body(body) if body is not None else None
+    if raw is not None:
+        return _paginate_results(request_key, raw, offset, limit)
 
     execution = _describe_execution(request_key)
     if execution is not None and _run_status(execution) == "PROCESSING":

@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 import json
 
 from common.utils.aws_files_access import object_keys
@@ -14,6 +15,14 @@ from data_embeddings_storage.database.table_setup import create_embedding_table
 
 EMBED_BATCH_SIZE = 30
 SOURCE_METADATA_KEY = "rag_output_key"
+
+
+@dataclass(frozen=True)
+class LoadedRagSource:
+    bucket: str
+    key: str
+    documents: list
+    version: str
 
 
 def is_rag_output_key(key):
@@ -36,12 +45,17 @@ def is_common_rag_output_key(key, common_prefix=None):
 def _load_rag_documents(key):
     bucket = Helper.get_property("output_bucket")
     log.info(f"Loading s3://{bucket}/{key}")
+    raw_documents, version = Helper.get_json_with_version_from_s3(bucket, key)
     documents = [
-        doc for doc in Helper.get_json_from_s3(bucket, key)
+        doc for doc in raw_documents
         if isinstance(doc, dict) and doc.get("text")
     ]
-    log.info(f"{len(documents)} document(s) to embed from {key}")
-    return documents
+    log.info(f"{len(documents)} document(s) to embed from {key} ({version})")
+    return LoadedRagSource(bucket=bucket, key=key, documents=documents, version=version)
+
+
+def _current_source_version(bucket, key):
+    return Helper.get_s3_object_version(bucket, key)
 
 
 async def _generate_embeddings(documents, table_name, key):
@@ -68,10 +82,13 @@ async def delete_source_rows(connection, table_name, rag_output_key):
     )
 
 
-async def _replace_source_embeddings(documents, table_name, key):
+async def _replace_source_embeddings(source, table_name, key):
+    if not isinstance(source, LoadedRagSource) or not source.version:
+        raise ValueError(f"LoadedRagSource with non-empty version is required for {key}.")
+
     stamped = [
         {**doc, "metadata": {**(doc.get("metadata") or {}), SOURCE_METADATA_KEY: key}}
-        for doc in documents
+        for doc in source.documents
     ]
     processor = None
     records = []
@@ -82,6 +99,19 @@ async def _replace_source_embeddings(documents, table_name, key):
     async with pooled_connection() as connection:
         async with connection.transaction():
             await connection.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", lock_id)
+            current_version = await asyncio.to_thread(_current_source_version, source.bucket, key)
+            if current_version != source.version:
+                log.warning(
+                    f"Skipping stale embeddings replacement for s3://{source.bucket}/{key} in {table_name}: "
+                    f"loaded {source.version}, current is {current_version}"
+                )
+                return {
+                    "total": len(stamped),
+                    "postgres_processed": 0,
+                    "stale": True,
+                    "failed": 0,
+                    "errors": [],
+                }
             await delete_source_rows(connection, table_name, key)
             inserted = await _store_embeddings(connection, processor, records) if records else 0
 
@@ -103,11 +133,11 @@ async def invoke_rag_process(key):
     if not table_name:
         raise ValueError("common_embeddings_table_name is not configured.")
 
-    documents = _load_rag_documents(key)
+    source = _load_rag_documents(key)
     log.info(f"invoke_rag_process() Using common embeddings table {table_name} for {key}")
     await create_embedding_table(table_name)
     try:
-        return await _replace_source_embeddings(documents, table_name, key)
+        return await _replace_source_embeddings(source, table_name, key)
     finally:
         await close_db()
 
@@ -134,7 +164,10 @@ async def _embed(event):
     if not is_rag_output_key(key):
         raise ValueError(f"'{key}' is not a {RAG_OUTPUT_PREFIX} JSON object.")
 
-    status = await _replace_source_embeddings(_load_rag_documents(key), table_name, key)
+    source = _load_rag_documents(key)
+    status = await _replace_source_embeddings(source, table_name, key)
+    if status.get("stale"):
+        raise RuntimeError(f"Source {key} changed while embedding into {table_name}; retry required.")
     return {"key": key, "tableName": table_name, "embedded": status["postgres_processed"]}
 
 
@@ -155,7 +188,7 @@ def handler(event, context=None):
     if isinstance(event, dict) and event.get("action"):
         return asyncio.run(_run_action(event))
 
-    keys = [key for key in object_keys(event) if is_common_rag_output_key(key)]
+    keys = list(dict.fromkeys(key for key in object_keys(event) if is_common_rag_output_key(key)))
     if not keys:
         log.info(f"No common RAG_Output JSON objects in event. Skipping. Event={event}")
         return {"status": "skipped"}

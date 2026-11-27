@@ -1,5 +1,8 @@
 """Unit tests for the pre-processing -> RAG_Output -> embeddings handlers (no AWS or Postgres)."""
 
+import asyncio
+from datetime import datetime, timezone
+import io
 import json
 import os
 import sys
@@ -8,6 +11,7 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import quote_plus
 
+from botocore.exceptions import ClientError
 import numpy as np
 
 RAG_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -30,7 +34,12 @@ _IMPORT_STUBS = {
     )
 }
 with patch.dict(sys.modules, _IMPORT_STUBS):
-    from common.utils.aws_files_access import object_keys
+    from common.utils.aws_files_access import (
+        head_s3_object_version,
+        object_keys,
+        read_s3_json_with_version,
+        s3_object_version,
+    )
     from data_embeddings_storage import rag_process
     from data_embeddings_storage.database import data_processing_embeddings
     from data_preprocessing import pre_processing
@@ -330,42 +339,114 @@ class RagProcessHandlerTests(unittest.TestCase):
         invoke.assert_not_called()
 
 
+class S3ObjectVersionTests(unittest.TestCase):
+    def test_prefers_s3_version_id_and_falls_back_to_etag_with_timestamp(self):
+        ts = datetime(2026, 11, 27, 16, 19, 10, tzinfo=timezone.utc)
+        self.assertEqual(
+            s3_object_version({"VersionId": "v-123", "ETag": '"abc"', "LastModified": ts}),
+            "version:v-123",
+        )
+        self.assertEqual(
+            s3_object_version({"VersionId": "null", "ETag": '"abc"', "LastModified": ts}),
+            'etag:"abc":2026-11-27T16:19:10+00:00',
+        )
+        with self.assertRaises(ValueError):
+            s3_object_version({})
+
+    def test_reads_json_with_version_and_handles_missing_head_object(self):
+        s3 = MagicMock()
+        s3.get_object.return_value = {
+            "Body": io.BytesIO(b'[{"text": "hello"}]'),
+            "VersionId": "ver-7",
+        }
+        self.assertEqual(
+            read_s3_json_with_version(s3, "post-bucket", "RAG_Output/common/a.json"),
+            ([{"text": "hello"}], "version:ver-7"),
+        )
+
+        s3.head_object.side_effect = ClientError(
+            {"Error": {"Code": "404", "Message": "Not Found"}},
+            "HeadObject",
+        )
+        self.assertIsNone(head_s3_object_version(s3, "post-bucket", "RAG_Output/common/a.json"))
+
+        s3.head_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "Denied"}},
+            "HeadObject",
+        )
+        with self.assertRaises(ClientError):
+            head_s3_object_version(s3, "post-bucket", "RAG_Output/common/a.json")
+
+
+class _SharedAdvisoryStore:
+    def __init__(self, initial_rows=None):
+        self.committed_rows = list(initial_rows or [])
+        self.events = []
+        self._locks = {}
+
+    def lock_for(self, key):
+        return self._locks.setdefault(key, asyncio.Lock())
+
+
 class _FakeTransactionalConnection:
     """In-memory connection that commits or rolls back DELETE + INSERT batches atomically."""
 
-    def __init__(self, initial_rows=None, fail_on_executemany_call=None):
-        self.committed_rows = list(initial_rows or [])
+    def __init__(self, initial_rows=None, fail_on_executemany_call=None, shared_store=None):
+        self._store = shared_store or _SharedAdvisoryStore(initial_rows)
         self._working_rows = None
         self._in_tx = False
+        self._held_locks = []
         self.fail_on_executemany_call = fail_on_executemany_call
         self.executemany_calls = 0
-        self.events = []
+
+    @property
+    def committed_rows(self):
+        return self._store.committed_rows
+
+    @property
+    def events(self):
+        return self._store.events
 
     @asynccontextmanager
     async def transaction(self):
         self.events.append(("tx_begin",))
         self._in_tx = True
-        self._working_rows = list(self.committed_rows)
+        self._working_rows = None
         try:
             yield self
         except BaseException:
             self._working_rows = None
             self._in_tx = False
+            while self._held_locks:
+                self._held_locks.pop().release()
             self.events.append(("tx_rollback",))
             raise
-        self.committed_rows = self._working_rows
+        if self._working_rows is not None:
+            self._store.committed_rows = self._working_rows
         self._working_rows = None
         self._in_tx = False
+        while self._held_locks:
+            self._held_locks.pop().release()
         self.events.append(("tx_commit",))
+
+    def _rows_for_write(self):
+        if not self._in_tx:
+            return self._store.committed_rows
+        if self._working_rows is None:
+            self._working_rows = list(self._store.committed_rows)
+        return self._working_rows
 
     async def execute(self, sql, *args):
         if "pg_advisory_xact_lock" in sql:
+            lock = self._store.lock_for(args[0])
+            await lock.acquire()
+            self._held_locks.append(lock)
             self.events.append(("xact_lock", self._in_tx, args[0]))
             return
         if sql.strip().upper().startswith("DELETE FROM"):
             target = json.loads(args[0])
             self.events.append(("delete", self._in_tx, target))
-            rows = self._working_rows if self._in_tx else self.committed_rows
+            rows = self._rows_for_write()
             rows[:] = [
                 row for row in rows
                 if not all(row["metadata"].get(k) == v for k, v in target.items())
@@ -378,7 +459,7 @@ class _FakeTransactionalConnection:
         self.events.append(("insert_batch", self._in_tx, len(records)))
         if self.fail_on_executemany_call == self.executemany_calls:
             raise RuntimeError(f"insert batch {self.executemany_calls} failed")
-        rows = self._working_rows if self._in_tx else self.committed_rows
+        rows = self._rows_for_write()
         for text, metadata_json, embedding in records:
             rows.append({"text": text, "metadata": json.loads(metadata_json), "embedding": embedding})
 
@@ -410,12 +491,17 @@ class InvokeRagProcessTests(unittest.IsolatedAsyncioTestCase):
         async def fake_pooled_connection():
             yield connection
 
+        def fake_head_version(bucket, checked_key):
+            connection.events.append(("check_version", connection._in_tx, bucket, checked_key))
+            return "version:v1"
+
         documents = [{"text": "reg chunk", "metadata": {"page": 2}}]
 
         with patch.object(rag_process.Helper, "get_property", return_value="post-bucket"), \
                 patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"), \
                 patch.object(rag_process.Helper, "get_common_embeddings_table_name", return_value="embeddings_cms_regs"), \
-                patch.object(rag_process.Helper, "get_json_from_s3", return_value=documents), \
+                patch.object(rag_process.Helper, "get_json_with_version_from_s3", return_value=(documents, "version:v1")), \
+                patch.object(rag_process.Helper, "get_s3_object_version", side_effect=fake_head_version), \
                 patch.object(rag_process, "create_embedding_table", new=AsyncMock()) as create_table, \
                 patch.object(rag_process, "pooled_connection", fake_pooled_connection), \
                 patch.object(rag_process, "close_db", new=AsyncMock()) as close_db, \
@@ -439,11 +525,116 @@ class InvokeRagProcessTests(unittest.IsolatedAsyncioTestCase):
                 ("generate", ["reg chunk"]),
                 ("tx_begin",),
                 ("xact_lock", True, f"embeddings_cms_regs:{key}"),
+                ("check_version", True, "post-bucket", key),
                 ("delete", True, {"rag_output_key": key}),
                 ("insert_batch", True, 1),
                 ("tx_commit",),
             ],
         )
+
+    async def test_stale_invocation_does_not_overwrite_newer_committed_rows(self):
+        key = "RAG_Output/common/cfr_438.json"
+        other_key = "RAG_Output/common/other.json"
+        store = _SharedAdvisoryStore(
+            initial_rows=[
+                {"text": "v0 chunk", "metadata": {"rag_output_key": key}, "embedding": np.array([0.0], dtype=np.float32)},
+                {"text": "untouched", "metadata": {"rag_output_key": other_key}, "embedding": np.array([9.0], dtype=np.float32)},
+            ]
+        )
+        s3_state = {
+            "documents": [{"text": "stale v1 chunk", "metadata": {"page": 1}}],
+            "version": "version:v1",
+        }
+        v1_loaded = asyncio.Event()
+        v2_committed = asyncio.Event()
+
+        def fake_load_json_with_version(_bucket, _key):
+            return list(s3_state["documents"]), s3_state["version"]
+
+        def fake_head_version(_bucket, _key):
+            return s3_state["version"]
+
+        bedrock_client = MagicMock()
+
+        async def fake_batch_get_embeddings(texts, max_concurrent_requests=10):
+            if texts == ["stale v1 chunk"]:
+                v1_loaded.set()
+                await v2_committed.wait()
+                return [np.array([1.0], dtype=np.float32)]
+            return [np.array([2.0], dtype=np.float32) for _ in texts]
+
+        bedrock_client.batch_get_embeddings = AsyncMock(side_effect=fake_batch_get_embeddings)
+
+        @asynccontextmanager
+        async def fake_pooled_connection():
+            yield _FakeTransactionalConnection(shared_store=store)
+
+        async def run_newer_after_v1_loads():
+            await v1_loaded.wait()
+            s3_state["documents"] = [{"text": "fresh v2 chunk", "metadata": {"page": 5}}]
+            s3_state["version"] = "version:v2"
+            try:
+                return await rag_process.invoke_rag_process(key)
+            finally:
+                v2_committed.set()
+
+        with patch.object(rag_process.Helper, "get_property", return_value="post-bucket"), \
+                patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"), \
+                patch.object(rag_process.Helper, "get_common_embeddings_table_name", return_value="embeddings_cms_regs"), \
+                patch.object(rag_process.Helper, "get_json_with_version_from_s3", side_effect=fake_load_json_with_version), \
+                patch.object(rag_process.Helper, "get_s3_object_version", side_effect=fake_head_version), \
+                patch.object(rag_process, "create_embedding_table", new=AsyncMock()), \
+                patch.object(rag_process, "pooled_connection", fake_pooled_connection), \
+                patch.object(rag_process, "close_db", new=AsyncMock()), \
+                patch.object(rag_process, "EmbeddingProcessor", data_processing_embeddings.EmbeddingProcessor), \
+                patch.object(data_processing_embeddings, "BedrockEmbeddingClient", return_value=bedrock_client):
+            stale_result, fresh_result = await asyncio.gather(
+                rag_process.invoke_rag_process(key),
+                run_newer_after_v1_loads(),
+            )
+
+        self.assertEqual(fresh_result, {"total": 1, "postgres_processed": 1, "failed": 0, "errors": []})
+        self.assertEqual(
+            stale_result,
+            {"total": 1, "postgres_processed": 0, "stale": True, "failed": 0, "errors": []},
+        )
+        self.assertEqual(
+            [(r["text"], r["metadata"]) for r in store.committed_rows],
+            [
+                ("untouched", {"rag_output_key": other_key}),
+                ("fresh v2 chunk", {"page": 5, "rag_output_key": key}),
+            ],
+        )
+
+    async def test_deleted_source_under_lock_skips_replacement(self):
+        key = "RAG_Output/common/cfr_438.json"
+        existing_rows = [
+            {"text": "existing reg chunk", "metadata": {"rag_output_key": key}, "embedding": np.array([1.0], dtype=np.float32)}
+        ]
+        connection = _FakeTransactionalConnection(initial_rows=existing_rows)
+        bedrock_client = MagicMock()
+        bedrock_client.batch_get_embeddings = AsyncMock(
+            return_value=[np.array([2.0], dtype=np.float32)]
+        )
+
+        @asynccontextmanager
+        async def fake_pooled_connection():
+            yield connection
+
+        with patch.object(rag_process.Helper, "get_property", return_value="post-bucket"), \
+                patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"), \
+                patch.object(rag_process.Helper, "get_common_embeddings_table_name", return_value="embeddings_cms_regs"), \
+                patch.object(rag_process.Helper, "get_json_with_version_from_s3", return_value=([{"text": "stale"}], "version:v1")), \
+                patch.object(rag_process.Helper, "get_s3_object_version", return_value=None), \
+                patch.object(rag_process, "create_embedding_table", new=AsyncMock()), \
+                patch.object(rag_process, "pooled_connection", fake_pooled_connection), \
+                patch.object(rag_process, "close_db", new=AsyncMock()), \
+                patch.object(rag_process, "EmbeddingProcessor", data_processing_embeddings.EmbeddingProcessor), \
+                patch.object(data_processing_embeddings, "BedrockEmbeddingClient", return_value=bedrock_client):
+            result = await rag_process.invoke_rag_process(key)
+
+        self.assertEqual(result, {"total": 1, "postgres_processed": 0, "stale": True, "failed": 0, "errors": []})
+        self.assertEqual(connection.committed_rows, existing_rows)
 
     async def test_bedrock_failure_preserves_previous_rows_without_deleting(self):
         key = "RAG_Output/common/cfr_438.json"
@@ -469,7 +660,8 @@ class InvokeRagProcessTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(rag_process.Helper, "get_property", return_value="post-bucket"), \
                 patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"), \
                 patch.object(rag_process.Helper, "get_common_embeddings_table_name", return_value="embeddings_cms_regs"), \
-                patch.object(rag_process.Helper, "get_json_from_s3", return_value=documents), \
+                patch.object(rag_process.Helper, "get_json_with_version_from_s3", return_value=(documents, "version:v1")), \
+                patch.object(rag_process.Helper, "get_s3_object_version", return_value="version:v1"), \
                 patch.object(rag_process, "create_embedding_table", new=AsyncMock()), \
                 patch.object(rag_process, "pooled_connection", fake_pooled_connection), \
                 patch.object(rag_process, "close_db", new=AsyncMock()) as close_db, \
@@ -505,7 +697,8 @@ class InvokeRagProcessTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(rag_process.Helper, "get_property", return_value="post-bucket"), \
                 patch.object(rag_process.Helper, "get_common_input_prefix", return_value="common/"), \
                 patch.object(rag_process.Helper, "get_common_embeddings_table_name", return_value="embeddings_cms_regs"), \
-                patch.object(rag_process.Helper, "get_json_from_s3", return_value=documents), \
+                patch.object(rag_process.Helper, "get_json_with_version_from_s3", return_value=(documents, "version:v1")), \
+                patch.object(rag_process.Helper, "get_s3_object_version", return_value="version:v1"), \
                 patch.object(rag_process, "create_embedding_table", new=AsyncMock()), \
                 patch.object(rag_process, "pooled_connection", fake_pooled_connection), \
                 patch.object(rag_process, "close_db", new=AsyncMock()) as close_db, \
