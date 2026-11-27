@@ -84,6 +84,23 @@ export const MANAGED_BY = "AWS CDK";
  */
 export const DEFAULT_OWNER = "AISuite Platform Team";
 
+/** Pinned CrowdStrike Falcon container sensor image (CMS Artifactory remote). */
+export const FALCON_IMAGE =
+  "artifactory.cloud.cms.gov/crowdstrike-remote/falcon-container/release/falcon-container:8.10.0-8002";
+/** Secrets Manager secret holding `cid` and `provisioningToken`. */
+export const FALCON_SECRET_NAME = "crowdstrike/falcon";
+export const FALCON_ENABLED_ENV_KEY = "AISUITE_FALCON_ENABLED";
+export const FALCON_IMAGE_ENV_KEY = "AISUITE_FALCON_IMAGE";
+export const FALCON_REGISTRY_SECRET_ENV_KEY =
+  "AISUITE_FALCON_REGISTRY_SECRET_NAME";
+
+export interface FalconConfig {
+  image: string;
+  secretName: string;
+  /** Secrets Manager secret (`username`/`password`) for private registry pulls. */
+  registryCredentialsSecretName?: string;
+}
+
 /**
  * Standard tag taxonomy applied to every stack. Keys are intentionally fixed so
  * that all environments and any future stacks share one consistent cost- and
@@ -123,6 +140,11 @@ export interface DeploymentConfig {
   albHostName: string;
   /** Name of the central S3 bucket that receives server access logs (managed externally). */
   accessLogsBucketName: string;
+  /**
+   * CrowdStrike Falcon sensor config for the RAG API task. Present only when
+   * `AISUITE_FALCON_ENABLED=true`.
+   */
+  falcon?: FalconConfig;
 }
 
 const ACCOUNT_ID_PATTERN = /^\d{12}$/;
@@ -179,6 +201,24 @@ export function getDeploymentConfig(
     albHostName:
       process.env.AISUITE_ALB_HOST_NAME?.trim() ||
       `alb.${environmentName}.macsuite.aisuite.internal.cms.gov`,
+    ...(isFalconEnabled() ? { falcon: resolveFalconConfig() } : undefined),
+  };
+}
+
+function isFalconEnabled(): boolean {
+  return process.env[FALCON_ENABLED_ENV_KEY]?.trim().toLowerCase() === "true";
+}
+
+function resolveFalconConfig(): FalconConfig {
+  const registryCredentialsSecretName =
+    process.env[FALCON_REGISTRY_SECRET_ENV_KEY]?.trim();
+
+  return {
+    image: process.env[FALCON_IMAGE_ENV_KEY]?.trim() || FALCON_IMAGE,
+    secretName: FALCON_SECRET_NAME,
+    ...(registryCredentialsSecretName
+      ? { registryCredentialsSecretName }
+      : undefined),
   };
 }
 

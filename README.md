@@ -41,6 +41,22 @@ If Corepack is unavailable: `npx --yes pnpm@11.7.0 install`.
   Environments and `AISUITE_DEPLOY_ROLE_ARN`. Deploy also re-runs type-check
   and unit tests before assuming the OIDC role.
 
+## CrowdStrike Falcon
+
+The RAG API task can run the Falcon container sensor. It is opt-in per GitHub
+Environment via variables:
+
+- `AISUITE_FALCON_ENABLED=true` — injects the sensor (raises dev/qa API tasks
+  to 512 CPU / 1024 MiB).
+- `AISUITE_FALCON_IMAGE` — optional override of the pinned sensor image.
+- `AISUITE_FALCON_REGISTRY_SECRET_NAME` — optional Secrets Manager secret
+  (`username`/`password`) if the registry requires authentication.
+
+Before enabling, each account needs a `crowdstrike/falcon` secret with `cid`
+and `provisioningToken` keys, and the private subnets must reach the image
+registry. If the secret uses a customer-managed KMS key, grant the API
+execution role `kms:Decrypt`.
+
 ## CDK bootstrap
 
 Modern stack synthesis needs a one-time `CDKToolkit` bootstrap in each AWS
